@@ -79,8 +79,16 @@
 | 验收项 | 状态 | 备注 |
 | --- | --- | --- |
 
-## 遗留风险和待处理项
+## 残留风险和待处理项
 ```
+
+## ⚠️ Delivery 强制要求
+
+1. **必须包含「残留风险」(Residual Risk) section。**
+2. **必须包含本轮变更文件列表。**
+3. **必须包含验证命令和结果。** 说明验证了什么、怎么验证的、结果如何。
+4. **必须明确是否建议 commit。** 给出明确的 commit 建议。
+5. **⚠️ Harness 不会自动 commit。** Commit 由用户手动执行。Delivery 通过后会进入 commit checkpoint 状态，用户需手动 commit 后再执行 `pnpm harness advance <taskId> --confirm-committed` 继续。
 
 ## 中断交接
 

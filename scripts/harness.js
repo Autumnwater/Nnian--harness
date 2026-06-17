@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// HEXAI Review Harness V1 — CLI
+// HEXAI Review Harness V2 — CLI
 // Lightweight orchestration for multi-agent weekly task R&D workflow.
 // No external dependencies.
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -93,6 +94,43 @@ function getImplementerStages() {
 
 function getSubtasksForTask() {
   return getWorkflowConfig().subtasks;
+}
+
+// ---------------------------------------------------------------------------
+// V2: Clipboard helper (macOS pbcopy)
+// ---------------------------------------------------------------------------
+function copyToClipboard(text) {
+  try {
+    execSync('pbcopy', { input: text, stdio: ['pipe', 'ignore', 'pipe'] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V2: Stage-to-window mapping
+// ---------------------------------------------------------------------------
+function getTargetWindow(stage) {
+  const workStages = ['implementation-plan', 'code-implementation', 'plan-fix', 'code-fix'];
+  const reviewStages = ['plan-review', 'plan-fix-review', 'code-review', 'code-fix-review', 'delivery'];
+  const harnessStages = ['done'];
+  if (workStages.includes(stage)) return 'work';
+  if (reviewStages.includes(stage)) return 'review';
+  if (harnessStages.includes(stage)) return 'harness';
+  // Default: implementer stages → work, review stages → review
+  const implementerStages = getImplementerStages();
+  if (implementerStages.includes(stage)) return 'work';
+  const reviewStagesAll = getReviewStages();
+  if (reviewStagesAll.includes(stage)) return 'review';
+  return 'review';
+}
+
+// ---------------------------------------------------------------------------
+// V2: Prompt file path
+// ---------------------------------------------------------------------------
+function promptFilePath(taskId, subtaskId, stage) {
+  return path.join(HARNESS_ROOT, 'runs', taskId, 'prompts', `${subtaskId}-${stage}.md`);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,11 +800,22 @@ function cmdInit(taskId, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Generate prompt
+// Generate prompt (V2: --copy support, prompt file, structured output)
 // ---------------------------------------------------------------------------
-function cmdNext(taskId) {
+function cmdNext(taskId, opts = {}) {
   const status = loadStatus(taskId);
   const { currentSubtask, currentStage } = status;
+
+  // V2: awaitingCommit guard
+  if (status.awaitingCommit) {
+    console.log('⏸️  Delivery passed — manual commit checkpoint required before continuing.');
+    console.log(`   需要手动 commit 的子任务: ${status.commitRequiredForSubtask}`);
+    console.log();
+    console.log('   请先手动 commit 业务代码，然后运行:');
+    console.log(`   pnpm harness advance ${taskId} --confirm-committed`);
+    process.exitCode = 1;
+    return { error: 'awaiting-commit', commitRequiredForSubtask: status.commitRequiredForSubtask };
+  }
 
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
   if (!stageData) {
@@ -797,27 +846,217 @@ function cmdNext(taskId) {
 
   saveStatus(taskId, status);
 
+  let result;
   if (stageData.stageStatus === 'interrupted') {
-    return generateContinuationPrompt(taskId, status, currentSubtask, currentStage, subtask);
+    result = generateContinuationPrompt(taskId, status, currentSubtask, currentStage, subtask);
+  } else {
+    stageData.stageStatus = 'active';
+    if (!stageData.startedAt) stageData.startedAt = now();
+
+    // Add to outputs[] (P1-5)
+    if (stageData.primaryReportPath && !stageData.outputs.includes(stageData.primaryReportPath)) {
+      stageData.outputs.push(stageData.primaryReportPath);
+    }
+
+    saveStatus(taskId, status);
+
+    const templateName = getTemplateName(currentStage);
+    const vars = buildTemplateVars(taskId, currentSubtask, currentStage, status);
+    const template = loadTemplate(templateName);
+    const prompt = substituteTemplate(template, vars);
+    result = { prompt, stage: currentStage, subtask: currentSubtask, continuation: false };
   }
 
-  stageData.stageStatus = 'active';
-  if (!stageData.startedAt) stageData.startedAt = now();
+  // V2: Save prompt to file
+  const promptPath = promptFilePath(taskId, currentSubtask, currentStage);
+  ensureDir(path.dirname(promptPath));
+  fs.writeFileSync(promptPath, result.prompt, 'utf-8');
 
-  // Add to outputs[] (P1-5)
-  if (stageData.primaryReportPath && !stageData.outputs.includes(stageData.primaryReportPath)) {
-    stageData.outputs.push(stageData.primaryReportPath);
+  // V2: Copy to clipboard if requested
+  let copied = false;
+  if (opts.copy) {
+    copied = copyToClipboard(result.prompt);
   }
 
-  saveStatus(taskId, status);
+  // V2: Structured output
+  const config = getStageConfig(currentStage) || {};
+  const targetWindow = getTargetWindow(currentStage);
 
-  const templateName = getTemplateName(currentStage);
-  const vars = buildTemplateVars(taskId, currentSubtask, currentStage, status);
-  const template = loadTemplate(templateName);
-  const prompt = substituteTemplate(template, vars);
+  console.log('═══════════════════════════════════════════════');
+  console.log(`📋 NEXT PROMPT GENERATED`);
+  console.log(`   currentSubtask: ${currentSubtask}`);
+  console.log(`   currentStage: ${currentStage}`);
+  console.log(`   expectedSkill: ${config.requiredSkill || '(none)'}`);
+  console.log(`   targetWindow: ${targetWindow}`);
+  console.log(`   promptPath: ${promptPath}`);
+  if (result.continuation) {
+    console.log(`   continuation: true`);
+  }
+  if (opts.copy) {
+    if (copied) {
+      console.log(`   copiedToClipboard: true`);
+    } else {
+      console.log(`   copiedToClipboard: false`);
+      console.log(`   ⚠️  pbcopy 不可用，无法复制到剪贴板。Prompt 已保存到文件。`);
+    }
+  }
+  console.log('═══════════════════════════════════════════════');
+  console.log();
+  console.log(result.prompt);
 
-  console.log(prompt);
-  return { prompt, stage: currentStage, subtask: currentSubtask };
+  return { ...result, promptPath, copiedToClipboard: copied, targetWindow, expectedSkill: config.requiredSkill };
+}
+
+// ---------------------------------------------------------------------------
+// V2: Step — chain check → advance → next
+// ---------------------------------------------------------------------------
+function cmdStep(taskId, opts = {}) {
+  // Step 1: Check
+  console.log('▶ CHECK');
+  const checkResult = cmdCheck(taskId);
+  if (!checkResult.pass) {
+    console.log('\n⛔ STEP STOPPED at check — fix issues before retrying.');
+    process.exitCode = 1;
+    return { success: false, stoppedAt: 'check', ...checkResult };
+  }
+  console.log('✅ CHECK PASSED\n');
+
+  // Step 2: Advance
+  console.log('▶ ADVANCE');
+  const advanceResult = cmdAdvance(taskId);
+  if (!advanceResult.success) {
+    console.log('\n⛔ STEP STOPPED at advance.');
+    process.exitCode = 1;
+    return { success: false, stoppedAt: 'advance', ...advanceResult };
+  }
+
+  // If awaitingCommit, stop here — don't proceed to next
+  if (advanceResult.awaitingCommit) {
+    console.log('⏸️  Delivery passed — manual commit checkpoint required.');
+    console.log('   STEP stopped at commit checkpoint.');
+    return { success: true, stoppedAt: 'awaiting-commit', awaitingCommit: true };
+  }
+
+  console.log(`✅ ADVANCED: ${advanceResult.subtask || ''} / ${advanceResult.stage || ''}\n`);
+
+  // Step 3: Next
+  console.log('▶ NEXT');
+  const nextResult = cmdNext(taskId, { copy: opts.copy });
+  if (nextResult.error) {
+    console.log(`\n⛔ STEP STOPPED at next: ${nextResult.error}`);
+    process.exitCode = 1;
+    return { success: false, stoppedAt: 'next', ...nextResult };
+  }
+  console.log('✅ NEXT PROMPT GENERATED');
+  console.log(`   Target window: ${nextResult.targetWindow}`);
+  console.log(`   Expected skill: ${nextResult.expectedSkill || '(none)'}`);
+  console.log(`   Prompt path: ${nextResult.promptPath}`);
+  if (opts.copy) {
+    console.log(`   Copied to clipboard: ${nextResult.copiedToClipboard}`);
+  }
+
+  return { success: true, stoppedAt: null, ...nextResult };
+}
+
+// ---------------------------------------------------------------------------
+// V2: Current — read-only status overview
+// ---------------------------------------------------------------------------
+function cmdCurrent(taskId) {
+  const status = loadStatus(taskId);
+  const { currentSubtask, currentStage } = status;
+  const subtasks = getSubtasksForTask();
+  const subtask = subtasks.find(s => s.id === currentSubtask);
+  const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage] || {};
+  const config = getStageConfig(currentStage) || {};
+
+  const round = determineRoundForStage(status, currentSubtask, currentStage);
+  const targetWindow = getTargetWindow(currentStage);
+
+  // Gather round info
+  const st = status.subtasks[currentSubtask];
+  const planRound = st?.planRound || 1;
+  const codeRound = st?.codeRound || 1;
+  const deliveryRound = st?.deliveryRound || 1;
+
+  // Latest prompt path
+  const latestPromptPath = promptFilePath(taskId, currentSubtask, currentStage);
+
+  // Latest reports for current subtask
+  const subtaskStages = status.subtasks[currentSubtask]?.stages || {};
+  const latestReports = [];
+  for (const [stageId, sData] of Object.entries(subtaskStages)) {
+    if (sData.primaryReportPath && fs.existsSync(sData.primaryReportPath)) {
+      latestReports.push({ stage: stageId, path: sData.primaryReportPath, status: sData.stageStatus });
+    }
+  }
+
+  // Next recommended command
+  let nextCmd;
+  if (status.awaitingCommit) {
+    nextCmd = `pnpm harness advance ${taskId} --confirm-committed`;
+  } else if (stageData.stageStatus === 'interrupted') {
+    nextCmd = `pnpm harness resume-current ${taskId}`;
+  } else if (stageData.stageStatus === 'completed') {
+    nextCmd = `pnpm harness advance ${taskId}`;
+  } else {
+    nextCmd = `pnpm harness next ${taskId} --copy`;
+  }
+
+  console.log('═══════════════════════════════════════════════');
+  console.log(`📍 ${taskId} — CURRENT STATE`);
+  console.log('═══════════════════════════════════════════════');
+  console.log();
+  console.log(`| 项目 | 值 |`);
+  console.log(`| --- | --- |`);
+  console.log(`| taskStatus | ${status.taskStatus || 'in-progress'} |`);
+  console.log(`| currentSubtask | ${currentSubtask} |`);
+  console.log(`| subtaskTitle | ${subtask?.title || '?'} |`);
+  console.log(`| subtaskStatus | ${status.subtasks[currentSubtask]?.status || '?'} |`);
+  console.log(`| currentStage | ${currentStage} |`);
+  console.log(`| stageStatus | ${stageData.stageStatus || '?'} |`);
+  console.log(`| planRound | ${planRound} |`);
+  console.log(`| codeRound | ${codeRound} |`);
+  console.log(`| deliveryRound | ${deliveryRound} |`);
+  console.log(`| currentRound | ${round} |`);
+  console.log(`| targetWindow | ${targetWindow} |`);
+  console.log(`| expectedSkill | ${config.requiredSkill || '(none)'} |`);
+  console.log(`| awaitingCommit | ${status.awaitingCommit ? 'true' : 'false'} |`);
+  if (status.awaitingCommit) {
+    console.log(`| commitRequiredForSubtask | ${status.commitRequiredForSubtask || currentSubtask} |`);
+  }
+  console.log();
+
+  if (latestReports.length > 0) {
+    console.log('### Latest Reports');
+    for (const r of latestReports) {
+      console.log(`- [${r.status}] \`${r.path}\``);
+    }
+    console.log();
+  }
+
+  const promptExists = fs.existsSync(latestPromptPath);
+  console.log(`**Latest prompt path:** \`${latestPromptPath}\` ${promptExists ? '✅' : '❌ (not yet generated)'}`);
+  console.log();
+  console.log(`**Next recommended command:**`);
+  console.log(`  \`${nextCmd}\``);
+  console.log();
+  console.log('═══════════════════════════════════════════════');
+
+  return {
+    taskStatus: status.taskStatus || 'in-progress',
+    currentSubtask,
+    currentStage,
+    targetWindow,
+    expectedSkill: config.requiredSkill,
+    planRound,
+    codeRound,
+    deliveryRound,
+    awaitingCommit: status.awaitingCommit || false,
+    commitRequiredForSubtask: status.commitRequiredForSubtask || null,
+    latestPromptPath,
+    latestReports,
+    nextRecommendedCommand: nextCmd,
+  };
 }
 
 function getTemplateName(stage) {
@@ -891,7 +1130,7 @@ function generateContinuationPrompt(taskId, status, subtaskId, stage, subtask) {
   prompt += `- **primary handoff:** \`${vars.handoffPath}\`\n`;
   prompt += `- **mirror handoff:** \`${vars.mirrorHandoffPath}\`\n`;
 
-  console.log(prompt);
+  // V2: Don't console.log here — caller handles output
   return { prompt, stage, subtask: subtaskId, continuation: true };
 }
 
@@ -946,10 +1185,23 @@ function cmdCheck(taskId) {
     }
 
     if (currentStage === 'plan-fix' || currentStage === 'code-fix') {
-      // Fix stages: must have ### Fix Mapping (P1-1)
-      if (!content.includes('### Fix Mapping')) {
-        issues.push(`${currentStage}: Missing "### Fix Mapping" section in report`);
-      } else {
+      // Fix stages: must have ### Fix Mapping (P1-1, V2: enhanced diagnostics)
+      const hasCorrectHeading = content.includes('### Fix Mapping');
+      const hasWrongHeading = content.includes('## Fix Mapping');
+
+      // V2: Detect wrong heading level
+      if (!hasCorrectHeading) {
+        if (hasWrongHeading) {
+          issues.push(`${currentStage}: Fix Mapping heading level is wrong. Expected "### Fix Mapping", found "## Fix Mapping".`);
+        } else {
+          issues.push(`${currentStage}: Missing "### Fix Mapping" section in report`);
+        }
+        issues.push(`   当前阶段: ${currentStage}`);
+        issues.push(`   当前 fix report path: ${primaryPath}`);
+        issues.push(`   期望标题: ### Fix Mapping`);
+      }
+
+      if (hasCorrectHeading) {
         // Check Fix Mapping coverage
         const fixMapping = parseFixMapping(content);
 
@@ -975,7 +1227,11 @@ function cmdCheck(taskId) {
             const unmapped = openFindings.filter(f => !mappedIds.includes(f.id));
 
             if (unmapped.length > 0) {
-              issues.push(`${currentStage}: Fix Mapping does not cover these open findings from previous review: ${unmapped.map(f => f.id).join(', ')}`);
+              issues.push(`${currentStage}: Fix Mapping 未覆盖上一轮 review 中的以下 open/reopened findings（共 ${unmapped.length} 个）:`);
+              issues.push(`   missing finding IDs: ${unmapped.map(f => f.id).join(', ')}`);
+              issues.push(`   previous review report: ${previousReviewStage.primaryReportPath}`);
+              issues.push(`   current fix report: ${primaryPath}`);
+              issues.push(`   ⚠️  Finding ID 必须精确匹配上一轮 review，不要补零、不要重命名、不要改编号。`);
             }
 
             // Check each mapped finding has a valid status
@@ -1138,10 +1394,82 @@ function getPreviousStage(stage) {
 }
 
 // ---------------------------------------------------------------------------
-// Advance (P0-1, P1-2, P1-3: stage-specific gates, subtask progression, rounds)
+// Advance (P0-1, P1-2, P1-3, V2: delivery commit checkpoint)
 // ---------------------------------------------------------------------------
-function cmdAdvance(taskId) {
+function cmdAdvance(taskId, opts = {}) {
   const status = loadStatus(taskId);
+
+  // V2: Handle --confirm-committed when awaitingCommit
+  if (opts.confirmCommitted) {
+    if (!status.awaitingCommit) {
+      console.log('⚠️  Not in awaitingCommit state. Use regular advance.');
+      return { success: false, reason: 'not-awaiting-commit' };
+    }
+
+    const commitSubtask = status.commitRequiredForSubtask;
+    status.awaitingCommit = false;
+    status.commitRequiredForSubtask = null;
+
+    // Mark the subtask as completed
+    status.subtasks[commitSubtask].status = 'completed';
+
+    // Record residual risks from this subtask
+    if (!status.residualRisks) status.residualRisks = [];
+    status.residualRisks.push({
+      subtask: commitSubtask,
+      stage: 'delivery',
+      risk: `${commitSubtask} delivery passed, manually committed by user.`,
+      recordedAt: now(),
+    });
+
+    addHistory(status, 'confirm-committed', { subtask: commitSubtask });
+
+    // Determine next subtask
+    const allSubtasks = getSubtasksForTask();
+    const currentIdx = allSubtasks.findIndex(s => s.id === commitSubtask);
+    const nextSubtask = allSubtasks[currentIdx + 1];
+
+    if (!nextSubtask) {
+      // Last subtask done
+      status.currentStage = 'done';
+      status.taskStatus = 'completed';
+      addHistory(status, 'task-completed', { subtask: commitSubtask });
+      saveStatus(taskId, status);
+      console.log(`✅ Commit confirmed. All subtasks completed! Task ${taskId} is done.`);
+      console.log(`   currentStage: done`);
+      console.log(`   nextRecommendedAction: 等待 Codex 总体验收`);
+      return { success: true, advanced: true, taskDone: true };
+    }
+
+    // Advance to next subtask
+    status.currentSubtask = nextSubtask.id;
+    status.currentStage = 'implementation-plan';
+    status.subtasks[nextSubtask.id].status = 'active';
+
+    if (!status.subtasks[nextSubtask.id].planRound) status.subtasks[nextSubtask.id].planRound = 1;
+    if (!status.subtasks[nextSubtask.id].codeRound) status.subtasks[nextSubtask.id].codeRound = 1;
+    if (!status.subtasks[nextSubtask.id].deliveryRound) status.subtasks[nextSubtask.id].deliveryRound = 1;
+
+    const round = determineRoundForStage(status, nextSubtask.id, 'implementation-plan');
+    const newStage = {
+      stageStatus: 'active',
+      currentOutputPath: generateReportPath(taskId, nextSubtask, 'implementation-plan', round),
+      latestAcceptedOutputPath: '',
+      primaryReportPath: generateReportPath(taskId, nextSubtask, 'implementation-plan', round),
+      mirrorOutputPath: path.join(outputsDir(taskId, nextSubtask.id), path.basename(generateReportPath(taskId, nextSubtask, 'implementation-plan', round))),
+      handoffPath: generateHandoffPath(taskId, nextSubtask, 'implementation-plan'),
+      mirrorHandoffPath: generateMirrorHandoffPath(taskId, nextSubtask, 'implementation-plan'),
+      startedAt: now(),
+      outputs: [],
+    };
+    status.subtasks[nextSubtask.id].stages['implementation-plan'] = newStage;
+
+    addHistory(status, 'subtask-advanced', { subtask: nextSubtask.id, stage: 'implementation-plan' });
+    saveStatus(taskId, status);
+
+    console.log(`✅ Commit confirmed. Delivery completed for ${commitSubtask}, advancing to ${nextSubtask.id} / implementation-plan`);
+    return { success: true, advanced: true, subtask: nextSubtask.id, stage: 'implementation-plan' };
+  }
 
   // Run check first
   const checkResult = cmdCheck(taskId);
@@ -1154,6 +1482,39 @@ function cmdAdvance(taskId) {
   const { currentSubtask, currentStage } = status;
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
   const config = getStageConfig(currentStage) || {};
+
+  // V2: Delivery stage → awaitingCommit instead of direct advance to next subtask
+  if (currentStage === 'delivery') {
+    // Mark delivery stage as completed
+    stageData.stageStatus = 'completed';
+    stageData.completedAt = now();
+
+    if (stageData.primaryReportPath) {
+      stageData.latestAcceptedOutputPath = stageData.primaryReportPath;
+      if (!stageData.outputs.includes(stageData.primaryReportPath)) {
+        stageData.outputs.push(stageData.primaryReportPath);
+      }
+    }
+
+    // Set awaitingCommit — do NOT advance to next subtask automatically
+    status.awaitingCommit = true;
+    status.commitRequiredForSubtask = currentSubtask;
+
+    addHistory(status, 'delivery-passed-awaiting-commit', { subtask: currentSubtask });
+    saveStatus(taskId, status);
+
+    console.log('═══════════════════════════════════════════════');
+    console.log(`✅ Delivery passed for ${currentSubtask}.`);
+    console.log();
+    console.log('⏸️  Manual commit checkpoint is required before continuing.');
+    console.log('   Harness will not commit automatically.');
+    console.log();
+    console.log('   请先手动 commit 业务代码，然后运行:');
+    console.log(`   pnpm harness advance ${taskId} --confirm-committed`);
+    console.log('═══════════════════════════════════════════════');
+
+    return { success: true, advanced: true, awaitingCommit: true, subtask: currentSubtask, stage: 'delivery' };
+  }
 
   // Mark current stage as completed
   stageData.stageStatus = 'completed';
@@ -1183,58 +1544,6 @@ function cmdAdvance(taskId) {
     console.log(`   Task ${taskId} completed.`);
     saveStatus(taskId, status);
     return { success: true, advanced: true, taskDone: true };
-  }
-
-  // Check if we need to advance to a new subtask (from delivery -> done)
-  if (currentStage === 'delivery') {
-    // Save current subtask status
-    status.subtasks[currentSubtask].status = 'completed';
-
-    const allSubtasks = getSubtasksForTask();
-    const currentIdx = allSubtasks.findIndex(s => s.id === currentSubtask);
-    const nextSubtask = allSubtasks[currentIdx + 1];
-
-    if (!nextSubtask) {
-      // Last subtask done
-      status.currentStage = 'done';
-      status.taskStatus = 'completed';
-      addHistory(status, 'task-completed', { subtask: currentSubtask });
-      saveStatus(taskId, status);
-      console.log(`✅ All subtasks completed! Task ${taskId} is done.`);
-      console.log(`   currentStage: done`);
-      console.log(`   nextRecommendedAction: 等待 Codex 总体验收`);
-      return { success: true, advanced: true, taskDone: true };
-    }
-
-    // Advance to next subtask's implementation-plan
-    status.currentSubtask = nextSubtask.id;
-    status.currentStage = 'implementation-plan';
-    status.subtasks[nextSubtask.id].status = 'active';
-
-    // Initialize round counters for the new subtask if not set
-    if (!status.subtasks[nextSubtask.id].planRound) status.subtasks[nextSubtask.id].planRound = 1;
-    if (!status.subtasks[nextSubtask.id].codeRound) status.subtasks[nextSubtask.id].codeRound = 1;
-    if (!status.subtasks[nextSubtask.id].deliveryRound) status.subtasks[nextSubtask.id].deliveryRound = 1;
-
-    const round = determineRoundForStage(status, nextSubtask.id, 'implementation-plan');
-    const newStage = {
-      stageStatus: 'active',
-      currentOutputPath: generateReportPath(taskId, nextSubtask, 'implementation-plan', round),
-      latestAcceptedOutputPath: '',
-      primaryReportPath: generateReportPath(taskId, nextSubtask, 'implementation-plan', round),
-      mirrorOutputPath: path.join(outputsDir(taskId, nextSubtask.id), path.basename(generateReportPath(taskId, nextSubtask, 'implementation-plan', round))),
-      handoffPath: generateHandoffPath(taskId, nextSubtask, 'implementation-plan'),
-      mirrorHandoffPath: generateMirrorHandoffPath(taskId, nextSubtask, 'implementation-plan'),
-      startedAt: now(),
-      outputs: [],
-    };
-    status.subtasks[nextSubtask.id].stages['implementation-plan'] = newStage;
-
-    addHistory(status, 'subtask-advanced', { subtask: nextSubtask.id, stage: 'implementation-plan' });
-    saveStatus(taskId, status);
-
-    console.log(`✅ Delivery completed for ${currentSubtask}, advancing to ${nextSubtask.id} / implementation-plan`);
-    return { success: true, advanced: true };
   }
 
   // Same subtask, next stage
@@ -1275,7 +1584,7 @@ function cmdAdvance(taskId) {
   if (getStageConfig(nextStage)?.roundGroup) {
     console.log(`   Round: ${nextRound}`);
   }
-  return { success: true, advanced: true };
+  return { success: true, advanced: true, subtask: currentSubtask, stage: nextStage };
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,7 +1642,7 @@ function cmdStatus(taskId) {
 }
 
 // ---------------------------------------------------------------------------
-// Summary
+// Summary (V2: enhanced with awaitingCommit, open findings, next command)
 // ---------------------------------------------------------------------------
 function cmdSummary(taskId) {
   const status = loadStatus(taskId);
@@ -1342,8 +1651,28 @@ function cmdSummary(taskId) {
 
   console.log(`\n# ${taskId} Summary`);
   console.log();
+
+  // Task status overview
+  console.log('## 任务状态');
+  console.log();
+  console.log(`| 项目 | 值 |`);
+  console.log(`| --- | --- |`);
+  console.log(`| taskStatus | ${status.taskStatus || 'in-progress'} |`);
+  console.log(`| currentSubtask | ${status.currentSubtask} |`);
+  console.log(`| currentStage | ${status.currentStage} |`);
+  console.log(`| awaitingCommit | ${status.awaitingCommit ? 'true' : 'false'} |`);
+  if (status.awaitingCommit) {
+    console.log(`| commitRequiredForSubtask | ${status.commitRequiredForSubtask} |`);
+  }
+  console.log();
+
+  // Subtask table
+  console.log('## 子任务进度');
+  console.log();
   console.log(`| Subtask | Title | Status | Key Stage |`);
   console.log(`| --- | --- | --- | --- |`);
+
+  const completedSubtasks = [];
 
   for (const s of allSubtasks) {
     const st = status.subtasks[s.id];
@@ -1361,23 +1690,91 @@ function cmdSummary(taskId) {
       keyStage = st.status || 'unknown';
     }
 
+    if (st.status === 'completed' || st.status === 'imported-completed') {
+      completedSubtasks.push(s.id);
+    }
+
     console.log(`| ${s.id} | ${s.title} | ${st.status} | ${keyStage} |`);
   }
 
   console.log();
-  console.log(`**Current Position:** ${status.currentSubtask} / ${status.currentStage}`);
-  if (status.taskStatus) {
-    console.log(`**Task Status:** ${status.taskStatus}`);
-  }
+  console.log(`**Completed subtasks:** ${completedSubtasks.length > 0 ? completedSubtasks.join(', ') : '(none)'}`);
+  console.log();
 
-  if (status.residualRisks && status.residualRisks.length > 0) {
-    console.log();
-    console.log('### Residual Risks');
-    for (const r of status.residualRisks) {
-      console.log(`- ${r.subtask}${r.stage ? '/' + r.stage : ''}: ${r.risk}`);
+  // Latest reports for current subtask
+  const subtaskStages = status.subtasks[status.currentSubtask]?.stages || {};
+  const latestReports = [];
+  for (const [stageId, sData] of Object.entries(subtaskStages)) {
+    if (sData.primaryReportPath) {
+      const exists = fs.existsSync(sData.primaryReportPath);
+      latestReports.push({ stage: stageId, path: sData.primaryReportPath, status: sData.stageStatus, exists });
     }
   }
 
+  if (latestReports.length > 0) {
+    console.log('## 当前子任务报告');
+    console.log();
+    for (const r of latestReports) {
+      const icon = r.exists ? '✅' : '❌';
+      console.log(`- ${icon} [${r.status}] \`${r.path}\``);
+    }
+    console.log();
+  }
+
+  // Open/reopened findings for current subtask
+  const allFindings = getAllFindingsForSubtask(status, status.currentSubtask);
+  const openFindings = allFindings.filter(f => f.status === 'open' || f.status === 'reopened');
+  if (openFindings.length > 0) {
+    console.log('## Open/Reopened Findings');
+    console.log();
+    const byPriority = { P0: [], P1: [], P2: [] };
+    for (const f of openFindings) {
+      (byPriority[f.priority] || byPriority.P2).push(f);
+    }
+    for (const p of ['P0', 'P1', 'P2']) {
+      if (byPriority[p].length > 0) {
+        console.log(`- ${p}: ${byPriority[p].map(f => f.id).join(', ')}`);
+      }
+    }
+    console.log();
+  }
+
+  // Residual risks
+  if (status.residualRisks && status.residualRisks.length > 0) {
+    console.log('## Residual Risks');
+    console.log();
+    for (const r of status.residualRisks) {
+      console.log(`- ${r.subtask}${r.stage ? '/' + r.stage : ''}: ${r.risk}`);
+    }
+    console.log();
+  }
+
+  // Latest prompt path
+  const latestPromptPath = promptFilePath(taskId, status.currentSubtask, status.currentStage);
+  const promptExists = fs.existsSync(latestPromptPath);
+  console.log(`**Latest prompt path:** \`${latestPromptPath}\` ${promptExists ? '✅' : '❌ (not yet generated)'}`);
+  console.log();
+
+  // Next recommended command
+  let nextCmd;
+  if (status.awaitingCommit) {
+    nextCmd = `pnpm harness advance ${taskId} --confirm-committed`;
+  } else if (status.currentStage === 'done' || status.taskStatus === 'completed') {
+    nextCmd = '(task completed)';
+  } else {
+    const stageData = subtaskStages[status.currentStage];
+    if (stageData?.stageStatus === 'interrupted') {
+      nextCmd = `pnpm harness resume-current ${taskId}`;
+    } else if (stageData?.stageStatus === 'completed') {
+      nextCmd = `pnpm harness advance ${taskId}`;
+    } else {
+      nextCmd = `pnpm harness next ${taskId} --copy`;
+    }
+  }
+
+  console.log('## Next Recommended Command');
+  console.log();
+  console.log(`\`${nextCmd}\``);
   console.log();
 }
 
@@ -1607,7 +2004,27 @@ function cmdResumeCurrent(taskId) {
 
   const allSubtasks = getSubtasksForTask();
   const subtask = allSubtasks.find(s => s.id === currentSubtask);
-  return generateContinuationPrompt(taskId, status, currentSubtask, currentStage, subtask);
+  const result = generateContinuationPrompt(taskId, status, currentSubtask, currentStage, subtask);
+
+  // V2: Save prompt and output structured info
+  const promptPath = promptFilePath(taskId, currentSubtask, currentStage);
+  ensureDir(path.dirname(promptPath));
+  fs.writeFileSync(promptPath, result.prompt, 'utf-8');
+
+  const config = getStageConfig(currentStage) || {};
+  const targetWindow = getTargetWindow(currentStage);
+
+  console.log('═══════════════════════════════════════════════');
+  console.log(`🔄 RESUMED PROMPT (continuation)`);
+  console.log(`   currentSubtask: ${currentSubtask}`);
+  console.log(`   currentStage: ${currentStage}`);
+  console.log(`   targetWindow: ${targetWindow}`);
+  console.log(`   promptPath: ${promptPath}`);
+  console.log('═══════════════════════════════════════════════');
+  console.log();
+  console.log(result.prompt);
+
+  return { ...result, promptPath, targetWindow };
 }
 
 // ---------------------------------------------------------------------------
@@ -1778,14 +2195,16 @@ function parseArgs(argv) {
 }
 
 function printUsage() {
-  console.log(`HEXAI Review Harness V1
+  console.log(`HEXAI Review Harness V2
 
 Usage:
   harness init <taskId> [--from <subtask>] [--stage <stage>]
                       [--force] [--archive-existing]
-  harness next <taskId>
+  harness next <taskId> [--copy]
+  harness step <taskId> [--copy]
+  harness current <taskId>
   harness check <taskId>
-  harness advance <taskId>
+  harness advance <taskId> [--confirm-committed]
   harness status <taskId>
   harness summary <taskId>
   harness import <taskId> --completed <subtask>
@@ -1795,21 +2214,24 @@ Usage:
   harness resume-current <taskId>
   harness brief <taskId>
 
-Options:
-  --force              Overwrite existing run (used with init)
-  --archive-existing   Archive existing run before init
-  --from <subtask>     Starting subtask (default: W6-A-02)
-  --stage <stage>      Starting stage (default: implementation-plan)
-  -  --completed <subtask>  Mark a subtask as imported-completed
+V2 New Commands:
+  step          check → advance → next (chain, stops on first failure)
+  current       只读当前状态，显示 targetWindow、expectedSkill、next command
+
+V2 New Options:
+  --copy               Copy prompt to clipboard (macOS pbcopy)
+  --confirm-committed  Confirm manual commit after delivery checkpoint
 
 Examples:
   harness init W6-A
   harness init W6-A --from W6-A-03 --stage code-review
   harness init W6-A --force
-  harness init W6-A --archive-existing
-  harness next W6-A
+  harness next W6-A --copy
+  harness step W6-A --copy
+  harness current W6-A
   harness check W6-A
   harness advance W6-A
+  harness advance W6-A --confirm-committed
   harness status W6-A
   harness brief W6-A
 `);
@@ -1824,7 +2246,7 @@ function main() {
 
   try {
     // Load workflow config for any command that needs it
-    const commandsNeedingConfig = ['init', 'next', 'check', 'advance', 'status', 'summary',
+    const commandsNeedingConfig = ['init', 'next', 'step', 'current', 'check', 'advance', 'status', 'summary',
       'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
@@ -1843,7 +2265,17 @@ function main() {
       }
       case 'next': {
         if (!taskId) throw new Error('taskId required');
-        cmdNext(taskId);
+        cmdNext(taskId, { copy: opts.copy === true || opts.copy === 'true' });
+        break;
+      }
+      case 'step': {
+        if (!taskId) throw new Error('taskId required');
+        cmdStep(taskId, { copy: opts.copy === true || opts.copy === 'true' });
+        break;
+      }
+      case 'current': {
+        if (!taskId) throw new Error('taskId required');
+        cmdCurrent(taskId);
         break;
       }
       case 'check': {
@@ -1853,7 +2285,7 @@ function main() {
       }
       case 'advance': {
         if (!taskId) throw new Error('taskId required');
-        cmdAdvance(taskId);
+        cmdAdvance(taskId, { confirmCommitted: opts['confirm-committed'] === true || opts['confirm-committed'] === 'true' });
         break;
       }
       case 'status': {

@@ -1239,6 +1239,7 @@ Expected: Should be fixed
     });
   });
 
+  // V2: Delivery now requires --confirm-committed before advancing to next subtask
   describe('P0-1: delivery blocks open findings (test 14, 15)', () => {
     before(() => {
       harness('init W6-A --force');
@@ -1292,8 +1293,6 @@ Expected: Should be fixed
 
     it('should block delivery when open findings exist', () => {
       const status = readStatus('W6-A');
-      // Check: no findings from prior stages should exist here
-      // But create delivery report with content that triggers issues
       createReport(status, 'delivery',
         '# Delivery Report\n\nContent without required sections.\n');
 
@@ -1301,38 +1300,53 @@ Expected: Should be fixed
       assert.equal(r.success, false, 'Delivery should fail without summary/evidence');
     });
 
-    it('should allow delivery to advance (test 14) to next subtask', () => {
+    it('V2: delivery advance should set awaitingCommit, not auto-advance to next subtask', () => {
       const status = readStatus('W6-A');
       // Create proper delivery report
       createReport(status, 'delivery',
         '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
 
       const r = harness('advance W6-A');
-      assert.equal(r.success, true, 'Delivery should advance');
+      assert.equal(r.success, true, 'Delivery advance should succeed');
 
       const updated = readStatus('W6-A');
+      // V2: Should stay at delivery, awaitingCommit
+      assert.equal(updated.currentSubtask, 'W6-A-02',
+        'Should stay at current subtask (awaitingCommit)');
+      assert.equal(updated.currentStage, 'delivery',
+        'Should stay at delivery stage');
+      assert.equal(updated.awaitingCommit, true,
+        'Should set awaitingCommit to true');
+      assert.equal(updated.commitRequiredForSubtask, 'W6-A-02',
+        'Should record which subtask needs commit');
+    });
+
+    it('V2: advance --confirm-committed should advance to next subtask', () => {
+      const r = harness('advance W6-A --confirm-committed');
+      assert.equal(r.success, true, 'confirm-committed should succeed');
+
+      const updated = readStatus('W6-A');
+      assert.equal(updated.awaitingCommit, false,
+        'awaitingCommit should be cleared');
       assert.equal(updated.currentSubtask, 'W6-A-03',
         'Should advance to next subtask W6-A-03');
       assert.equal(updated.currentStage, 'implementation-plan',
         'Next subtask should start at implementation-plan');
+      assert.equal(updated.subtasks['W6-A-02'].status, 'completed',
+        'Previous subtask should be completed');
     });
   });
 
   describe('P0-1: last subtask delivery -> done (test 15)', () => {
     before(() => {
-      // Create status from scratch with W6-A-06 as active and set current
       harness('init W6-A --force');
-
-      // Manually fast-track: init from W6-A-06 at delivery
       const reportDir = path.join(REVIEW_ROOT, 'W6', 'W6-A-06');
       fs.mkdirSync(reportDir, { recursive: true });
-
       harness('init W6-A --from W6-A-06 --stage delivery --force');
     });
 
-    it('should set task to completed when last subtask delivery passes', () => {
+    it('V2: delivery advance sets awaitingCommit, not done directly', () => {
       const status = readStatus('W6-A');
-      // Create delivery report
       const stage = status.subtasks['W6-A-06'].stages['delivery'];
       assert.ok(stage, 'delivery stage should exist');
       assert.ok(stage.primaryReportPath, 'delivery should have primaryReportPath');
@@ -1341,15 +1355,25 @@ Expected: Should be fixed
         '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
 
       const r = harness('advance W6-A');
-      assert.equal(r.success, true, 'Delivery should advance to done');
+      assert.equal(r.success, true, 'Delivery should advance');
+
+      const updated = readStatus('W6-A');
+      assert.equal(updated.awaitingCommit, true,
+        'Should be in awaitingCommit state');
+      assert.equal(updated.commitRequiredForSubtask, 'W6-A-06',
+        'Should require commit for W6-A-06');
+    });
+
+    it('V2: advance --confirm-committed completes the last subtask', () => {
+      const r = harness('advance W6-A --confirm-committed');
+      assert.equal(r.success, true, 'confirm-committed should succeed');
 
       const updated = readStatus('W6-A');
       assert.equal(updated.currentStage, 'done',
         'Should be at done stage');
       assert.equal(updated.taskStatus, 'completed',
         'Task status should be completed');
-      assert.ok(updated.subtasks['W6-A-06'].status === 'completed' ||
-        updated.subtasks['W6-A-06'].status === 'active',
+      assert.equal(updated.subtasks['W6-A-06'].status, 'completed',
         'Last subtask should be completed');
     });
   });
@@ -1436,6 +1460,393 @@ Expected: Should be fixed
             `${sid}/${stageId} should have outputs[]`);
         }
       }
+    });
+  });
+
+  // ===================================================================
+  // V2 Tests
+  // ===================================================================
+
+  describe('V2: next --copy', () => {
+    let result;
+    let status;
+
+    before(() => {
+      harness('init W6-A --force');
+      result = harness('next W6-A --copy');
+      status = readStatus('W6-A');
+    });
+
+    it('should generate a prompt with --copy flag', () => {
+      assert.equal(result.success, true, `next --copy should succeed: ${result.stderr}`);
+    });
+
+    it('should include structured metadata in output', () => {
+      assert.ok(result.stdout.includes('currentSubtask'), 'Should include currentSubtask');
+      assert.ok(result.stdout.includes('targetWindow'), 'Should include targetWindow');
+      assert.ok(result.stdout.includes('expectedSkill'), 'Should include expectedSkill');
+      assert.ok(result.stdout.includes('promptPath'), 'Should include promptPath');
+    });
+
+    it('should include copiedToClipboard in output', () => {
+      assert.ok(
+        result.stdout.includes('copiedToClipboard'),
+        'Should include copiedToClipboard in output'
+      );
+    });
+
+    it('should save prompt to file', () => {
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-implementation-plan.md');
+      assert.ok(fs.existsSync(promptPath), 'Prompt file should exist');
+      const content = fs.readFileSync(promptPath, 'utf-8');
+      assert.ok(content.includes('W6-A'), 'Prompt file should contain taskId');
+    });
+
+    it('should still contain the prompt content', () => {
+      assert.ok(result.stdout.includes('W6-A-02'), 'Should include subtask in prompt');
+    });
+  });
+
+  describe('V2: step command', () => {
+    before(() => {
+      const reportDir = path.join(REVIEW_ROOT, 'W6', 'W6-A-02');
+      if (fs.existsSync(reportDir)) {
+        const files = fs.readdirSync(reportDir);
+        for (const f of files) {
+          if (f.endsWith('.md')) {
+            try { fs.unlinkSync(path.join(reportDir, f)); } catch {}
+          }
+        }
+      }
+      harness('init W6-A --force');
+      // Create a valid implementation-plan report so check passes
+      const status = readStatus('W6-A');
+      const stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      fs.mkdirSync(path.dirname(stage.primaryReportPath), { recursive: true });
+      fs.writeFileSync(stage.primaryReportPath,
+        '# 实施方案\n\n## Fabric 官方能力核查\n- Fabric API 覆盖\n\n## 需求理解\nContent.',
+        'utf-8');
+    });
+
+    it('should execute check -> advance -> next in order', () => {
+      const r = harness('step W6-A');
+      assert.equal(r.success, true, `step should succeed: ${r.stderr}`);
+
+      // Should mention CHECK PASSED
+      assert.ok(r.stdout.includes('CHECK PASSED') || r.stdout.includes('CHECK'),
+        'Should include CHECK output');
+
+      // Should have advanced to plan-review
+      const status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'plan-review',
+        'Should have advanced to plan-review');
+
+      // Should have generated next prompt
+      assert.ok(r.stdout.includes('NEXT PROMPT GENERATED') || r.stdout.includes('NEXT'),
+        'Should include NEXT output');
+    });
+
+    it('should accept --copy flag', () => {
+      // First advance back to implementation-plan
+      harness('advance W6-A');
+      // Now the stage is plan-fix, let's create a report and test step --copy
+      // Actually let's just init fresh and test
+      harness('init W6-A --force');
+      const status = readStatus('W6-A');
+      const stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      fs.mkdirSync(path.dirname(stage.primaryReportPath), { recursive: true });
+      fs.writeFileSync(stage.primaryReportPath,
+        '# 实施方案\n\n## Fabric 官方能力核查\n- Fabric API 覆盖\n\n## 需求理解\nContent.',
+        'utf-8');
+
+      const r = harness('step W6-A --copy');
+      assert.equal(r.success, true, `step --copy should succeed: ${r.stderr}`);
+      assert.ok(
+        r.stdout.includes('Copied to clipboard') || r.stdout.includes('copiedToClipboard'),
+        'Should include clipboard info'
+      );
+    });
+  });
+
+  describe('V2: step stops on check failure', () => {
+    before(() => {
+      // Clean up any existing report files that might interfere
+      const reportDir = path.join(REVIEW_ROOT, 'W6', 'W6-A-02');
+      if (fs.existsSync(reportDir)) {
+        const files = fs.readdirSync(reportDir);
+        for (const f of files) {
+          if (f.endsWith('.md')) {
+            try { fs.unlinkSync(path.join(reportDir, f)); } catch {}
+          }
+        }
+      }
+      harness('init W6-A --force');
+    });
+
+    it('should stop at check and not execute advance/next', () => {
+      const r = harness('step W6-A');
+      // step sets process.exitCode=1 on check failure → execSync throws
+      assert.equal(r.success, false, 'step should fail when check fails');
+      assert.ok(
+        r.stdout.includes('STOPPED at check') || r.stderr.includes('STOPPED at check'),
+        'Should indicate stopped at check'
+      );
+
+      // Verify stage didn't advance
+      const status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'implementation-plan',
+        'Should still be at implementation-plan');
+    });
+  });
+
+  describe('V2: step respects delivery awaitingCommit', () => {
+    before(() => {
+      harness('init W6-A --from W6-A-06 --stage delivery --force');
+      const status = readStatus('W6-A');
+      createReport(status, 'delivery',
+        '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+    });
+
+    it('should stop at awaiting-commit after delivery', () => {
+      const r = harness('step W6-A');
+      assert.equal(r.success, true, 'step should succeed but stop at commit checkpoint');
+      assert.ok(
+        r.stdout.includes('commit checkpoint') || r.stdout.includes('awaiting-commit') || r.stdout.includes('confirm-committed'),
+        'Should mention commit checkpoint'
+      );
+
+      const status = readStatus('W6-A');
+      assert.equal(status.awaitingCommit, true,
+        'Status should have awaitingCommit=true');
+    });
+  });
+
+  describe('V2: current command', () => {
+    let result;
+
+    before(() => {
+      harness('init W6-A --force');
+      result = harness('current W6-A');
+    });
+
+    it('should succeed', () => {
+      assert.equal(result.success, true, `current should succeed: ${result.stderr}`);
+    });
+
+    it('should output current stage info', () => {
+      assert.ok(result.stdout.includes('currentSubtask'), 'Should include currentSubtask');
+      assert.ok(result.stdout.includes('currentStage'), 'Should include currentStage');
+      assert.ok(result.stdout.includes('W6-A-02'), 'Should include subtask ID');
+      assert.ok(result.stdout.includes('implementation-plan'), 'Should include stage');
+    });
+
+    it('should output targetWindow', () => {
+      assert.ok(result.stdout.includes('targetWindow'), 'Should include targetWindow');
+      assert.ok(
+        result.stdout.includes('work') || result.stdout.includes('review'),
+        'Should show window value'
+      );
+    });
+
+    it('should output expectedSkill', () => {
+      assert.ok(result.stdout.includes('expectedSkill'), 'Should include expectedSkill');
+    });
+
+    it('should output next recommended command', () => {
+      assert.ok(
+        result.stdout.includes('Next recommended command') ||
+        result.stdout.includes('harness next'),
+        'Should include next recommended command'
+      );
+    });
+
+    it('should output awaitingCommit status', () => {
+      assert.ok(result.stdout.includes('awaitingCommit'), 'Should include awaitingCommit');
+    });
+
+    it('should not modify status (read-only)', () => {
+      const status = readStatus('W6-A');
+      const historyAfter = (status.history || []).length;
+      // Run current again
+      harness('current W6-A');
+      const status2 = readStatus('W6-A');
+      const historyAfter2 = (status2.history || []).length;
+      assert.equal(historyAfter2, historyAfter,
+        'current should not add history entries');
+    });
+  });
+
+  describe('V2: Fix Mapping enhanced diagnostics', () => {
+    before(() => {
+      harness('init W6-A --force');
+
+      // Advance to plan-review
+      const s1 = readStatus('W6-A');
+      const i = s1.subtasks['W6-A-02'].stages['implementation-plan'];
+      createReportAt(i.primaryReportPath, '# Plan\n\n## Fabric 官方能力核查\nOK\n');
+      harness('advance W6-A');
+
+      // plan-review with a finding
+      let status = readStatus('W6-A');
+      createReport(status, 'plan-review',
+        '# Plan Review\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+      harness('advance W6-A');
+    });
+
+    it('should report current fix report path when Fix Mapping is missing', () => {
+      const status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'plan-fix');
+      createReport(status, 'plan-fix', '# Plan Fix Report\n\nNo Fix Mapping here.\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, false, 'Check should fail without Fix Mapping');
+      assert.ok(
+        r.stdout.includes('Fix Mapping') || r.stderr.includes('Fix Mapping'),
+        'Should mention Fix Mapping'
+      );
+    });
+
+    it('should detect wrong heading level (## Fix Mapping instead of ###)', () => {
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix',
+        '# Plan Fix Report\n\n## Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-001 | fixed | src/x.ts | done |\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, false, 'Check should fail with wrong heading level');
+      assert.ok(
+        r.stdout.includes('heading level') || r.stdout.includes('### Fix Mapping'),
+        'Should report heading level is wrong'
+      );
+    });
+
+    it('should list missing finding IDs with review and fix report paths', () => {
+      const status = readStatus('W6-A');
+      // Create fix report that uses correct heading but misses a finding
+      createReport(status, 'plan-fix',
+        '# Plan Fix Report\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P2-999 | fixed | src/y.ts | done |\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, false, 'Check should fail when finding IDs don\'t match');
+      assert.ok(
+        r.stdout.includes('W6-A-02-P1-001') || r.stderr.includes('W6-A-02-P1-001'),
+        'Should mention the missing finding ID'
+      );
+      assert.ok(
+        r.stdout.includes('不要补零') || r.stdout.includes('精确匹配') || r.stdout.includes('Finding ID'),
+        'Should remind about exact ID matching'
+      );
+    });
+  });
+
+  describe('V2: prompt includes Fix Mapping requirements', () => {
+    let result;
+
+    before(() => {
+      harness('init W6-A --force');
+      // Advance to plan-fix stage
+      const s1 = readStatus('W6-A');
+      const i = s1.subtasks['W6-A-02'].stages['implementation-plan'];
+      createReportAt(i.primaryReportPath, '# Plan\n\n## Fabric 官方能力核查\nOK\n');
+      harness('advance W6-A');
+
+      let status = readStatus('W6-A');
+      createReport(status, 'plan-review', '# PR\nOK.\n');
+      harness('advance W6-A');
+
+      status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'plan-fix');
+      result = harness('next W6-A');
+    });
+
+    it('should include ### Fix Mapping requirement in plan-fix prompt', () => {
+      assert.ok(
+        result.stdout.includes('### Fix Mapping'),
+        'plan-fix prompt should mention ### Fix Mapping heading'
+      );
+    });
+
+    it('should include requirement to cover ALL open/reopened findings', () => {
+      assert.ok(
+        result.stdout.includes('open') || result.stdout.includes('reopened') ||
+        result.stdout.includes('覆盖') || result.stdout.includes('上一轮'),
+        'Should mention covering all open/reopened findings'
+      );
+    });
+
+    it('should include requirement to copy IDs exactly from review', () => {
+      assert.ok(
+        result.stdout.includes('原样复制') || result.stdout.includes('精确匹配') ||
+        result.stdout.includes('不要补零') || result.stdout.includes('不得重命名'),
+        'Should require exact ID copying'
+      );
+    });
+  });
+
+  describe('V2: summary enhanced output', () => {
+    let result;
+
+    before(() => {
+      harness('init W6-A --force');
+      result = harness('summary W6-A');
+    });
+
+    it('should include taskStatus', () => {
+      assert.ok(result.stdout.includes('taskStatus'), 'Should include taskStatus');
+    });
+
+    it('should include awaitingCommit status', () => {
+      assert.ok(result.stdout.includes('awaitingCommit'), 'Should include awaitingCommit');
+    });
+
+    it('should include next recommended command', () => {
+      assert.ok(
+        result.stdout.includes('Next Recommended Command') ||
+        result.stdout.includes('harness'),
+        'Should include next recommended command'
+      );
+    });
+
+    it('should include completed subtasks section', () => {
+      assert.ok(
+        result.stdout.includes('Completed subtasks') ||
+        result.stdout.includes('completed'),
+        'Should include completed subtasks info'
+      );
+    });
+  });
+
+  describe('V2: awaitingCommit blocks next and step', () => {
+    before(() => {
+      harness('init W6-A --from W6-A-06 --stage delivery --force');
+      const status = readStatus('W6-A');
+      createReport(status, 'delivery',
+        '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      harness('advance W6-A'); // Now awaitingCommit
+    });
+
+    it('next should not generate prompt when awaitingCommit', () => {
+      const r = harness('next W6-A');
+      assert.equal(r.success, false, 'next should fail when awaitingCommit');
+      assert.ok(
+        r.stdout.includes('commit') || r.stderr.includes('commit') ||
+        r.stdout.includes('confirm-committed'),
+        'Should mention manual commit and confirm-committed'
+      );
+    });
+
+    it('step should stop at commit checkpoint when awaitingCommit', () => {
+      const r = harness('step W6-A');
+      // When awaitingCommit is already set, step detects it and stops
+      // The status should still have awaitingCommit=true
+      const status = readStatus('W6-A');
+      assert.equal(status.awaitingCommit, true,
+        'Status should still have awaitingCommit=true after step');
+      // Should mention commit checkpoint or confirm-committed
+      assert.ok(
+        r.stdout.includes('commit') || r.stdout.includes('confirm-committed') ||
+        r.stdout.includes('checkpoint'),
+        'Should mention commit requirements'
+      );
     });
   });
 });
