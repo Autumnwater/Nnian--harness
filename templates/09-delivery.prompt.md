@@ -1,0 +1,90 @@
+请使用 `<hexai-delivery>` 技能执行本阶段任务。
+
+# 交付物整理 — {{subtaskId}} {{subtaskTitle}}
+
+## 任务信息
+
+- **taskId:** {{taskId}}
+- **subtaskId:** {{subtaskId}}
+- **subtaskTitle:** {{subtaskTitle}}
+- **stage:** {{stage}}
+- **stageStatus:** {{stageStatus}}
+- **ownerProfile:** {{ownerProfile}}
+- **requiredSkill:** {{requiredSkill}}
+
+## 工作区
+
+- **codeRepo:** {{codeRepo}}
+- **reviewRoot:** {{reviewRoot}}
+- **reportDir:** {{reportDir}}
+- **runDir:** {{runDir}}
+- **evidenceDir:** {{evidenceDir}}
+
+## 产物路径
+
+- **primaryReportPath:** {{primaryReportPath}}
+- **mirrorOutputPath:** {{mirrorOutputPath}}
+- **implementationPlan:** {{implementationPlan}}
+- **codeMapping:** {{codeMapping}}
+- **allReviewFindings:** {{allReviewFindings}}
+
+## 边界规则
+
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{codeRepo}}`。
+2. 你有权读写 `{{codeRepo}}` 中任务相关的业务代码。
+3. 你有权写入 `{{reportDir}}` 下的交付物整理。
+4. **你不可批准自己的交付物。** 最终准入由 Codex 负责。
+5. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
+6. **不可**执行 destructive git、commit、push，除非用户明确要求。
+
+## 任务要求
+
+整理 `{{subtaskId}}` 的完整交付物，包括：
+
+1. **交付摘要** — 子任务完成情况概述
+2. **验证证据** — 功能验证、测试结果、截图等
+3. **Finding 状态汇总** — 所有 review findings 的最终状态
+4. **人工验收摘要** — 供 Codex 最终准入使用的人工验收清单
+
+## 产物要求
+
+1. 将交付物报告写入：`{{primaryReportPath}}`
+2. 将机器可读副本写入：`{{mirrorOutputPath}}`
+
+交付物报告格式：
+
+```markdown
+# {{subtaskId}} {{subtaskTitle}} 交付物报告
+
+## 交付摘要
+
+## 代码变更清单
+
+| 文件 | 变更类型 | 关联 Finding |
+| --- | --- | --- |
+
+## Finding 状态汇总
+
+| Finding | Priority | 最终状态 | 备注 |
+| --- | --- | --- | --- |
+
+## 验证证据
+
+### 功能验证
+### 测试结果
+### 手动验收
+
+## 人工验收摘要
+
+| 验收项 | 状态 | 备注 |
+| --- | --- | --- |
+
+## 遗留风险和待处理项
+```
+
+## 中断交接
+
+如果你因为 token 不足、上下文不足或外部中断无法完成本阶段，请不要伪造完成状态。请写入 handoff：
+
+**primary handoff:** `{{handoffPath}}`
+**mirror handoff:** `{{mirrorHandoffPath}}`

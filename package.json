@@ -1,0 +1,14 @@
+{
+  "name": "hexai-review-harness",
+  "version": "1.0.0",
+  "description": "HEXAI Review Harness V1 — lightweight orchestration for multi-agent weekly task R&D workflow",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/harness.test.js",
+    "harness": "node scripts/harness.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

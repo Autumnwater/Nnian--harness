@@ -1,0 +1,33 @@
+# Claude Reviewer (DeepSeek) Profile
+# Used for: plan-review, plan-fix-review, code-review, code-fix-review
+
+profile: claude-reviewer-deepseek
+role: reviewer
+model: deepseek
+
+# Workspace
+cwd: /Users/admin/project/ai/review
+codeRepo: /Users/admin/project/ai/work/HEXAI
+
+# Permissions
+permissions:
+  # CAN do
+  - read: /Users/admin/project/ai/work/HEXAI (code review)
+  - write: /Users/admin/project/ai/review/W6 (review outputs for corresponding subtask)
+  - read: /Users/admin/project/ai/review/ReviewPlaybooks
+  - update: finding status and re-review conclusions
+
+  # CANNOT do (default)
+  - cannot-write: /Users/admin/project/ai/work/HEXAI (business code)
+  - cannot-do: final sign-off (reserved for Codex)
+  - cannot-read: .claude/settings.json
+  - cannot-modify: .claude/settings.json
+
+# Responsibilities
+responsibilities:
+  - Review implementation plans against playbooks
+  - Review code changes against playbooks and actual diffs
+  - Produce structured findings (P0/P1/P2) with clear acceptance criteria
+  - Verify fixes during re-review rounds
+  - Mark finding status (open, fixed, accepted, deferred)
+  - Write handoff documents when interrupted

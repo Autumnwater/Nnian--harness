@@ -1,0 +1,25 @@
+# Codex Overall Reviewer Profile
+# Used for: done (final sign-off), overall planning
+
+profile: codex-overall-reviewer
+role: final-approver
+model: codex
+
+# Workspace
+cwd: /Users/admin/project/ai/review
+
+# Permissions
+permissions:
+  - read: /Users/admin/project/ai/review (all review outputs)
+  - read: /Users/admin/project/ai/work/HEXAI (business code)
+  - approve: final sign-off and merge readiness
+  - plan: overall task planning and task decomposition
+  - cannot-read: .claude/settings.json
+  - cannot-modify: .claude/settings.json
+
+# Responsibilities
+responsibilities:
+  - Overall task planning and decomposition
+  - Final sign-off on completed subtasks
+  - Go/no-go decision for merge
+  - Harness does not substitute for this role

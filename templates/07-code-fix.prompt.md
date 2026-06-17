@@ -1,0 +1,79 @@
+请使用 `<hexai-code-fix>` 技能执行本阶段任务。
+
+# 代码修复 — {{subtaskId}} {{subtaskTitle}}
+
+## 任务信息
+
+- **taskId:** {{taskId}}
+- **subtaskId:** {{subtaskId}}
+- **subtaskTitle:** {{subtaskTitle}}
+- **stage:** {{stage}}
+- **stageStatus:** {{stageStatus}}
+- **ownerProfile:** {{ownerProfile}}
+- **requiredSkill:** {{requiredSkill}}
+
+## 工作区
+
+- **codeRepo:** {{codeRepo}}
+- **reviewRoot:** {{reviewRoot}}
+- **reportDir:** {{reportDir}}
+- **runDir:** {{runDir}}
+- **evidenceDir:** {{evidenceDir}}
+
+## 产物路径
+
+- **primaryReportPath:** {{primaryReportPath}}
+- **mirrorOutputPath:** {{mirrorOutputPath}}
+- **reviewFindings:** {{reviewFindingsPath}}
+
+## 边界规则
+
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{codeRepo}}`。
+2. 你有权读写 `{{codeRepo}}` 中任务相关的业务代码。
+3. 你有权写入 `{{reportDir}}` 下的修复记录和验证证据。
+4. **按 CodeReview findings 做最小代码修复。** 只修 finding 指出的问题，不做额外变更。
+5. **你不可批准自己的修复。** 修复后的代码必须经过 reviewer 复审。
+6. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
+7. **不可**执行 destructive git、commit、push，除非用户明确要求。
+
+## 任务要求
+
+请根据以下 Code Review findings 进行代码修复：
+
+`{{reviewFindingsPath}}`
+
+修复要求：
+1. 逐条处理每个 finding（P0 必须修复，P1 强烈建议修复，P2 评估修复）
+2. 每个修复应是最小变更 — 只修问题，不做不相关的重构
+3. 确保代码风格与现有代码一致
+4. 如果决定不修复某个 finding，必须给出充分理由
+
+## 产物要求
+
+1. 将修复报告写入：`{{primaryReportPath}}`
+2. 将机器可读副本写入：`{{mirrorOutputPath}}`
+
+修复报告格式：
+
+```markdown
+# {{subtaskId}} {{subtaskTitle}} CodeFix报告
+
+## 修复概览
+
+| Finding | Status | 修复文件 | 修复说明 |
+| --- | --- | --- | --- |
+
+## 详细修复
+
+### {{subtaskId}}-P{n}-{id}
+- **修复文件:** {路径}
+- **修复内容:** {说明}
+- **验证方式:** {如何验证}
+```
+
+## 中断交接
+
+如果你因为 token 不足、上下文不足或外部中断无法完成本阶段，请不要伪造完成状态。请写入 handoff：
+
+**primary handoff:** `{{handoffPath}}`
+**mirror handoff:** `{{mirrorHandoffPath}}`
