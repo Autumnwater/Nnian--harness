@@ -78,7 +78,7 @@
       "id": "delivery",
       "label": "交付物整理",
       "requiredSkill": "hexai-delivery",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-reviewer-deepseek",
       "nextStage": "done",
       "roundGroup": "delivery"
     },
@@ -98,7 +98,7 @@
 
   "fixReviewStages": ["plan-fix-review", "code-fix-review"],
 
-  "implementerStages": ["implementation-plan", "plan-fix", "code-implementation", "code-fix", "delivery"],
+  "implementerStages": ["implementation-plan", "plan-fix", "code-implementation", "code-fix"],
 
   "subtasks": [
     { "id": "W6-A-01", "title": "缩放锚点", "shortTitle": "缩放锚点", "taskTheme": "W6-A画布本体UIUX收口" },

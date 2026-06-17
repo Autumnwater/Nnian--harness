@@ -65,17 +65,18 @@
 
 ## ⚠️ Fix Mapping 强制要求
 
-1. **必须使用精确标题 `### Fix Mapping`** — 不得使用 `## Fix Mapping` 或其他级别。
+1. **必须使用精确标题 `### Fix Mapping`** — 不得使用 `## Fix Mapping` 或其他级别。标题必须独占一行。
 2. **必须覆盖上一轮 review 中的所有 open/reopened P0/P1/P2 findings。** 不得遗漏。
 3. **Finding ID 必须从 review 报告中原样复制。** 不得补零（如 P1-001 → P1-01 是错误的），不得重命名，不得改编号。
 4. **Fix Mapping 表格至少包含以下列：**
    | Finding | Status | 修复内容/文件 | 验证 |
-5. **Status 推荐使用：**
+5. **Status 推荐使用（FixReport 阶段均为提议，最终状态由 fix-review 确认）：**
    - `fixed` — 已修复
-   - `deferred` — 推迟到后续处理（需说明理由）
-   - `false-positive` — 误报（需说明理由）
+   - `deferred` — 推迟处理（FixReport 提出，需 fix-review 确认）
+   - `false-positive` — 误报（FixReport 提出，需 fix-review 确认）
    - `accepted` — 接受建议并已修改
-6. **不满足以上要求将导致 check 失败，无法 advance。**
+6. **⚠️ deferred / false-positive 只是提议。** 最终关闭必须由 fix-review 阶段确认 verified / accepted / deferred / false-positive。FixReport 不得自行将 finding 标记为最终关闭。
+7. **不满足以上要求将导致 check 失败，无法 advance。**
 
 ## 中断交接
 

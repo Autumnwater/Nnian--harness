@@ -97,11 +97,18 @@ function getSubtasksForTask() {
 }
 
 // ---------------------------------------------------------------------------
-// V2: Clipboard helper (macOS pbcopy)
+// V2: Clipboard helper (macOS pbcopy, injectable for testing)
+// HARNESS_DISABLE_PBCOPY=1  : force failure, output warning
+// HARNESS_COPY_COMMAND=<cmd>: override copy command (e.g. "xclip -selection clipboard")
 // ---------------------------------------------------------------------------
 function copyToClipboard(text) {
+  // Allow forcing failure for test environments
+  if (process.env.HARNESS_DISABLE_PBCOPY === '1') {
+    return false;
+  }
+  const copyCmd = process.env.HARNESS_COPY_COMMAND || 'pbcopy';
   try {
-    execSync('pbcopy', { input: text, stdio: ['pipe', 'ignore', 'pipe'] });
+    execSync(copyCmd, { input: text, stdio: ['pipe', 'ignore', 'pipe'] });
     return true;
   } catch {
     return false;
@@ -204,22 +211,43 @@ function loadStatus(taskId) {
   if (!status) {
     throw new Error(`Corrupt status file for ${taskId}: ${p}`);
   }
-  // Migrate old status to new fields (P1-3, P1-5)
+  let migrated = false;
+  // Migrate old status to new fields (P1-3, P1-5, P2-2)
   for (const [sid, st] of Object.entries(status.subtasks || {})) {
-    if (st.planRound === undefined) st.planRound = 1;
-    if (st.codeRound === undefined) st.codeRound = 1;
-    if (st.deliveryRound === undefined) st.deliveryRound = 1;
+    if (st.planRound === undefined) { st.planRound = 1; migrated = true; }
+    if (st.codeRound === undefined) { st.codeRound = 1; migrated = true; }
+    if (st.deliveryRound === undefined) { st.deliveryRound = 1; migrated = true; }
     for (const [stageId, stage] of Object.entries(st.stages || {})) {
-      if (!stage.outputs) stage.outputs = [];
-      if (!stage.currentOutputPath) stage.currentOutputPath = stage.primaryReportPath || '';
+      if (!stage.outputs) { stage.outputs = []; migrated = true; }
+      if (!stage.currentOutputPath) { stage.currentOutputPath = stage.primaryReportPath || ''; migrated = true; }
     }
   }
-  if (!status.residualRisks) status.residualRisks = [];
+  // P2-2: Migration defaults for V2 fields
+  if (status.schemaVersion === undefined) {
+    status.schemaVersion = 2;
+    migrated = true;
+  }
+  if (status.awaitingCommit === undefined) {
+    status.awaitingCommit = false;
+    migrated = true;
+  }
+  if (status.commitRequiredForSubtask === undefined) {
+    status.commitRequiredForSubtask = null;
+    migrated = true;
+  }
+  if (!status.residualRisks) { status.residualRisks = []; migrated = true; }
+  if (migrated) {
+    saveStatus(taskId, status);
+  }
   return status;
 }
 
 function saveStatus(taskId, status) {
   status.updatedAt = now();
+  // P2-2: Normalize schemaVersion on every write (handles both fresh and migrated status)
+  if (status.schemaVersion === undefined) status.schemaVersion = 2;
+  if (status.awaitingCommit === undefined) status.awaitingCommit = false;
+  if (status.commitRequiredForSubtask === undefined) status.commitRequiredForSubtask = null;
   writeJSON(statusPath(taskId), status);
 }
 
@@ -480,32 +508,43 @@ function getAllFindingsForSubtask(status, subtaskId) {
 }
 
 /**
- * Parse Fix Mapping table from report content (P1-1).
+ * Parse Fix Mapping table from report content (P1-7).
  * Format:
  *   ### Fix Mapping
  *   | Finding | Status | 修复文件 | 验证 |
  *   | --- | --- | --- | --- |
  *   | W6-A-02-P1-001 | fixed | src/file.ts | verified |
  *
+ * P1-7: Section must start at a line that is EXACTLY "### Fix Mapping".
+ *       Finds the line, then reads table rows until the next heading or end.
  * Returns array of { finding, status, fixFile, verification }
  */
 function parseFixMapping(content) {
   const mapping = [];
-  const sectionMatch = content.match(/### Fix Mapping[\s\S]*?(?=\n###|\n##|$)/);
-  if (!sectionMatch) return mapping;
+  // P1-7: Find the heading line — must be exactly "### Fix Mapping" on its own line
+  const lines = content.split('\n');
+  let headingLineIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed === '### Fix Mapping') {
+      headingLineIdx = i;
+      break;
+    }
+  }
+  if (headingLineIdx === -1) return mapping;
 
-  const lines = sectionMatch[0].split('\n');
-  let inTable = false;
-
-  for (const line of lines) {
+  // P1-7: Scan section lines (after heading) for table rows until next heading
+  const sectionLines = lines.slice(headingLineIdx + 1);
+  for (const line of sectionLines) {
     const trimmed = line.trim();
+    // Stop at next markdown heading (H1-H4)
+    if (/^#{1,4}\s/.test(trimmed)) break;
     if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
       const cells = trimmed.split('|').filter(c => c.trim()).map(c => c.trim());
       if (cells.length >= 2) {
-        // Skip header and separator rows
         const headerVal = cells[0].toLowerCase();
+        // Skip header row, separator row, and empty cells
         if (headerVal === 'finding' || headerVal === '---' || cells[0] === '') continue;
-        inTable = true;
         mapping.push({
           finding: cells[0],
           status: cells[1].toLowerCase(),
@@ -513,10 +552,6 @@ function parseFixMapping(content) {
           verification: cells[3] || '',
         });
       }
-    } else if (inTable && trimmed === '') {
-      break;
-    } else if (inTable && !trimmed.startsWith('|')) {
-      break;
     }
   }
 
@@ -524,7 +559,8 @@ function parseFixMapping(content) {
 }
 
 /**
- * Find the most recent review stage output in the same round group (plan/code).
+ * Find the latest blocking review stage output in the same round group (plan/code).
+ * P1-5: For plan-fix prefer plan-fix-review; for code-fix prefer code-fix-review.
  * Used by fix stages to determine which findings need coverage.
  */
 function findPreviousReviewStage(status, subtaskId, roundGroup) {
@@ -675,8 +711,11 @@ function cmdInit(taskId, opts = {}) {
     taskTitle: getWorkflowConfig().taskTitle || `${taskId} 画布本体UIUX收口`,
     createdAt: now(),
     updatedAt: now(),
+    schemaVersion: 2,  // P2-2
     currentSubtask: fromSubtask,
     currentStage: startStage,
+    awaitingCommit: false,     // P2-2
+    commitRequiredForSubtask: null,  // P2-2
     residualRisks: [],
     subtasks: {},
     history: [],
@@ -853,11 +892,8 @@ function cmdNext(taskId, opts = {}) {
     stageData.stageStatus = 'active';
     if (!stageData.startedAt) stageData.startedAt = now();
 
-    // Add to outputs[] (P1-5)
-    if (stageData.primaryReportPath && !stageData.outputs.includes(stageData.primaryReportPath)) {
-      stageData.outputs.push(stageData.primaryReportPath);
-    }
-
+    // P2-3: Do NOT add to outputs[] here — the report doesn't exist yet.
+    // outputs[] and latestAcceptedOutputPath are set only after check/advance pass.
     saveStatus(taskId, status);
 
     const templateName = getTemplateName(currentStage);
@@ -911,6 +947,25 @@ function cmdNext(taskId, opts = {}) {
 // V2: Step — chain check → advance → next
 // ---------------------------------------------------------------------------
 function cmdStep(taskId, opts = {}) {
+  // P1-1: If already at commit checkpoint, skip check/advance entirely
+  const preCheck = loadStatus(taskId);
+  if (preCheck.awaitingCommit) {
+    console.log('═══════════════════════════════════════════════');
+    console.log('⏸️  Already at commit checkpoint — awaiting manual commit.');
+    console.log(`   需要手动 commit 的子任务: ${preCheck.commitRequiredForSubtask}`);
+    console.log();
+    console.log('   请先手动 commit 业务代码，然后运行:');
+    console.log(`   pnpm harness advance ${taskId} --confirm-committed`);
+    console.log('═══════════════════════════════════════════════');
+    return {
+      success: true,
+      stoppedAt: 'awaiting-commit',
+      awaitingCommit: true,
+      commitRequiredForSubtask: preCheck.commitRequiredForSubtask,
+      nextCommand: `pnpm harness advance ${taskId} --confirm-committed`,
+    };
+  }
+
   // Step 1: Check
   console.log('▶ CHECK');
   const checkResult = cmdCheck(taskId);
@@ -934,7 +989,13 @@ function cmdStep(taskId, opts = {}) {
   if (advanceResult.awaitingCommit) {
     console.log('⏸️  Delivery passed — manual commit checkpoint required.');
     console.log('   STEP stopped at commit checkpoint.');
-    return { success: true, stoppedAt: 'awaiting-commit', awaitingCommit: true };
+    return {
+      success: true,
+      stoppedAt: 'awaiting-commit',
+      awaitingCommit: true,
+      commitRequiredForSubtask: advanceResult.subtask,
+      nextCommand: `pnpm harness advance ${taskId} --confirm-committed`,
+    };
   }
 
   console.log(`✅ ADVANCED: ${advanceResult.subtask || ''} / ${advanceResult.stage || ''}\n`);
@@ -1057,6 +1118,8 @@ function cmdCurrent(taskId) {
     latestReports,
     nextRecommendedCommand: nextCmd,
   };
+  // P2-2: Persist migration / normalization on read-only commands too
+  saveStatus(taskId, status);
 }
 
 function getTemplateName(stage) {
@@ -1185,36 +1248,39 @@ function cmdCheck(taskId) {
     }
 
     if (currentStage === 'plan-fix' || currentStage === 'code-fix') {
-      // Fix stages: must have ### Fix Mapping (P1-1, V2: enhanced diagnostics)
-      const hasCorrectHeading = content.includes('### Fix Mapping');
-      const hasWrongHeading = content.includes('## Fix Mapping');
+      // Fix stages: must have ### Fix Mapping (P1-7: line-level regex match)
+      // P1-7: Must match a line that is EXACTLY "### Fix Mapping" (no extra chars on line)
+      const headingMatch = content.match(/^###\s+Fix\s+Mapping\s*$/m);
+      const hasCorrectHeading = !!headingMatch;
+      // P1-7: Detect wrong heading level — any other markdown heading level for Fix Mapping
+      const wrongHeadingMatch = content.match(/^(#{1,2}|#{4,})\s+Fix\s+Mapping\s*$/m);
+      const hasWrongHeading = !!wrongHeadingMatch;
 
-      // V2: Detect wrong heading level
       if (!hasCorrectHeading) {
         if (hasWrongHeading) {
-          issues.push(`${currentStage}: Fix Mapping heading level is wrong. Expected "### Fix Mapping", found "## Fix Mapping".`);
+          issues.push(`${currentStage}: Fix Mapping heading level is wrong. Expected "### Fix Mapping", found "${wrongHeadingMatch[0]}".`);
         } else {
-          issues.push(`${currentStage}: Missing "### Fix Mapping" section in report`);
+          issues.push(`${currentStage}: Missing "### Fix Mapping" section. The heading must be on its own line with exactly three hashes.`);
         }
         issues.push(`   当前阶段: ${currentStage}`);
-        issues.push(`   当前 fix report path: ${primaryPath}`);
-        issues.push(`   期望标题: ### Fix Mapping`);
+        issues.push(`   current fix report: ${primaryPath}`);
+        issues.push(`   expected heading: ### Fix Mapping (on its own line)`);
       }
 
       if (hasCorrectHeading) {
         // Check Fix Mapping coverage
         const fixMapping = parseFixMapping(content);
 
-        // Determine round group to find previous review
+        // P1-5: Find latest blocking review report
         const roundGroup = config.roundGroup; // 'plan' or 'code'
-        let previousReviewStage = null;
+        let latestBlockingReviewStage = null;
 
         if (roundGroup) {
-          previousReviewStage = findPreviousReviewStage(status, currentSubtask, roundGroup);
+          latestBlockingReviewStage = findPreviousReviewStage(status, currentSubtask, roundGroup);
         }
 
-        if (previousReviewStage && previousReviewStage.primaryReportPath) {
-          const reviewContent = fs.readFileSync(previousReviewStage.primaryReportPath, 'utf-8');
+        if (latestBlockingReviewStage && latestBlockingReviewStage.primaryReportPath) {
+          const reviewContent = fs.readFileSync(latestBlockingReviewStage.primaryReportPath, 'utf-8');
           const findings = parseFindings(reviewContent);
 
           // Filter open/reopened findings
@@ -1227,14 +1293,16 @@ function cmdCheck(taskId) {
             const unmapped = openFindings.filter(f => !mappedIds.includes(f.id));
 
             if (unmapped.length > 0) {
-              issues.push(`${currentStage}: Fix Mapping 未覆盖上一轮 review 中的以下 open/reopened findings（共 ${unmapped.length} 个）:`);
+              // P1-5: Updated terminology
+              issues.push(`${currentStage}: Fix Mapping 未覆盖 latest blocking review 中的以下 open/reopened findings（共 ${unmapped.length} 个）:`);
               issues.push(`   missing finding IDs: ${unmapped.map(f => f.id).join(', ')}`);
-              issues.push(`   previous review report: ${previousReviewStage.primaryReportPath}`);
+              issues.push(`   latest blocking review report: ${latestBlockingReviewStage.primaryReportPath}`);
               issues.push(`   current fix report: ${primaryPath}`);
               issues.push(`   ⚠️  Finding ID 必须精确匹配上一轮 review，不要补零、不要重命名、不要改编号。`);
             }
 
-            // Check each mapped finding has a valid status
+            // P1-6: Status validity check — all proposed statuses are allowed in FixReport
+            // (deferred/false-positive are proposals only; fix-review confirms final)
             for (const m of fixMapping) {
               const statusVal = m.status;
               if (!['fixed', 'accepted', 'deferred', 'false-positive', 'needs-decision'].includes(statusVal)) {
@@ -1248,20 +1316,14 @@ function cmdCheck(taskId) {
               issues.push(`${currentStage}: These findings have status "needs-decision": ${needsDecision.map(m => m.finding).join(', ')} — blocks advancement`);
             }
 
-            // Check P0/P1 must be fixed or explicitly accepted/deferred
-            for (const m of fixMapping) {
-              const findingObj = openFindings.find(f => f.id === m.finding);
-              if (findingObj && (findingObj.priority === 'P0' || findingObj.priority === 'P1')) {
-                if (!['fixed', 'accepted', 'deferred', 'false-positive'].includes(m.status)) {
-                  issues.push(`${currentStage}: P${findingObj.priority} finding "${m.finding}" must be fixed/accepted/deferred/false-positive (current: ${m.status})`);
-                }
-              }
-            }
+            // P1-6: DO NOT enforce that P0/P1 must be fixed/accepted/deferred here.
+            // FixReport is a PROPOSAL. The fix-review stage confirms final status.
+            // Only fix-review findings (verified/accepted/deferred/false-positive) are final.
           } else {
-            console.log(`   ℹ️  No open/reopened findings from previous review`);
+            console.log(`   ℹ️  No open/reopened findings from latest blocking review`);
           }
         } else {
-          console.log(`   ℹ️  No previous review stage output found — skipping coverage check`);
+          console.log(`   ℹ️  No latest blocking review stage output found — skipping coverage check`);
         }
       }
     }
@@ -1401,9 +1463,25 @@ function cmdAdvance(taskId, opts = {}) {
 
   // V2: Handle --confirm-committed when awaitingCommit
   if (opts.confirmCommitted) {
+    // P1-4: Strict preconditions — exit non-zero on any violation
     if (!status.awaitingCommit) {
-      console.log('⚠️  Not in awaitingCommit state. Use regular advance.');
-      return { success: false, reason: 'not-awaiting-commit' };
+      console.log('⚠️  Not at commit checkpoint. Use regular "harness advance" first.');
+      console.log('   --confirm-committed only works after a delivery passes and awaitingCommit is set.');
+      process.exit(1);
+    }
+    if (!status.commitRequiredForSubtask) {
+      console.log('⚠️  commitRequiredForSubtask is missing from status. Cannot confirm commit.');
+      process.exit(1);
+    }
+    if (status.currentSubtask !== status.commitRequiredForSubtask) {
+      console.log(`⚠️  Current subtask (${status.currentSubtask}) does not match commitRequiredForSubtask (${status.commitRequiredForSubtask}).`);
+      console.log('   You may be at a different subtask. Use "harness current" to check.');
+      process.exit(1);
+    }
+    if (status.currentStage !== 'delivery') {
+      console.log(`⚠️  Current stage is "${status.currentStage}", not "delivery".`);
+      console.log('   --confirm-committed only applies after a delivery passes.');
+      process.exit(1);
     }
 
     const commitSubtask = status.commitRequiredForSubtask;

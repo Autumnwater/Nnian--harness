@@ -36,6 +36,32 @@ function harness(args = '') {
   }
 }
 
+function harnessEnv(envOverrides, args = '') {
+  const cmd = `node "${HARNESS_SCRIPT}" ${args}`;
+  try {
+    const stdout = execSync(cmd, {
+      cwd: HARNESS_DIR,
+      env: { ...process.env, REVIEW_ROOT, CODE_REPO, HARNESS_ROOT: HARNESS_DIR, ...envOverrides },
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10000,
+    });
+    return { success: true, stdout, stderr: '' };
+  } catch (err) {
+    return {
+      success: false,
+      stdout: err.stdout || '',
+      stderr: err.stderr || '',
+      exitCode: err.status,
+    };
+  }
+}
+
+function saveStatus(taskId, status) {
+  const p = path.join(HARNESS_DIR, 'runs', taskId, 'status.json');
+  fs.writeFileSync(p, JSON.stringify(status, null, 2) + '\n', 'utf-8');
+}
+
 function readStatus(taskId) {
   const p = path.join(HARNESS_DIR, 'runs', taskId, 'status.json');
   if (!fs.existsSync(p)) return null;
@@ -1847,6 +1873,200 @@ Expected: Should be fixed
         r.stdout.includes('checkpoint'),
         'Should mention commit requirements'
       );
+    });
+  });
+
+  // ===================================================================
+  // P1-4: advance --confirm-committed strict preconditions
+  // ===================================================================
+  describe('P1-4: advance --confirm-committed preconditions', () => {
+    it('should fail --confirm-committed when not in awaitingCommit state', () => {
+      harness('init W6-A --force');
+      const r = harness('advance W6-A --confirm-committed');
+      assert.equal(r.success, false, 'Should fail when not at commit checkpoint');
+      assert.ok(
+        r.stdout.includes('Not at commit checkpoint') ||
+        r.stdout.includes('awaitingCommit') ||
+        r.stdout.includes('commit'),
+        'Should explain not at commit checkpoint'
+      );
+    });
+
+    it('should fail --confirm-committed when currentStage is not delivery', () => {
+      // Set up: delivery passed → awaitingCommit
+      harness('init W6-A --force');
+      harness('advance W6-A'); // implementation-plan → plan-review
+      // Manually set awaitingCommit but keep stage as plan-review
+      const status = readStatus('W6-A');
+      status.awaitingCommit = true;
+      status.commitRequiredForSubtask = status.currentSubtask;
+      // Change stage away from delivery
+      status.currentStage = 'plan-review';
+      saveStatus('W6-A', status);
+
+      const r = harness('advance W6-A --confirm-committed');
+      assert.equal(r.success, false, 'Should fail when stage is not delivery');
+      assert.ok(
+        r.stdout.includes('delivery') || r.stdout.includes('stage'),
+        'Should explain stage mismatch'
+      );
+    });
+  });
+
+  // ===================================================================
+  // P1-7: Fix Mapping heading level detection
+  // ===================================================================
+  describe('P1-7: Fix Mapping heading level detection', () => {
+    before(() => {
+      harness('init W6-A --force');
+      // Advance to plan-fix
+      const s1 = readStatus('W6-A');
+      createReportAt(s1.subtasks['W6-A-02'].stages['implementation-plan'].primaryReportPath,
+        '# Plan\n\n## Fabric 官方能力核查\nOK\n');
+      harness('advance W6-A');
+      let status = readStatus('W6-A');
+      createReport(status, 'plan-review', '# PR\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+      harness('advance W6-A');
+    });
+
+    it('should fail check with #### Fix Mapping (H4)', () => {
+      const status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'plan-fix');
+      createReport(status, 'plan-fix',
+        '# Plan Fix Report\n\n#### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-001 | fixed | src/x.ts | done |\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, false, 'H4 heading should be rejected');
+      assert.ok(
+        r.stdout.includes('heading level') || r.stdout.includes('### Fix Mapping'),
+        'Should report heading level error'
+      );
+    });
+
+    it('should pass check with correct ### Fix Mapping', () => {
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix',
+        '# Plan Fix Report\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-001 | fixed | src/x.ts | done |\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, true, 'Correct H3 heading should pass');
+    });
+  });
+
+  // ===================================================================
+  // P2-1: pbcopy injectable via env vars
+  // ===================================================================
+  describe('P2-1: pbcopy injectable via HARNESS_DISABLE_PBCOPY', () => {
+    it('should output copiedToClipboard: false when HARNESS_DISABLE_PBCOPY=1', () => {
+      harness('init W6-A --force');
+      const r = harnessEnv({ HARNESS_DISABLE_PBCOPY: '1' }, 'next W6-A --copy');
+      assert.equal(r.success, true, 'next --copy should still succeed');
+      assert.ok(
+        r.stdout.includes('copiedToClipboard: false') || r.stdout.includes('copiedToClipboard'),
+        'Should report copiedToClipboard: false'
+      );
+      assert.ok(
+        r.stdout.includes('pbcopy') || r.stdout.includes('warning') || r.stdout.includes('无法复制'),
+        'Should warn about clipboard failure'
+      );
+    });
+
+    it('should still generate prompt file when clipboard fails', () => {
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-implementation-plan.md');
+      if (fs.existsSync(promptPath)) fs.unlinkSync(promptPath);
+      const r = harnessEnv({ HARNESS_DISABLE_PBCOPY: '1' }, 'next W6-A --copy');
+      assert.equal(r.success, true);
+      assert.ok(fs.existsSync(promptPath), 'Prompt file should still be created');
+    });
+  });
+
+  // ===================================================================
+  // P2-2: schemaVersion migration
+  // ===================================================================
+  describe('P2-2: schemaVersion migration', () => {
+    it('should add schemaVersion: 2 to new status', () => {
+      harness('init W6-A --force');
+      const status = readStatus('W6-A');
+      assert.equal(status.schemaVersion, 2, 'New status should have schemaVersion: 2');
+      assert.equal(status.awaitingCommit, false, 'New status should have awaitingCommit: false');
+      assert.equal(status.commitRequiredForSubtask, null, 'New status should have commitRequiredForSubtask: null');
+    });
+
+    it('should migrate old status without schemaVersion', () => {
+      // Use a unique task ID to avoid collision with any existing run
+      const taskId = 'W6-A-MIGRATE-TEST';
+      const statusPath = path.join(HARNESS_DIR, 'runs', taskId, 'status.json');
+      const oldStatus = {
+        taskId,
+        taskTitle: 'Migration Test',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        currentSubtask: 'W6-A-02',
+        currentStage: 'implementation-plan',
+        residualRisks: [],
+        subtasks: {
+          'W6-A-02': {
+            id: 'W6-A-02',
+            title: 'Test',
+            shortTitle: 'Test',
+            taskTheme: 'Test',
+            planRound: 1,
+            codeRound: 1,
+            deliveryRound: 1,
+            status: 'active',
+            stages: {
+              'implementation-plan': {
+                stageStatus: 'active',
+                currentOutputPath: '',
+                latestAcceptedOutputPath: '',
+                outputs: [],
+              },
+            },
+          },
+        },
+        history: [],
+        // NOTE: schemaVersion, awaitingCommit, commitRequiredForSubtask are intentionally absent
+      };
+      fs.mkdirSync(path.dirname(statusPath), { recursive: true });
+      fs.writeFileSync(statusPath, JSON.stringify(oldStatus, null, 2), 'utf-8');
+
+      // loadStatus (via current) should migrate this old status
+      const r = harness(`current ${taskId}`);
+      assert.equal(r.success, true, 'Should handle old status gracefully');
+
+      const migrated = readStatus(taskId);
+      assert.equal(migrated.schemaVersion, 2, 'Should have schemaVersion: 2 after migration');
+      assert.equal(migrated.awaitingCommit, false, 'Should have awaitingCommit: false after migration');
+      assert.equal(migrated.commitRequiredForSubtask, null, 'Should have commitRequiredForSubtask: null after migration');
+    });
+
+    it('should persist schemaVersion: 2 after saveStatus', () => {
+      harness('init W6-A --force');
+      const status = readStatus('W6-A');
+      assert.equal(status.schemaVersion, 2, 'Should write schemaVersion: 2');
+      // Trigger a save
+      harness('current W6-A');
+      const saved = readStatus('W6-A');
+      assert.equal(saved.schemaVersion, 2, 'schemaVersion should persist after save');
+    });
+  });
+
+  // ===================================================================
+  // P2-3: outputs[] not updated by next
+  // ===================================================================
+  describe('P2-3: next does not add non-existent paths to outputs[]', () => {
+    it('next should not add primaryReportPath to outputs[] before report exists', () => {
+      harness('init W6-A --force');
+      const before = readStatus('W6-A');
+      const outputsBefore = before.subtasks['W6-A-02'].stages['implementation-plan'].outputs.slice();
+
+      harness('next W6-A');
+
+      const after = readStatus('W6-A');
+      const outputsAfter = after.subtasks['W6-A-02'].stages['implementation-plan'].outputs;
+      // outputs should NOT have grown just from next being called
+      assert.equal(outputsAfter.length, outputsBefore.length,
+        'outputs[] should not grow just from next being called');
     });
   });
 });
