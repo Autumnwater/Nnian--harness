@@ -147,6 +147,26 @@ function now() {
   return new Date().toISOString();
 }
 
+function getCurrentYyyymmdd() {
+  const override = process.env.HARNESS_DATE_YYYYMMDD;
+  if (override) {
+    if (!/^\d{8}$/.test(override)) {
+      throw new Error(`Invalid HARNESS_DATE_YYYYMMDD: ${override}. Expected YYYYMMDD.`);
+    }
+    return override;
+  }
+
+  const timeZone = process.env.HARNESS_TIME_ZONE || 'Asia/Shanghai';
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const byType = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${byType.year}${byType.month}${byType.day}`;
+}
+
 function ensureDir(dirPath) {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true });
@@ -272,7 +292,7 @@ function toChineseRound(n) {
 function generateReportPath(taskId, subtask, stage, round) {
   const cfg = getWorkflowConfig();
   const week = taskId.split('-')[0];
-  const yyyymmdd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const yyyymmdd = getCurrentYyyymmdd();
 
   const reviewRoot = getEffectiveReviewRoot();
   const reportDir = path.join(reviewRoot, week, subtask.id);
@@ -659,7 +679,7 @@ function buildTemplateVars(taskId, subtaskId, stage, status) {
     ].filter(Boolean).join(', '),
     // Additional metadata
     round,
-    yyyymmdd: new Date().toISOString().slice(0, 10).replace(/-/g, ''),
+    yyyymmdd: getCurrentYyyymmdd(),
   };
 }
 

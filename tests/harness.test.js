@@ -775,6 +775,18 @@ describe('HEXAI Review Harness V1', () => {
       assert.ok(stage.primaryReportPath.includes('实施计划'));
       assert.ok(stage.primaryReportPath.endsWith('.md'));
     });
+
+    it('should use HARNESS_DATE_YYYYMMDD for report file naming when provided', () => {
+      const r = harnessEnv({ HARNESS_DATE_YYYYMMDD: '20260618' }, 'init W6-A --force');
+      assert.equal(r.success, true, `init should succeed with date override: ${r.stderr}`);
+
+      const status = readStatus('W6-A');
+      const stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      assert.ok(
+        stage.primaryReportPath.includes('20260618'),
+        `primaryReportPath should use overridden local date: ${stage.primaryReportPath}`
+      );
+    });
   });
 
   describe('two consecutive advances', () => {
