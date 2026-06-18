@@ -71,6 +71,30 @@
 4. 更新 finding 状态（open → fixed / accepted / deferred）
 5. 判断方案是否可以进入代码实施阶段
 
+报告必须包含 `Decision: pass` 或 `Decision: changes-required`。所有既有和新增 finding 都必须使用以下机器可读格式；禁止使用 `### P1#1`、`### NEW P1#1` 等旧格式：
+
+```markdown
+### Finding {{subtaskId}}-P{n}-{序号}
+
+Priority: P0/P1/P2
+Status: verified/accepted/deferred/false-positive/open/reopened
+Owner: claude-implementer-minimax
+Module: {模块名}
+Files:
+- {文件路径}
+
+Issue:
+{问题描述}
+
+Expected:
+{期望状态}
+
+Acceptance:
+{验收标准}
+```
+
+只要存在 `open` 或 `reopened` finding，必须使用 `Decision: changes-required`；Harness 会自动回到下一轮 plan-fix。
+
 ## 产物要求
 
 1. 将复审意见写入：`{{primaryReportPath}}`

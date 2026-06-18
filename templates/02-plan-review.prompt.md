@@ -62,6 +62,8 @@
 
 请按照 playbook 标准，对实施方案进行严格评审。产出结构化 findings：
 
+报告必须包含独占一行的 `Decision: pass` 或 `Decision: changes-required`。
+
 ```markdown
 ### Finding {{subtaskId}}-P{n}-{序号}
 

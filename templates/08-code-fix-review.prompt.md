@@ -2,6 +2,8 @@
 
 # Code Fix 复审 — {{subtaskId}} {{subtaskTitle}}
 
+> **阶段身份确认：这是 `code-fix-review`，不是 `code-review`。禁止更新或覆盖上一轮 CodeReview 文件。**
+
 ## 任务信息
 
 - **taskId:** {{taskId}}
@@ -26,6 +28,8 @@
 - **codeMappingToReview:** {{codeMappingToReview}}
 - **fixReportToReview:** {{fixReportToReview}}
 - **previousReviewFindings:** {{previousReviewFindings}}
+
+`previousReviewFindings` 是只读输入。严禁写入或覆盖该路径。
 
 ## 边界规则
 
@@ -60,10 +64,36 @@
 4. 如发现新问题，产出新的 findings
 5. 判断代码是否可以进入交付阶段
 
+报告必须包含 `Decision: pass` 或 `Decision: changes-required`。所有既有和新增 finding 都必须使用以下机器可读格式；禁止使用 `### P1#1`、`### NEW P1#1` 等旧格式：
+
+```markdown
+### Finding {{subtaskId}}-P{n}-{序号}
+
+Priority: P0/P1/P2
+Status: verified/accepted/deferred/false-positive/open/reopened
+Owner: claude-implementer-minimax
+Module: {模块名}
+Files:
+- {文件路径}
+
+Issue:
+{问题描述}
+
+Expected:
+{期望状态}
+
+Acceptance:
+{验收标准}
+```
+
+只要存在 `open` 或 `reopened` finding，必须使用 `Decision: changes-required`；Harness 会自动回到下一轮 code-fix。
+
 ## 产物要求
 
 1. 将复审意见写入：`{{primaryReportPath}}`
 2. 将机器可读副本写入：`{{mirrorOutputPath}}`
+3. 写入后必须检查以上两个目标文件真实存在；未落盘不得声称完成。
+4. 除 `primaryReportPath` 和 `mirrorOutputPath` 外，不得写入任何 CodeReview/复审报告路径。
 
 ## 中断交接
 

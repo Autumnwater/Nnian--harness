@@ -103,7 +103,7 @@
   "subtasks": [
     { "id": "W6-A-01", "title": "缩放锚点", "shortTitle": "缩放锚点", "taskTheme": "W6-A画布本体UIUX收口" },
     { "id": "W6-A-02", "title": "移动磁吸与红色参考线", "shortTitle": "移动磁吸与红色参考线", "taskTheme": "W6-A画布本体UIUX收口" },
-    { "id": "W6-A-03", "title": "选中态控制点cursor收口", "shortTitle": "选中态控制点cursor收口", "taskTheme": "W6-A画布本体UIUX收口" },
+    { "id": "W6-A-03", "title": "选中态、控制点与 Cursor 补充优化", "shortTitle": "选中态控制点与Cursor补充优化", "taskTheme": "W6-A画布本体UIUX收口" },
     { "id": "W6-A-04", "title": "CV-06编辑元素阶段补齐", "shortTitle": "CV-06编辑元素阶段补齐", "taskTheme": "W6-A画布本体UIUX收口" },
     { "id": "W6-A-05", "title": "Space后移项跟踪", "shortTitle": "Space后移项跟踪", "taskTheme": "W6-A画布本体UIUX收口" },
     { "id": "W6-A-06", "title": "右侧Agent边界确认", "shortTitle": "右侧Agent边界确认", "taskTheme": "W6-A画布本体UIUX收口" }

@@ -133,6 +133,12 @@ function getTargetWindow(stage) {
   return 'review';
 }
 
+function getTargetWindowInstruction(targetWindow) {
+  if (targetWindow === 'work') return '请粘贴到 A/work 窗口';
+  if (targetWindow === 'review') return '请粘贴到 B/review 窗口';
+  return '请返回 Harness 窗口继续操作';
+}
+
 // ---------------------------------------------------------------------------
 // V2: Prompt file path
 // ---------------------------------------------------------------------------
@@ -466,7 +472,7 @@ function parseFindings(content) {
     const files = [];
 
     for (const line of lines) {
-      if (line.match(/^\s*Files:/i)) { inFiles = true; continue; }
+      if (line.match(/^\s*\*{0,2}Files\*{0,2}:/i)) { inFiles = true; continue; }
       if (inFiles && line.match(/^\s*-\s/)) {
         files.push(line.replace(/^\s*-\s+/, '').trim());
         continue;
@@ -475,7 +481,7 @@ function parseFindings(content) {
         inFiles = false;
       }
 
-      const kv = line.match(/^(\w+):\s*(.*)/);
+      const kv = line.match(/^\s*\*{0,2}(\w+)\*{0,2}:\s*(.*)/);
       if (kv) {
         const key = kv[1].toLowerCase();
         const val = kv[2].trim();
@@ -493,6 +499,41 @@ function parseFindings(content) {
   }
 
   return findings;
+}
+
+function validateFindingContract(findings, subtaskId) {
+  const issues = [];
+  const idPattern = new RegExp(`^${subtaskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-P[012]-\\d{2,3}$`);
+  const allowedStatuses = new Set([
+    'open', 'reopened', 'fixed', 'verified', 'accepted', 'deferred', 'false-positive',
+  ]);
+
+  for (const finding of findings) {
+    if (!idPattern.test(finding.id)) {
+      issues.push(`Invalid Finding ID "${finding.id}". Expected ${subtaskId}-P0|P1|P2-NN.`);
+    }
+    if (!['P0', 'P1', 'P2'].includes(finding.priority)) {
+      issues.push(`Finding ${finding.id} is missing a valid Priority: P0/P1/P2.`);
+    }
+    if (!allowedStatuses.has(finding.status)) {
+      issues.push(`Finding ${finding.id} has invalid Status "${finding.status}".`);
+    }
+  }
+
+  return issues;
+}
+
+function detectReviewDecision(content) {
+  const explicit = content.match(/^Decision:\s*(pass|changes-required)\s*$/mi);
+  if (explicit) return explicit[1].toLowerCase();
+
+  if (/修复.{0,20}后.{0,20}(可|可以)进入|有条件通过|不可进入|阻塞/.test(content)) {
+    return 'changes-required';
+  }
+  if (/可以立即开始实现|可以进入实现|可以进入代码实施|✅\s*通过/.test(content)) {
+    return 'pass';
+  }
+  return '';
 }
 
 /**
@@ -646,6 +687,17 @@ function buildTemplateVars(taskId, subtaskId, stage, status) {
     return subtaskStages[prevStage]?.primaryReportPath || '';
   }
 
+  const isCodeFixReview = stage === 'code-fix-review';
+  const isPlanFixReview = stage === 'plan-fix-review';
+  const fixReportToReview = isCodeFixReview
+    ? prevStagePath('code-fix')
+    : prevStagePath('plan-fix');
+  const previousReviewFindings = isCodeFixReview
+    ? (subtaskStages['code-fix']?.reviewFindingsPath || prevStagePath('code-review'))
+    : isPlanFixReview
+    ? (subtaskStages['plan-fix']?.reviewFindingsPath || prevStagePath('plan-review'))
+    : (prevStagePath('plan-review') || prevStagePath('plan-fix-review'));
+
   return {
     taskId,
     subtaskId,
@@ -668,8 +720,8 @@ function buildTemplateVars(taskId, subtaskId, stage, status) {
     // Cross-stage document references
     implementationPlan: prevStagePath('implementation-plan') || prevStagePath('plan-fix') || '',
     planToReview: prevStagePath('implementation-plan') || prevStagePath('plan-fix') || '',
-    fixReportToReview: prevStagePath('plan-fix') || '',
-    previousReviewFindings: prevStagePath('plan-review') || prevStagePath('plan-fix-review') || '',
+    fixReportToReview,
+    previousReviewFindings,
     codeMappingToReview: prevStagePath('code-implementation') || '',
     codeMapping: prevStagePath('code-implementation') || '',
     reviewFindingsPath: prevStagePath('code-review') || prevStagePath('code-fix-review') || prevStagePath('plan-review') || '',
@@ -937,6 +989,7 @@ function cmdNext(taskId, opts = {}) {
   // V2: Structured output
   const config = getStageConfig(currentStage) || {};
   const targetWindow = getTargetWindow(currentStage);
+  const nextAction = getTargetWindowInstruction(targetWindow);
 
   console.log('═══════════════════════════════════════════════');
   console.log(`📋 NEXT PROMPT GENERATED`);
@@ -944,6 +997,7 @@ function cmdNext(taskId, opts = {}) {
   console.log(`   currentStage: ${currentStage}`);
   console.log(`   expectedSkill: ${config.requiredSkill || '(none)'}`);
   console.log(`   targetWindow: ${targetWindow}`);
+  console.log(`   nextAction: ${nextAction}`);
   console.log(`   promptPath: ${promptPath}`);
   if (result.continuation) {
     console.log(`   continuation: true`);
@@ -960,7 +1014,7 @@ function cmdNext(taskId, opts = {}) {
   console.log();
   console.log(result.prompt);
 
-  return { ...result, promptPath, copiedToClipboard: copied, targetWindow, expectedSkill: config.requiredSkill };
+  return { ...result, promptPath, copiedToClipboard: copied, targetWindow, nextAction, expectedSkill: config.requiredSkill };
 }
 
 // ---------------------------------------------------------------------------
@@ -1233,6 +1287,7 @@ function cmdCheck(taskId) {
 
   const issues = [];
   const warnings = [];
+  let requiresFixLoop = false;
   const config = getStageConfig(currentStage) || {};
 
   // 1. Check primaryReportPath exists and non-empty
@@ -1252,11 +1307,31 @@ function cmdCheck(taskId) {
   const mirrorPath = stageData.mirrorOutputPath;
   if (mirrorPath && !fs.existsSync(mirrorPath)) {
     warnings.push(`mirrorOutputPath does not exist: ${mirrorPath}`);
+  } else if (mirrorPath && primaryPath && fs.existsSync(primaryPath) && fs.existsSync(mirrorPath)) {
+    const primaryContent = fs.readFileSync(primaryPath, 'utf-8');
+    const mirrorContent = fs.readFileSync(mirrorPath, 'utf-8');
+    if (primaryContent !== mirrorContent) {
+      issues.push(`mirrorOutputPath content differs from primaryReportPath: ${mirrorPath}`);
+    }
   }
 
   // 3. Stage-specific gate checks
   if (primaryPath && fs.existsSync(primaryPath)) {
     const content = fs.readFileSync(primaryPath, 'utf-8');
+
+    if (getReviewStages().includes(currentStage)) {
+      const findings = parseFindings(content);
+      const legacyFindingHeading = content.match(/^#{3,6}\s+(?!Finding\s+)(?:NEW\s+)?(?:W\d+-[A-Z]-\d{2}-)?P[012](?:#|-)\d+/m);
+      const decision = detectReviewDecision(content);
+
+      if (legacyFindingHeading) {
+        issues.push(`${currentStage}: Legacy finding heading "${legacyFindingHeading[0]}" is not machine-readable. Use "### Finding ${currentSubtask}-P{0|1|2}-NN".`);
+      }
+      issues.push(...validateFindingContract(findings, currentSubtask).map(issue => `${currentStage}: ${issue}`));
+      if (decision === 'changes-required' && findings.length === 0) {
+        issues.push(`${currentStage}: Review requires changes but contains no machine-readable "### Finding ..." blocks.`);
+      }
+    }
 
     if (currentStage === 'plan-review' || currentStage === 'code-review') {
       // Review stages: allow open P0/P1/P2 findings
@@ -1368,16 +1443,14 @@ function cmdCheck(taskId) {
         (f.status === 'open' || f.status === 'reopened')
       );
 
-      if (openP0P1.length > 0) {
-        issues.push(`${currentStage}: Blocked by ${openP0P1.length} open/reopened P0/P1 finding(s): ${openP0P1.map(f => f.id).join(', ')}`);
+      if (openP0P1.length > 0 || openP2.length > 0) {
+        requiresFixLoop = true;
+        const openIds = [...openP0P1, ...openP2].map(f => f.id);
+        warnings.push(`${currentStage}: Review requires another fix round for: ${openIds.join(', ')}`);
       }
 
-      if (openP2.length > 0) {
-        issues.push(`${currentStage}: Blocked by ${openP2.length} open/reopened P2 finding(s). Must be accepted/deferred: ${openP2.map(f => f.id).join(', ')}`);
-      }
-
-      if (notPassed && issues.length === 0) {
-        issues.push(`${currentStage}: Review report indicates "不通过" (not passed)`);
+      if (notPassed && findings.length === 0) {
+        issues.push(`${currentStage}: Review report indicates "不通过" but contains no machine-readable findings.`);
       }
     }
 
@@ -1456,7 +1529,7 @@ function cmdCheck(taskId) {
       console.log(`   Warnings: ${warnings.length}`);
       warnings.forEach(w => console.log(`   ⚠️  ${w}`));
     }
-    return { pass: true, warnings };
+    return { pass: true, warnings, requiresFixLoop };
   } else {
     console.log('❌ CHECK FAILED:');
     issues.forEach(i => console.log(`   ❌ ${i}`));
@@ -1464,7 +1537,7 @@ function cmdCheck(taskId) {
       warnings.forEach(w => console.log(`   ⚠️  ${w}`));
     }
     process.exitCode = 1;
-    return { pass: false, reasons: issues, warnings };
+    return { pass: false, reasons: issues, warnings, requiresFixLoop: false };
   }
 }
 
@@ -1581,6 +1654,51 @@ function cmdAdvance(taskId, opts = {}) {
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
   const config = getStageConfig(currentStage) || {};
 
+  if (checkResult.requiresFixLoop) {
+    const loopGroup = currentStage === 'plan-fix-review' ? 'plan' : 'code';
+    const fixStage = loopGroup === 'plan' ? 'plan-fix' : 'code-fix';
+    const roundKey = `${loopGroup}Round`;
+    const subtaskState = status.subtasks[currentSubtask];
+    const previousFixStage = subtaskState.stages[fixStage] || {};
+
+    stageData.stageStatus = 'completed-with-findings';
+    stageData.completedAt = now();
+    stageData.outputs = stageData.outputs || [];
+    if (stageData.primaryReportPath && !stageData.outputs.includes(stageData.primaryReportPath)) {
+      stageData.outputs.push(stageData.primaryReportPath);
+    }
+
+    subtaskState[roundKey] = (subtaskState[roundKey] || 1) + 1;
+    const nextRound = subtaskState[roundKey];
+    const subtask = getSubtasksForTask().find(item => item.id === currentSubtask);
+    const reportPath = generateReportPath(taskId, subtask, fixStage, nextRound);
+    subtaskState.stages[fixStage] = {
+      stageStatus: 'active',
+      currentOutputPath: reportPath,
+      latestAcceptedOutputPath: previousFixStage.latestAcceptedOutputPath || '',
+      primaryReportPath: reportPath,
+      mirrorOutputPath: path.join(outputsDir(taskId, currentSubtask), path.basename(reportPath)),
+      handoffPath: generateHandoffPath(taskId, subtask, fixStage),
+      mirrorHandoffPath: generateMirrorHandoffPath(taskId, subtask, fixStage),
+      startedAt: now(),
+      outputs: previousFixStage.outputs || [],
+      reviewFindingsPath: stageData.primaryReportPath || '',
+    };
+
+    status.currentStage = fixStage;
+    addHistory(status, 'fix-review-loop', {
+      subtask: currentSubtask,
+      fromStage: currentStage,
+      toStage: fixStage,
+      round: nextRound,
+    });
+    saveStatus(taskId, status);
+
+    console.log(`🔁 ${currentStage} requires changes; returning to ${fixStage}.`);
+    console.log(`   Round: ${nextRound}`);
+    return { success: true, advanced: true, looped: true, subtask: currentSubtask, stage: fixStage };
+  }
+
   // V2: Delivery stage → awaitingCommit instead of direct advance to next subtask
   if (currentStage === 'delivery') {
     // Mark delivery stage as completed
@@ -1652,6 +1770,7 @@ function cmdAdvance(taskId, opts = {}) {
 
   // Determine round for the new stage (P1-3)
   const nextRound = getRoundForStage(status, currentSubtask, nextStage);
+  const previousNextStage = status.subtasks[currentSubtask].stages?.[nextStage] || {};
   const nextStageData = {
     stageStatus: 'active',
     currentOutputPath: generateReportPath(taskId, subtask, nextStage, nextRound),
@@ -1661,8 +1780,11 @@ function cmdAdvance(taskId, opts = {}) {
     handoffPath: generateHandoffPath(taskId, subtask, nextStage),
     mirrorHandoffPath: generateMirrorHandoffPath(taskId, subtask, nextStage),
     startedAt: now(),
-    outputs: [],
+    outputs: previousNextStage.outputs || [],
   };
+  if (nextStage === 'plan-fix' || nextStage === 'code-fix') {
+    nextStageData.reviewFindingsPath = stageData.primaryReportPath || '';
+  }
 
   if (!status.subtasks[currentSubtask].stages) {
     status.subtasks[currentSubtask].stages = {};
@@ -2299,7 +2421,7 @@ Usage:
   harness init <taskId> [--from <subtask>] [--stage <stage>]
                       [--force] [--archive-existing]
   harness next <taskId> [--copy]
-  harness step <taskId> [--copy]
+  harness step <taskId> [--no-copy]
   harness current <taskId>
   harness check <taskId>
   harness advance <taskId> [--confirm-committed]
@@ -2318,6 +2440,7 @@ V2 New Commands:
 
 V2 New Options:
   --copy               Copy prompt to clipboard (macOS pbcopy)
+  --no-copy            Do not copy prompt when using step (step copies by default)
   --confirm-committed  Confirm manual commit after delivery checkpoint
 
 Examples:
@@ -2325,7 +2448,7 @@ Examples:
   harness init W6-A --from W6-A-03 --stage code-review
   harness init W6-A --force
   harness next W6-A --copy
-  harness step W6-A --copy
+  harness step W6-A
   harness current W6-A
   harness check W6-A
   harness advance W6-A
@@ -2368,7 +2491,7 @@ function main() {
       }
       case 'step': {
         if (!taskId) throw new Error('taskId required');
-        cmdStep(taskId, { copy: opts.copy === true || opts.copy === 'true' });
+        cmdStep(taskId, { copy: !(opts['no-copy'] === true || opts['no-copy'] === 'true') });
         break;
       }
       case 'current': {

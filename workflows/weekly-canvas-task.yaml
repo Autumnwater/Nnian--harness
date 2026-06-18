@@ -86,8 +86,8 @@ subtasks:
     taskTheme: "W6-A画布本体UIUX收口"
 
   - id: W6-A-03
-    title: "选中态控制点cursor收口"
-    shortTitle: "选中态控制点cursor收口"
+    title: "选中态、控制点与 Cursor 补充优化"
+    shortTitle: "选中态控制点与Cursor补充优化"
     taskTheme: "W6-A画布本体UIUX收口"
 
   - id: W6-A-04

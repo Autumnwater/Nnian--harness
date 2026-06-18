@@ -52,6 +52,8 @@
 
 请按照 playbook 标准，基于实际 diff 和完整文件上下文发现 P0/P1/P2 问题。产出结构化 findings：
 
+报告必须包含 `Decision: pass` 或 `Decision: changes-required`。
+
 ```markdown
 ### Finding {{subtaskId}}-P{n}-{序号}
 

@@ -85,6 +85,21 @@ function createReportAt(reportPath, content) {
   fs.writeFileSync(reportPath, content, 'utf-8');
 }
 
+function setupPlanFixReviewStage() {
+  harness('init W6-A --force');
+  let status = readStatus('W6-A');
+  createReport(status, 'implementation-plan', '# Plan\n\n## Fabric 官方能力核查\nOK\n');
+  harness('advance W6-A');
+
+  status = readStatus('W6-A');
+  createReport(status, 'plan-review', '# PR\n\nDecision: changes-required\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+  harness('advance W6-A');
+
+  status = readStatus('W6-A');
+  createReport(status, 'plan-fix', '# Fix\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-001 | fixed | src/x.ts | done |\n');
+  harness('advance W6-A');
+}
+
 // ---------------------------------------------------------------------------
 // Setup before all tests
 // ---------------------------------------------------------------------------
@@ -750,6 +765,17 @@ describe('HEXAI Review Harness V1', () => {
     });
   });
 
+  describe('delivery prompt write boundary', () => {
+    it('should forbid delivery from modifying business code', () => {
+      harness('init W6-A --from W6-A-03 --stage delivery --force');
+      const result = harness('next W6-A');
+      assert.equal(result.success, true);
+      assert.ok(result.stdout.includes('禁止写入或修改'));
+      assert.ok(result.stdout.includes('只能写入'));
+      assert.ok(!result.stdout.includes('有权读写'));
+    });
+  });
+
   describe('W6-A-02 reportDir creation on init', () => {
     before(() => {
       const dir = path.join(REVIEW_ROOT, 'W6', 'W6-A-02');
@@ -1224,43 +1250,32 @@ Expected: Should be fixed
     });
   });
 
-  describe('P0-1: plan-fix-review blocks open P0/P1 (test 10, 12)', () => {
+  describe('P0-1: plan-fix-review loops open P0/P1 back to plan-fix', () => {
     before(() => {
-      harness('init W6-A --force');
-
-      let status = readStatus('W6-A');
-      const s1 = status.subtasks['W6-A-02'].stages['implementation-plan'];
-      createReportAt(s1.primaryReportPath, '# Plan\n\n## Fabric 官方能力核查\nOK\n');
-      harness('advance W6-A');
-
-      status = readStatus('W6-A');
-      createReport(status, 'plan-review', '# PR\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
-      harness('advance W6-A');
-
-      status = readStatus('W6-A');
-      createReport(status, 'plan-fix', '# Fix\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-001 | fixed | src/x.ts | done |\n');
-      harness('advance W6-A');
-
-      status = readStatus('W6-A');
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
       assert.equal(status.currentStage, 'plan-fix-review');
     });
 
-    it('should block advance when open P1 findings remain (test 10)', () => {
+    it('should advance back to plan-fix and increment planRound', () => {
       const status = readStatus('W6-A');
       // Create plan-fix-review that REOPENS the finding
       createReport(status, 'plan-fix-review',
-        '# Plan Fix Review\n\n报告结论：不通过。部分修复不符合预期。\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: reopened\nOwner: someone\nModule: M\nIssue: 修复不完整\nExpected: 需要重新修复\n');
+        '# Plan Fix Review\n\nDecision: changes-required\n\n## Fabric 官方能力核查\nVerified.\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: reopened\nOwner: someone\nModule: M\nIssue: 修复不完整\nExpected: 需要重新修复\n');
 
-      // Check should fail
       const checkResult = harness('check W6-A');
-      assert.equal(checkResult.success, false, 'Should fail with reopened P1');
+      assert.equal(checkResult.success, true, 'Valid fix-review output should pass contract validation');
 
-      // Advance should fail
       const advanceResult = harness('advance W6-A');
-      assert.equal(advanceResult.success, false, 'Advance should fail');
+      assert.equal(advanceResult.success, true, 'Advance should enter the next fix round');
+      const updated = readStatus('W6-A');
+      assert.equal(updated.currentStage, 'plan-fix');
+      assert.equal(updated.subtasks['W6-A-02'].planRound, 2);
+      assert.ok(updated.subtasks['W6-A-02'].stages['plan-fix'].primaryReportPath.includes('-2轮.md'));
     });
 
     it('should pass advance when all findings are verified (test 12)', () => {
+      setupPlanFixReviewStage();
       const status = readStatus('W6-A');
       // Create plan-fix-review that VERIFIES the finding (must include Fabric section for gate)
       createReport(status, 'plan-fix-review',
@@ -1274,6 +1289,74 @@ Expected: Should be fixed
       const updated = readStatus('W6-A');
       assert.equal(updated.currentStage, 'code-implementation',
         'Should advance to code-implementation');
+    });
+  });
+
+  describe('Harness review contract validation', () => {
+    it('should reject legacy finding headings that the parser cannot track', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: changes-required\n\n## Fabric 官方能力核查\nVerified.\n\n#### W6-A-02-P1-05: legacy heading\n\n**Priority**: P1\n**Status**: open\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, false);
+      assert.ok(result.stdout.includes('Legacy finding heading'));
+    });
+
+    it('should reject malformed structured finding IDs', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: changes-required\n\n## Fabric 官方能力核查\nVerified.\n\n### Finding W6-A-02-NEW-P1-5\nPriority: P1\nStatus: reopened\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, false);
+      assert.ok(result.stdout.includes('Invalid Finding ID'));
+    });
+
+    it('should parse markdown-bold finding metadata', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n\n### Finding W6-A-02-P1-001\n\n**Priority**: P1\n**Status**: verified\n**Owner**: someone\n**Module**: M\n**Files**:\n- src/a.ts\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, true, result.stdout);
+    });
+
+    it('should reject a mirror whose content differs from primary', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      const stage = status.subtasks['W6-A-02'].stages['plan-fix-review'];
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n');
+      createReportAt(stage.mirrorOutputPath, '# Different mirror\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, false);
+      assert.ok(result.stdout.includes('content differs'));
+      fs.unlinkSync(stage.mirrorOutputPath);
+    });
+  });
+
+  describe('stage-specific fix-review document references', () => {
+    it('should point code-fix-review at code-fix and code-review reports', () => {
+      harness('init W6-A --from W6-A-03 --stage code-fix-review --force');
+      const status = readStatus('W6-A');
+      const stages = status.subtasks['W6-A-03'].stages;
+      stages['code-review'].primaryReportPath = '/tmp/W6-A-03-code-review.md';
+      stages['code-fix'].primaryReportPath = '/tmp/W6-A-03-code-fix.md';
+      stages['code-fix'].reviewFindingsPath = '/tmp/W6-A-03-code-review.md';
+      saveStatus('W6-A', status);
+
+      const result = harness('next W6-A');
+      assert.equal(result.success, true);
+      assert.ok(result.stdout.includes('fixReportToReview:** /tmp/W6-A-03-code-fix.md'));
+      assert.ok(result.stdout.includes('previousReviewFindings:** /tmp/W6-A-03-code-review.md'));
+      assert.ok(!result.stdout.includes('计划FixReport'));
+      assert.ok(result.stdout.includes('禁止更新或覆盖上一轮 CodeReview 文件'));
+      assert.ok(result.stdout.includes('previousReviewFindings` 是只读输入'));
     });
   });
 
@@ -1522,6 +1605,8 @@ Expected: Should be fixed
     it('should include structured metadata in output', () => {
       assert.ok(result.stdout.includes('currentSubtask'), 'Should include currentSubtask');
       assert.ok(result.stdout.includes('targetWindow'), 'Should include targetWindow');
+      assert.ok(result.stdout.includes('nextAction: 请粘贴到 A/work 窗口'),
+        'Should explicitly identify the A/work target window');
       assert.ok(result.stdout.includes('expectedSkill'), 'Should include expectedSkill');
       assert.ok(result.stdout.includes('promptPath'), 'Should include promptPath');
     });
@@ -1566,8 +1651,8 @@ Expected: Should be fixed
         'utf-8');
     });
 
-    it('should execute check -> advance -> next in order', () => {
-      const r = harness('step W6-A');
+    it('should execute check -> advance -> next and copy by default', () => {
+      const r = harnessEnv({ HARNESS_COPY_COMMAND: 'true' }, 'step W6-A');
       assert.equal(r.success, true, `step should succeed: ${r.stderr}`);
 
       // Should mention CHECK PASSED
@@ -1582,6 +1667,10 @@ Expected: Should be fixed
       // Should have generated next prompt
       assert.ok(r.stdout.includes('NEXT PROMPT GENERATED') || r.stdout.includes('NEXT'),
         'Should include NEXT output');
+      assert.ok(r.stdout.includes('nextAction: 请粘贴到 B/review 窗口'),
+        'Should explicitly identify the B/review target window');
+      assert.ok(r.stdout.includes('copiedToClipboard: true') || r.stdout.includes('Copied to clipboard: true'),
+        'step should copy the generated prompt by default');
     });
 
     it('should accept --copy flag', () => {

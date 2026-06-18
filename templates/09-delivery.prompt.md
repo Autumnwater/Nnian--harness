@@ -30,12 +30,13 @@
 
 ## 边界规则
 
-1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{codeRepo}}`。
-2. 你有权读写 `{{codeRepo}}` 中任务相关的业务代码。
-3. 你有权写入 `{{reportDir}}` 下的交付物整理。
-4. **你不可批准自己的交付物。** 最终准入由 Codex 负责。
-5. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
-6. **不可**执行 destructive git、commit、push，除非用户明确要求。
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{reviewRoot}}`。
+2. 你可以读取 `{{codeRepo}}` 并在其中运行非破坏性的验证命令。
+3. **禁止写入或修改** `{{codeRepo}}` 业务代码。
+4. 你只能写入 `{{primaryReportPath}}` 和 `{{mirrorOutputPath}}` 对应的交付报告。
+5. **你不可批准自己的交付物。** 最终准入由 Codex 负责。
+6. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
+7. **不可**执行 destructive git、commit、push，除非用户明确要求。
 
 ## 任务要求
 
