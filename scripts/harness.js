@@ -991,10 +991,11 @@ function cmdNext(taskId, opts = {}) {
 
   // Set currentOutputPath (P1-5)
   stageData.currentOutputPath = stageData.primaryReportPath;
-  if (!stageData.outputBaseline) {
-    stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
-    stageData.outputBaselineCapturedAt = now();
-  }
+  // Every generated prompt starts a new production attempt. Capture the
+  // current artifact even when this stage was activated before, otherwise a
+  // stale baseline from an earlier attempt can make unchanged output look new.
+  stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
+  stageData.outputBaselineCapturedAt = now();
 
   saveStatus(taskId, status);
 
@@ -1504,8 +1505,16 @@ function cmdCheck(taskId) {
         warnings.push('Delivery report may be missing residual risk section');
       }
 
-      if (!status.acceptances?.[currentSubtask]) {
+      const acceptance = status.acceptances?.[currentSubtask];
+      if (!acceptance) {
         issues.push(`Delivery blocked: manual acceptance is missing. Run: pnpm harness accept ${taskId} --note "<验收说明>"`);
+      } else {
+        const acceptedSnapshot = acceptance.outputSnapshot;
+        const currentSnapshot = getFileSnapshot(primaryPath);
+        if (!acceptedSnapshot || acceptance.primaryReportPath !== primaryPath ||
+            acceptedSnapshot.sha256 !== currentSnapshot.sha256) {
+          issues.push(`Delivery blocked: report changed after manual acceptance. Re-run: pnpm harness accept ${taskId} --note "<验收说明>"`);
+        }
       }
 
       // Check all findings for the subtask
@@ -2045,10 +2054,19 @@ function cmdAccept(taskId, opts = {}) {
     throw new Error(`Manual acceptance can only be recorded at delivery; currentStage=${status.currentStage}`);
   }
 
+  const stageData = status.subtasks[status.currentSubtask]?.stages?.delivery;
+  const primaryReportPath = stageData?.primaryReportPath;
+  const outputSnapshot = getFileSnapshot(primaryReportPath);
+  if (!outputSnapshot.exists || outputSnapshot.size === 0) {
+    throw new Error(`Manual acceptance requires a non-empty delivery report: ${primaryReportPath || '(missing path)'}`);
+  }
+
   if (!status.acceptances) status.acceptances = {};
   status.acceptances[status.currentSubtask] = {
     acceptedAt: now(),
     note,
+    primaryReportPath,
+    outputSnapshot,
   };
   addHistory(status, 'manual-acceptance', {
     subtask: status.currentSubtask,

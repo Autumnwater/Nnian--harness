@@ -815,7 +815,7 @@ describe('HEXAI Review Harness V1', () => {
     });
   });
 
-  describe('two consecutive advances', () => {
+  describe('conditional review branch', () => {
     before(() => {
       const reportDir = path.join(REVIEW_ROOT, 'W6', 'W6-A-02');
       if (fs.existsSync(reportDir)) {
@@ -834,7 +834,7 @@ describe('HEXAI Review Harness V1', () => {
         'utf-8');
       harness('advance W6-A');
 
-      // Second advance: plan-review → plan-fix
+      // Second advance: a review without findings skips plan-fix
       const status2 = readStatus('W6-A');
       const stage2 = status2.subtasks['W6-A-02'].stages['plan-review'];
       fs.mkdirSync(path.dirname(stage2.primaryReportPath), { recursive: true });
@@ -842,9 +842,9 @@ describe('HEXAI Review Harness V1', () => {
       harness('advance W6-A');
     });
 
-    it('should reach plan-fix after two advances', () => {
+    it('should reach code-implementation after a clean plan review', () => {
       const status = readStatus('W6-A');
-      assert.equal(status.currentStage, 'plan-fix');
+      assert.equal(status.currentStage, 'code-implementation');
     });
   });
 
@@ -1081,7 +1081,8 @@ Expected: Should be better
 
       // plan-review
       status = readStatus('W6-A');
-      createReport(status, 'plan-review', '# Plan Review\nSome findings.\n');
+      createReport(status, 'plan-review',
+        '# Plan Review\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       // plan-fix (needs Fix Mapping)
@@ -1091,7 +1092,8 @@ Expected: Should be better
 
       // plan-fix-review (must include Fabric section for Fabric-first gate)
       status = readStatus('W6-A');
-      createReport(status, 'plan-fix-review', '# Fix Review\n\n## Fabric 官方能力核查\nOK.\nAll verified.\n');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nOK.\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       // code-implementation (needs Fabric section at plan-fix-review stage)
@@ -1175,7 +1177,8 @@ Expected: Should be fixed
       harness('advance W6-A');
 
       status = readStatus('W6-A');
-      createReport(status, 'plan-review', '# PR\nOK.\n');
+      createReport(status, 'plan-review',
+        '# PR\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       status = readStatus('W6-A');
@@ -1183,7 +1186,8 @@ Expected: Should be fixed
       harness('advance W6-A');
 
       status = readStatus('W6-A');
-      createReport(status, 'plan-fix-review', '# Fix Review\n\n## Fabric 官方能力核查\nOK.\nVerified.\n');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nOK.\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       status = readStatus('W6-A');
@@ -1325,7 +1329,7 @@ Expected: Should be fixed
       assert.equal(result.success, true, result.stdout);
     });
 
-    it('should reject a mirror whose content differs from primary', () => {
+    it('should replace a stale mirror with the accepted primary', () => {
       setupPlanFixReviewStage();
       const status = readStatus('W6-A');
       const stage = status.subtasks['W6-A-02'].stages['plan-fix-review'];
@@ -1334,8 +1338,11 @@ Expected: Should be fixed
       createReportAt(stage.mirrorOutputPath, '# Different mirror\n');
 
       const result = harness('check W6-A');
-      assert.equal(result.success, false);
-      assert.ok(result.stdout.includes('content differs'));
+      assert.equal(result.success, true);
+      assert.equal(
+        fs.readFileSync(stage.mirrorOutputPath, 'utf-8'),
+        fs.readFileSync(stage.primaryReportPath, 'utf-8')
+      );
       fs.unlinkSync(stage.mirrorOutputPath);
     });
   });
@@ -1375,17 +1382,19 @@ Expected: Should be fixed
 
       // plan-review
       status = readStatus('W6-A');
-      createReport(status, 'plan-review', '# PR\nOK.\n');
+      createReport(status, 'plan-review',
+        '# PR\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       // plan-fix
       status = readStatus('W6-A');
-      createReport(status, 'plan-fix', '# Fix\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| n/a | fixed | - | - |\n');
+      createReport(status, 'plan-fix', '# Fix\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-001 | fixed | src/x.ts | done |\n');
       harness('advance W6-A');
 
       // plan-fix-review (must pass cleanly — include Fabric section for Fabric-first gate)
       status = readStatus('W6-A');
-      createReport(status, 'plan-fix-review', '# Fix Review\n\n## Fabric 官方能力核查\nOK.\nAll good.\n');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nOK.\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       // code-implementation
@@ -1395,17 +1404,19 @@ Expected: Should be fixed
 
       // code-review
       status = readStatus('W6-A');
-      createReport(status, 'code-review', '# CR\nOK.\n');
+      createReport(status, 'code-review',
+        '# CR\n\n### Finding W6-A-02-P1-002\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       // code-fix
       status = readStatus('W6-A');
-      createReport(status, 'code-fix', '# Fix\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| n/a | fixed | - | - |\n');
+      createReport(status, 'code-fix', '# Fix\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| W6-A-02-P1-002 | fixed | src/x.ts | done |\n');
       harness('advance W6-A');
 
       // code-fix-review
       status = readStatus('W6-A');
-      createReport(status, 'code-fix-review', '# Fix Review\nAll good.\n');
+      createReport(status, 'code-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n### Finding W6-A-02-P1-002\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       status = readStatus('W6-A');
@@ -1426,6 +1437,7 @@ Expected: Should be fixed
       // Create proper delivery report
       createReport(status, 'delivery',
         '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      assert.equal(harness('accept W6-A --note "用户人工验收通过"').success, true);
 
       const r = harness('advance W6-A');
       assert.equal(r.success, true, 'Delivery advance should succeed');
@@ -1474,6 +1486,7 @@ Expected: Should be fixed
 
       createReport(status, 'delivery',
         '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      assert.equal(harness('accept W6-A --note "用户人工验收通过"').success, true);
 
       const r = harness('advance W6-A');
       assert.equal(r.success, true, 'Delivery should advance');
@@ -1535,7 +1548,8 @@ Expected: Should be fixed
       harness('advance W6-A');
 
       status = readStatus('W6-A');
-      createReport(status, 'plan-review', '# PR\nOK.\n');
+      createReport(status, 'plan-review',
+        '# PR\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       status = readStatus('W6-A');
@@ -1732,6 +1746,7 @@ Expected: Should be fixed
       const status = readStatus('W6-A');
       createReport(status, 'delivery',
         '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      assert.equal(harness('accept W6-A --note "用户人工验收通过"').success, true);
     });
 
     it('should stop at awaiting-commit after delivery', () => {
@@ -1877,7 +1892,8 @@ Expected: Should be fixed
       harness('advance W6-A');
 
       let status = readStatus('W6-A');
-      createReport(status, 'plan-review', '# PR\nOK.\n');
+      createReport(status, 'plan-review',
+        '# PR\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: open\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
       harness('advance W6-A');
 
       status = readStatus('W6-A');
@@ -1948,6 +1964,7 @@ Expected: Should be fixed
       const status = readStatus('W6-A');
       createReport(status, 'delivery',
         '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      assert.equal(harness('accept W6-A --note "用户人工验收通过"').success, true);
       harness('advance W6-A'); // Now awaitingCommit
     });
 
@@ -2081,14 +2098,79 @@ Expected: Should be fixed
     });
   });
 
+  describe('V2.4: output freshness and Harness-owned mirror', () => {
+    it('should reject unchanged pre-existing output and sync mirror after a fresh update', () => {
+      harness('init W6-A --force');
+      let status = readStatus('W6-A');
+      let stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      createReportAt(stage.primaryReportPath,
+        '# Plan\n\n## Fabric 官方能力核查\nOK\n\nExisting content.\n');
+
+      assert.equal(harness('next W6-A').success, true);
+      const staleCheck = harness('check W6-A');
+      assert.equal(staleCheck.success, false);
+      assert.ok(staleCheck.stdout.includes('was not updated'));
+
+      fs.appendFileSync(stage.primaryReportPath, '\nFresh update.\n', 'utf-8');
+      const freshCheck = harness('check W6-A');
+      assert.equal(freshCheck.success, true, freshCheck.stdout);
+
+      status = readStatus('W6-A');
+      stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      assert.equal(
+        fs.readFileSync(stage.mirrorOutputPath, 'utf-8'),
+        fs.readFileSync(stage.primaryReportPath, 'utf-8')
+      );
+      assert.ok(stage.mirrorSyncedAt, 'Passing check should record mirror sync time');
+    });
+  });
+
+  describe('V2.4: delivery acceptance contract', () => {
+    it('should only accept a non-empty report at delivery', () => {
+      harness('init W6-A --force');
+      assert.equal(harness('accept W6-A --note "验收通过"').success, false);
+
+      harness('init W6-A --from W6-A-06 --stage delivery --force');
+      assert.equal(harness('accept W6-A').success, false);
+      const emptyStatus = readStatus('W6-A');
+      const emptyReportPath = emptyStatus.subtasks['W6-A-06'].stages.delivery.primaryReportPath;
+      if (fs.existsSync(emptyReportPath)) fs.unlinkSync(emptyReportPath);
+      assert.equal(harness('accept W6-A --note "验收通过"').success, false);
+
+      const status = readStatus('W6-A');
+      createReport(status, 'delivery',
+        '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      assert.equal(harness('accept W6-A --note "验收通过"').success, true);
+
+      const accepted = readStatus('W6-A').acceptances['W6-A-06'];
+      assert.equal(accepted.primaryReportPath,
+        status.subtasks['W6-A-06'].stages.delivery.primaryReportPath);
+      assert.ok(accepted.outputSnapshot.sha256);
+    });
+
+    it('should require re-acceptance when the delivery report changes', () => {
+      const status = readStatus('W6-A');
+      const reportPath = status.subtasks['W6-A-06'].stages.delivery.primaryReportPath;
+      fs.appendFileSync(reportPath, '\nChanged after acceptance.\n', 'utf-8');
+
+      const staleAcceptance = harness('check W6-A');
+      assert.equal(staleAcceptance.success, false);
+      assert.ok(staleAcceptance.stdout.includes('changed after manual acceptance'));
+
+      assert.equal(harness('accept W6-A --note "变更后重新验收"').success, true);
+      assert.equal(harness('check W6-A').success, true);
+    });
+  });
+
   // ===================================================================
-  // P2-2: schemaVersion migration
+  // V2.4: schemaVersion 3 migration
   // ===================================================================
-  describe('P2-2: schemaVersion migration', () => {
-    it('should add schemaVersion: 2 to new status', () => {
+  describe('V2.4: schemaVersion 3 migration', () => {
+    it('should add schemaVersion: 3 to new status', () => {
       harness('init W6-A --force');
       const status = readStatus('W6-A');
-      assert.equal(status.schemaVersion, 2, 'New status should have schemaVersion: 2');
+      assert.equal(status.schemaVersion, 3, 'New status should have schemaVersion: 3');
+      assert.deepEqual(status.acceptances, {}, 'New status should initialize acceptances');
       assert.equal(status.awaitingCommit, false, 'New status should have awaitingCommit: false');
       assert.equal(status.commitRequiredForSubtask, null, 'New status should have commitRequiredForSubtask: null');
     });
@@ -2136,19 +2218,20 @@ Expected: Should be fixed
       assert.equal(r.success, true, 'Should handle old status gracefully');
 
       const migrated = readStatus(taskId);
-      assert.equal(migrated.schemaVersion, 2, 'Should have schemaVersion: 2 after migration');
+      assert.equal(migrated.schemaVersion, 3, 'Should have schemaVersion: 3 after migration');
+      assert.deepEqual(migrated.acceptances, {}, 'Should initialize acceptances during migration');
       assert.equal(migrated.awaitingCommit, false, 'Should have awaitingCommit: false after migration');
       assert.equal(migrated.commitRequiredForSubtask, null, 'Should have commitRequiredForSubtask: null after migration');
     });
 
-    it('should persist schemaVersion: 2 after saveStatus', () => {
+    it('should persist schemaVersion: 3 after saveStatus', () => {
       harness('init W6-A --force');
       const status = readStatus('W6-A');
-      assert.equal(status.schemaVersion, 2, 'Should write schemaVersion: 2');
+      assert.equal(status.schemaVersion, 3, 'Should write schemaVersion: 3');
       // Trigger a save
       harness('current W6-A');
       const saved = readStatus('W6-A');
-      assert.equal(saved.schemaVersion, 2, 'schemaVersion should persist after save');
+      assert.equal(saved.schemaVersion, 3, 'schemaVersion should persist after save');
     });
   });
 
