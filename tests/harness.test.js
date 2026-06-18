@@ -2163,13 +2163,23 @@ Expected: Should be fixed
   });
 
   // ===================================================================
-  // V2.4: schemaVersion 3 migration
+  // V3 Phase 1: schemaVersion 4 migration and execution safety
   // ===================================================================
-  describe('V2.4: schemaVersion 3 migration', () => {
-    it('should add schemaVersion: 3 to new status', () => {
+  describe('V3 Phase 1: schemaVersion 4 migration and execution safety', () => {
+    it('should add schemaVersion: 4 and manual execution defaults to new status', () => {
       harness('init W6-A --force');
       const status = readStatus('W6-A');
-      assert.equal(status.schemaVersion, 3, 'New status should have schemaVersion: 3');
+      assert.equal(status.schemaVersion, 4, 'New status should have schemaVersion: 4');
+      assert.ok(status.stateRevision >= 1, 'New status should have a persisted stateRevision');
+      assert.equal(status.stageRevision, 0, 'New status should initialize stageRevision');
+      assert.deepEqual(status.execution, {
+        mode: 'manual',
+        activeJobId: null,
+        activeAttemptId: null,
+        activeLeaseToken: null,
+        lockEpoch: 0,
+        lastJobId: null,
+      });
       assert.deepEqual(status.acceptances, {}, 'New status should initialize acceptances');
       assert.equal(status.awaitingCommit, false, 'New status should have awaitingCommit: false');
       assert.equal(status.commitRequiredForSubtask, null, 'New status should have commitRequiredForSubtask: null');
@@ -2213,25 +2223,201 @@ Expected: Should be fixed
       fs.mkdirSync(path.dirname(statusPath), { recursive: true });
       fs.writeFileSync(statusPath, JSON.stringify(oldStatus, null, 2), 'utf-8');
 
-      // loadStatus (via current) should migrate this old status
+      const beforeRead = fs.readFileSync(statusPath, 'utf-8');
+
+      // Read-only commands may use an in-memory migration but must not write it back.
       const r = harness(`current ${taskId}`);
       assert.equal(r.success, true, 'Should handle old status gracefully');
+      assert.equal(fs.readFileSync(statusPath, 'utf-8'), beforeRead,
+        'Read-only current must not persist migration without the execution lock');
+
+      // A state-changing command owns execution.lock, re-reads, migrates, and writes new stage evidence.
+      const next = harness(`next ${taskId}`);
+      assert.equal(next.success, true, 'Locked next should persist migration and baseline evidence');
 
       const migrated = readStatus(taskId);
-      assert.equal(migrated.schemaVersion, 3, 'Should have schemaVersion: 3 after migration');
+      assert.equal(migrated.schemaVersion, 4, 'Should have schemaVersion: 4 after migration');
+      assert.ok(migrated.stateRevision >= 1, 'Migration should persist stateRevision');
+      assert.ok(migrated.stageRevision >= 1, 'next should persist a new stage revision');
+      assert.equal(migrated.execution.mode, 'manual', 'Migration should default to manual mode');
+      assert.equal(migrated.execution.activeJobId, null);
+      assert.equal(migrated.execution.activeAttemptId, null);
+      assert.ok(migrated.subtasks['W6-A-02'].stages['implementation-plan'].outputBaseline,
+        'next should persist output baseline evidence');
       assert.deepEqual(migrated.acceptances, {}, 'Should initialize acceptances during migration');
       assert.equal(migrated.awaitingCommit, false, 'Should have awaitingCommit: false after migration');
       assert.equal(migrated.commitRequiredForSubtask, null, 'Should have commitRequiredForSubtask: null after migration');
+
+      const afterWrite = fs.readFileSync(statusPath, 'utf-8');
+      for (const readCommand of ['current', 'status', 'summary', 'brief']) {
+        assert.equal(harness(`${readCommand} ${taskId}`).success, true);
+        assert.equal(fs.readFileSync(statusPath, 'utf-8'), afterWrite,
+          `${readCommand} must not overwrite migrated baseline/revision evidence`);
+      }
     });
 
-    it('should persist schemaVersion: 3 after saveStatus', () => {
+    it('should persist schemaVersion: 4 after saveStatus', () => {
       harness('init W6-A --force');
       const status = readStatus('W6-A');
-      assert.equal(status.schemaVersion, 3, 'Should write schemaVersion: 3');
+      assert.equal(status.schemaVersion, 4, 'Should write schemaVersion: 4');
       // Trigger a save
       harness('current W6-A');
       const saved = readStatus('W6-A');
-      assert.equal(saved.schemaVersion, 3, 'schemaVersion should persist after save');
+      assert.equal(saved.schemaVersion, 4, 'schemaVersion should persist after save');
+    });
+
+    it('should reject progress while another task execution holds the lock', () => {
+      harness('init W6-A --force');
+      const lockPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'execution.lock');
+      const acquiredAt = new Date().toISOString();
+      fs.writeFileSync(lockPath, JSON.stringify({
+        taskId: 'W6-A',
+        command: 'step',
+        ownerId: 'live-test-owner',
+        pid: process.pid,
+        acquiredAt,
+        heartbeatAt: acquiredAt,
+        lockEpoch: 0,
+      }), 'utf-8');
+
+      const result = harness('next W6-A');
+
+      assert.equal(result.success, false);
+      assert.match(result.stderr, /task-locked/);
+      fs.unlinkSync(lockPath);
+    });
+
+    it('should recover a stale lock only after its owner process is gone', () => {
+      harness('init W6-A --force');
+      const lockPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'execution.lock');
+      fs.writeFileSync(lockPath, JSON.stringify({
+        ownerId: 'dead-owner',
+        pid: 2_147_483_647,
+        acquiredAt: '2000-01-01T00:00:00.000Z',
+        heartbeatAt: '2000-01-01T00:00:00.000Z',
+        lockEpoch: 0,
+      }), 'utf-8');
+
+      const result = harnessEnv({ HARNESS_LOCK_STALE_MS: '0' }, 'next W6-A');
+
+      assert.equal(result.success, true);
+      assert.equal(fs.existsSync(lockPath), false);
+      const recoveredStatus = readStatus('W6-A');
+      assert.equal(recoveredStatus.execution.lockEpoch, 1);
+      assert.equal(recoveredStatus.history.at(-1).action, 'stale-lock-recovered');
+      assert.equal(recoveredStatus.history.at(-1).details.reason, 'owner-dead-and-heartbeat-stale');
+    });
+
+    it('should replay an orphan recovery marker without incrementing lockEpoch twice', () => {
+      harness('init W6-A --force');
+      const lockPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'execution.lock');
+      const stale = {
+        ownerId: 'dead-owner',
+        pid: 2_147_483_647,
+        acquiredAt: '2000-01-01T00:00:00.000Z',
+        heartbeatAt: '2000-01-01T00:00:00.000Z',
+        lockEpoch: 0,
+      };
+      const recoveryId = `${stale.ownerId}:${stale.acquiredAt}`;
+      const status = readStatus('W6-A');
+      status.execution.lockEpoch = 1;
+      status.history.push({
+        timestamp: new Date().toISOString(),
+        action: 'stale-lock-recovered',
+        details: { recoveryId, lockEpoch: 1 },
+      });
+      saveStatus('W6-A', status);
+      fs.writeFileSync(`${lockPath}.stale.${stale.ownerId}`, JSON.stringify(stale), 'utf-8');
+
+      const result = harness('next W6-A');
+
+      assert.equal(result.success, true);
+      const replayedStatus = readStatus('W6-A');
+      assert.equal(replayedStatus.execution.lockEpoch, 1);
+      assert.equal(
+        replayedStatus.history.filter(entry => entry.details?.recoveryId === recoveryId).length,
+        1
+      );
+      assert.equal(fs.existsSync(`${lockPath}.stale.${stale.ownerId}`), false);
+    });
+
+    it('should complete an unaudited orphan recovery marker exactly once', () => {
+      harness('init W6-A --force');
+      const lockPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'execution.lock');
+      const stale = {
+        ownerId: 'crashed-recovery-owner',
+        pid: 2_147_483_647,
+        acquiredAt: '2001-01-01T00:00:00.000Z',
+        heartbeatAt: '2001-01-01T00:00:00.000Z',
+        lockEpoch: 0,
+      };
+      const markerPath = `${lockPath}.stale.${stale.ownerId}`;
+      fs.writeFileSync(markerPath, JSON.stringify(stale), 'utf-8');
+
+      const result = harness('next W6-A');
+
+      assert.equal(result.success, true);
+      const status = readStatus('W6-A');
+      const recoveryId = `${stale.ownerId}:${stale.acquiredAt}`;
+      assert.equal(status.execution.lockEpoch, 1);
+      assert.equal(
+        status.history.filter(entry => entry.details?.recoveryId === recoveryId).length,
+        1
+      );
+      assert.equal(fs.existsSync(markerPath), false);
+    });
+
+    it('should audit and fence each consecutive orphan recovery independently', () => {
+      harness('init W6-A --force');
+      const lockPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'execution.lock');
+      const staleLocks = [
+        { ownerId: 'owner-a', acquiredAt: '2000-01-01T00:00:00.000Z' },
+        { ownerId: 'owner-b', acquiredAt: '2001-01-01T00:00:00.000Z' },
+      ].map(item => ({
+        ...item,
+        pid: 2_147_483_647,
+        heartbeatAt: item.acquiredAt,
+        lockEpoch: 0,
+      }));
+      for (const stale of staleLocks) {
+        fs.writeFileSync(`${lockPath}.stale.${stale.ownerId}`, JSON.stringify(stale), 'utf-8');
+      }
+
+      const result = harness('next W6-A');
+
+      assert.equal(result.success, true);
+      const status = readStatus('W6-A');
+      assert.equal(status.execution.lockEpoch, 2);
+      for (const stale of staleLocks) {
+        const recoveryId = `${stale.ownerId}:${stale.acquiredAt}`;
+        assert.equal(
+          status.history.filter(entry => entry.details?.recoveryId === recoveryId).length,
+          1
+        );
+        assert.equal(fs.existsSync(`${lockPath}.stale.${stale.ownerId}`), false);
+      }
+    });
+
+    it('should reject manual progress while an attempt is active', () => {
+      harness('init W6-A --force');
+      const status = readStatus('W6-A');
+      status.execution.activeJobId = 'job-1';
+      status.execution.activeAttemptId = 'attempt-1';
+      status.execution.activeLeaseToken = 'attempt-1:1:token';
+      saveStatus('W6-A', status);
+
+      const result = harness('next W6-A');
+
+      assert.equal(result.success, false);
+      assert.match(result.stderr, /active-job-conflict/);
+
+      const checkResult = harness('check W6-A');
+      assert.equal(checkResult.success, false);
+      assert.match(checkResult.stderr, /active-job-conflict/);
+
+      const initResult = harness('init W6-A --force');
+      assert.equal(initResult.success, false);
+      assert.match(initResult.stderr, /active-job-conflict/);
     });
   });
 

@@ -4,8 +4,35 @@
   "title": "Harness Run Status",
   "description": "Machine-readable status for a Harness task run",
   "type": "object",
-  "required": ["taskId", "taskTitle", "createdAt", "updatedAt", "currentSubtask", "currentStage", "subtasks", "history"],
+  "required": ["schemaVersion", "stateRevision", "stageRevision", "execution", "taskId", "taskTitle", "createdAt", "updatedAt", "currentSubtask", "currentStage", "subtasks", "history"],
   "properties": {
+    "schemaVersion": {
+      "const": 4,
+      "description": "Internal status.json storage schema version"
+    },
+    "stateRevision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic revision incremented by every persisted mutation"
+    },
+    "stageRevision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Workflow cursor and gate-evidence revision used by stage CAS"
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "activeJobId", "activeAttemptId", "activeLeaseToken", "lockEpoch", "lastJobId"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["manual", "worker"] },
+        "activeJobId": { "type": ["string", "null"] },
+        "activeAttemptId": { "type": ["string", "null"] },
+        "activeLeaseToken": { "type": ["string", "null"] },
+        "lockEpoch": { "type": "integer", "minimum": 0 },
+        "lastJobId": { "type": ["string", "null"] }
+      }
+    },
     "taskId": {
       "type": "string",
       "description": "Task identifier, e.g. W6-A"
@@ -55,7 +82,7 @@
             "taskTheme": { "type": "string" },
             "status": {
               "type": "string",
-              "enum": ["pending", "active", "completed", "blocked", "skipped"]
+              "enum": ["pending", "active", "completed", "blocked", "skipped", "imported-completed"]
             },
             "stages": {
               "type": "object",

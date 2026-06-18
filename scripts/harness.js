@@ -5,9 +5,23 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import {
+  STATUS_SCHEMA_VERSION,
+  assertAttemptRef,
+  assertStageCursor,
+  createExecutionDefaults,
+  createStageCursor,
+  migrateExecutionState,
+} from './execution-protocol.js';
+import {
+  acquireExecutionLock,
+  finalizeRecoveredExecutionLock,
+  releaseExecutionLock,
+  updateExecutionLock,
+} from './execution-lock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = process.env.HARNESS_ROOT || path.resolve(__dirname, '..');
@@ -225,7 +239,19 @@ function readJSON(filePath) {
 
 function writeJSON(filePath, data) {
   ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(tempPath, 'wx');
+    fs.writeFileSync(fd, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(tempPath, { force: true });
+  }
 }
 
 function loadTemplate(templateName) {
@@ -260,10 +286,59 @@ function archiveDir(taskId) {
   return path.join(HARNESS_ROOT, 'runs', 'archive');
 }
 
+function executionLockPath(taskId) {
+  return path.join(HARNESS_ROOT, 'runs', taskId, 'execution.lock');
+}
+
+function withTaskExecutionLock(taskId, command, callback) {
+  const lockPath = executionLockPath(taskId);
+  const lock = acquireExecutionLock({
+    lockPath,
+    taskId,
+    command,
+    staleAfterMs: Number(process.env.HARNESS_LOCK_STALE_MS || 60_000),
+  });
+
+  try {
+    if (fs.existsSync(statusPath(taskId))) {
+      const status = loadStatus(taskId);
+      if (lock.recoveries.length > 0) {
+        let recoveryStateChanged = false;
+        for (const recovery of lock.recoveries) {
+          const alreadyRecorded = (status.history || []).some(entry =>
+            entry.action === 'stale-lock-recovered' &&
+            entry.details?.recoveryId === recovery.recoveryId
+          );
+          if (alreadyRecorded) continue;
+          status.execution.lockEpoch = Number(status.execution.lockEpoch || 0) + 1;
+          addHistory(status, 'stale-lock-recovered', {
+            recoveryId: recovery.recoveryId,
+            reason: 'owner-dead-and-heartbeat-stale',
+            previousOwnerId: recovery.previousLock.ownerId || null,
+            previousPid: recovery.previousLock.pid || null,
+            previousHeartbeatAt: recovery.previousLock.heartbeatAt || null,
+            lockEpoch: status.execution.lockEpoch,
+          });
+          recoveryStateChanged = true;
+        }
+        if (recoveryStateChanged) saveStatus(taskId, status);
+        finalizeRecoveredExecutionLock(lock);
+      }
+      updateExecutionLock(lock, {
+        heartbeatAt: now(),
+        lockEpoch: status.execution.lockEpoch,
+      });
+    }
+    return callback();
+  } finally {
+    releaseExecutionLock(lock);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Status load/save
 // ---------------------------------------------------------------------------
-function loadStatus(taskId) {
+function loadStatus(taskId, { persistMigration = true } = {}) {
   const p = statusPath(taskId);
   if (!fs.existsSync(p)) {
     throw new Error(`No run found for ${taskId}. Run "harness init ${taskId}" first.`);
@@ -283,11 +358,7 @@ function loadStatus(taskId) {
       if (!stage.currentOutputPath) { stage.currentOutputPath = stage.primaryReportPath || ''; migrated = true; }
     }
   }
-  // P2-2: Migration defaults for V2 fields
-  if (!status.schemaVersion || status.schemaVersion < 3) {
-    status.schemaVersion = 3;
-    migrated = true;
-  }
+  if (migrateExecutionState(status)) migrated = true;
   if (status.awaitingCommit === undefined) {
     status.awaitingCommit = false;
     migrated = true;
@@ -298,7 +369,7 @@ function loadStatus(taskId) {
   }
   if (!status.residualRisks) { status.residualRisks = []; migrated = true; }
   if (!status.acceptances) { status.acceptances = {}; migrated = true; }
-  if (migrated) {
+  if (migrated && persistMigration) {
     saveStatus(taskId, status);
   }
   return status;
@@ -306,11 +377,63 @@ function loadStatus(taskId) {
 
 function saveStatus(taskId, status) {
   status.updatedAt = now();
-  // P2-2: Normalize schemaVersion on every write (handles both fresh and migrated status)
-  if (!status.schemaVersion || status.schemaVersion < 3) status.schemaVersion = 3;
+  migrateExecutionState(status);
+  status.stateRevision += 1;
   if (status.awaitingCommit === undefined) status.awaitingCommit = false;
   if (status.commitRequiredForSubtask === undefined) status.commitRequiredForSubtask = null;
   writeJSON(statusPath(taskId), status);
+}
+
+function bumpStageRevision(status) {
+  status.stageRevision = Number(status.stageRevision || 0) + 1;
+}
+
+function getCurrentStageCursor(status) {
+  return createStageCursor({
+    subtaskId: status.currentSubtask,
+    stage: status.currentStage,
+    round: getRoundForStage(status, status.currentSubtask, status.currentStage),
+    stageRevision: status.stageRevision,
+    activeAttemptId: status.execution?.activeAttemptId || null,
+  });
+}
+
+function assertCheckEvidence(status, checkResult) {
+  assertStageCursor(checkResult.stageCursor, getCurrentStageCursor(status));
+  assertAttemptRef(checkResult.attemptRef, {
+    jobId: status.execution?.activeJobId || null,
+    attemptId: status.execution?.activeAttemptId || null,
+    leaseToken: status.execution?.activeLeaseToken || null,
+  });
+  const stageData = status.subtasks[status.currentSubtask]?.stages?.[status.currentStage];
+  const actual = getFileSnapshot(stageData?.primaryReportPath);
+  const expected = checkResult.primarySnapshot;
+  if (!expected || expected.sha256 !== actual.sha256 || expected.size !== actual.size) {
+    throw new Error('stage-cas-conflict: primary output changed after check');
+  }
+}
+
+function getCurrentAttemptRef(status) {
+  return {
+    jobId: status.execution?.activeJobId || null,
+    attemptId: status.execution?.activeAttemptId || null,
+    leaseToken: status.execution?.activeLeaseToken || null,
+  };
+}
+
+const MANUAL_PROGRESS_COMMANDS = new Set([
+  'init', 'next', 'step', 'check', 'advance', 'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current',
+]);
+
+function assertNoActiveExecution(taskId, command) {
+  if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
+  const status = readJSON(statusPath(taskId));
+  if (status?.execution?.activeJobId || status?.execution?.activeAttemptId) {
+    throw new Error(
+      `active-job-conflict: ${command} cannot change workflow state while ` +
+      `job=${status.execution.activeJobId || '(unknown)'} attempt=${status.execution.activeAttemptId || '(unknown)'} is active`
+    );
+  }
 }
 
 function addHistory(status, action, details = {}) {
@@ -819,7 +942,10 @@ function cmdInit(taskId, opts = {}) {
     taskTitle: getWorkflowConfig().taskTitle || `${taskId} 画布本体UIUX收口`,
     createdAt: now(),
     updatedAt: now(),
-    schemaVersion: 3,
+    schemaVersion: STATUS_SCHEMA_VERSION,
+    stateRevision: 0,
+    stageRevision: 0,
+    execution: createExecutionDefaults(),
     currentSubtask: fromSubtask,
     currentStage: startStage,
     awaitingCommit: false,     // P2-2
@@ -961,7 +1087,6 @@ function cmdNext(taskId, opts = {}) {
     console.log();
     console.log('   请先手动 commit 业务代码，然后运行:');
     console.log(`   pnpm harness advance ${taskId} --confirm-committed`);
-    process.exitCode = 1;
     return { error: 'awaiting-commit', commitRequiredForSubtask: status.commitRequiredForSubtask };
   }
 
@@ -996,6 +1121,7 @@ function cmdNext(taskId, opts = {}) {
   // stale baseline from an earlier attempt can make unchanged output look new.
   stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
   stageData.outputBaselineCapturedAt = now();
+  bumpStageRevision(status);
 
   saveStatus(taskId, status);
 
@@ -1087,7 +1213,6 @@ function cmdStep(taskId, opts = {}) {
   const checkResult = cmdCheck(taskId);
   if (!checkResult.pass) {
     console.log('\n⛔ STEP STOPPED at check — fix issues before retrying.');
-    process.exitCode = 1;
     return { success: false, stoppedAt: 'check', ...checkResult };
   }
   console.log('✅ CHECK PASSED\n');
@@ -1097,7 +1222,6 @@ function cmdStep(taskId, opts = {}) {
   const advanceResult = cmdAdvance(taskId, { checkResult });
   if (!advanceResult.success) {
     console.log('\n⛔ STEP STOPPED at advance.');
-    process.exitCode = 1;
     return { success: false, stoppedAt: 'advance', ...advanceResult };
   }
 
@@ -1121,7 +1245,6 @@ function cmdStep(taskId, opts = {}) {
   const nextResult = cmdNext(taskId, { copy: opts.copy });
   if (nextResult.error) {
     console.log(`\n⛔ STEP STOPPED at next: ${nextResult.error}`);
-    process.exitCode = 1;
     return { success: false, stoppedAt: 'next', ...nextResult };
   }
   console.log('✅ NEXT PROMPT GENERATED');
@@ -1139,7 +1262,7 @@ function cmdStep(taskId, opts = {}) {
 // V2: Current — read-only status overview
 // ---------------------------------------------------------------------------
 function cmdCurrent(taskId) {
-  const status = loadStatus(taskId);
+  const status = loadStatus(taskId, { persistMigration: false });
   const { currentSubtask, currentStage } = status;
   const subtasks = getSubtasksForTask();
   const subtask = subtasks.find(s => s.id === currentSubtask);
@@ -1314,8 +1437,7 @@ function cmdCheck(taskId) {
 
   if (!stageData) {
     console.log('❌ CHECK FAILED: No stage data');
-    process.exitCode = 1;
-    return { pass: false, reasons: ['No stage data'] };
+    return { pass: false, reasons: ['No stage data'], stageCursor: getCurrentStageCursor(status), attemptRef: getCurrentAttemptRef(status), primarySnapshot: null };
   }
 
   const issues = [];
@@ -1567,7 +1689,6 @@ function cmdCheck(taskId) {
       P1: findings.filter(f => f.priority === 'P1' && (f.status === 'open' || f.status === 'reopened')).length,
       P2: findings.filter(f => f.priority === 'P2' && (f.status === 'open' || f.status === 'reopened')).length,
     };
-    saveStatus(taskId, status);
   }
 
   // Output results
@@ -1576,22 +1697,45 @@ function cmdCheck(taskId) {
       ensureDir(path.dirname(mirrorPath));
       fs.copyFileSync(primaryPath, mirrorPath);
       stageData.mirrorSyncedAt = now();
-      saveStatus(taskId, status);
     }
+    bumpStageRevision(status);
+    saveStatus(taskId, status);
     console.log('✅ CHECK PASSED');
     if (warnings.length > 0) {
       console.log(`   Warnings: ${warnings.length}`);
       warnings.forEach(w => console.log(`   ⚠️  ${w}`));
     }
-    return { pass: true, warnings, requiresFixLoop, reviewDecision, openFindingCount };
+    return {
+      pass: true,
+      warnings,
+      requiresFixLoop,
+      reviewDecision,
+      openFindingCount,
+      stageCursor: getCurrentStageCursor(status),
+      attemptRef: getCurrentAttemptRef(status),
+      primarySnapshot: getFileSnapshot(primaryPath),
+    };
   } else {
+    if (primaryPath && fs.existsSync(primaryPath)) {
+      bumpStageRevision(status);
+      saveStatus(taskId, status);
+    }
     console.log('❌ CHECK FAILED:');
     issues.forEach(i => console.log(`   ❌ ${i}`));
     if (warnings.length > 0) {
       warnings.forEach(w => console.log(`   ⚠️  ${w}`));
     }
-    process.exitCode = 1;
-    return { pass: false, reasons: issues, warnings, requiresFixLoop: false, reviewDecision, openFindingCount };
+    return {
+      pass: false,
+      reasons: issues,
+      warnings,
+      requiresFixLoop: false,
+      reviewDecision,
+      openFindingCount,
+      stageCursor: getCurrentStageCursor(status),
+      attemptRef: getCurrentAttemptRef(status),
+      primarySnapshot: getFileSnapshot(primaryPath),
+    };
   }
 }
 
@@ -1606,7 +1750,7 @@ function getPreviousStage(stage) {
 // Advance (P0-1, P1-2, P1-3, V2: delivery commit checkpoint)
 // ---------------------------------------------------------------------------
 function cmdAdvance(taskId, opts = {}) {
-  const status = loadStatus(taskId);
+  let status = loadStatus(taskId);
 
   // V2: Handle --confirm-committed when awaitingCommit
   if (opts.confirmCommitted) {
@@ -1614,21 +1758,21 @@ function cmdAdvance(taskId, opts = {}) {
     if (!status.awaitingCommit) {
       console.log('⚠️  Not at commit checkpoint. Use regular "harness advance" first.');
       console.log('   --confirm-committed only works after a delivery passes and awaitingCommit is set.');
-      process.exit(1);
+      return { success: false, error: 'not-awaiting-commit' };
     }
     if (!status.commitRequiredForSubtask) {
       console.log('⚠️  commitRequiredForSubtask is missing from status. Cannot confirm commit.');
-      process.exit(1);
+      return { success: false, error: 'missing-commit-subtask' };
     }
     if (status.currentSubtask !== status.commitRequiredForSubtask) {
       console.log(`⚠️  Current subtask (${status.currentSubtask}) does not match commitRequiredForSubtask (${status.commitRequiredForSubtask}).`);
       console.log('   You may be at a different subtask. Use "harness current" to check.');
-      process.exit(1);
+      return { success: false, error: 'commit-subtask-mismatch' };
     }
     if (status.currentStage !== 'delivery') {
       console.log(`⚠️  Current stage is "${status.currentStage}", not "delivery".`);
       console.log('   --confirm-committed only applies after a delivery passes.');
-      process.exit(1);
+      return { success: false, error: 'commit-stage-mismatch' };
     }
 
     const commitSubtask = status.commitRequiredForSubtask;
@@ -1659,6 +1803,7 @@ function cmdAdvance(taskId, opts = {}) {
       status.currentStage = 'done';
       status.taskStatus = 'completed';
       addHistory(status, 'task-completed', { subtask: commitSubtask });
+      bumpStageRevision(status);
       saveStatus(taskId, status);
       console.log(`✅ Commit confirmed. All subtasks completed! Task ${taskId} is done.`);
       console.log(`   currentStage: done`);
@@ -1690,6 +1835,7 @@ function cmdAdvance(taskId, opts = {}) {
     status.subtasks[nextSubtask.id].stages['implementation-plan'] = newStage;
 
     addHistory(status, 'subtask-advanced', { subtask: nextSubtask.id, stage: 'implementation-plan' });
+    bumpStageRevision(status);
     saveStatus(taskId, status);
 
     console.log(`✅ Commit confirmed. Delivery completed for ${commitSubtask}, advancing to ${nextSubtask.id} / implementation-plan`);
@@ -1700,9 +1846,10 @@ function cmdAdvance(taskId, opts = {}) {
   const checkResult = opts.checkResult || cmdCheck(taskId);
   if (!checkResult.pass) {
     console.log('\n❌ Cannot advance: gate check failed. Fix issues before advancing.');
-    process.exitCode = 1;
     return { success: false };
   }
+  if (!opts.checkResult) status = loadStatus(taskId);
+  assertCheckEvidence(status, checkResult);
 
   const { currentSubtask, currentStage } = status;
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
@@ -1746,6 +1893,7 @@ function cmdAdvance(taskId, opts = {}) {
       toStage: fixStage,
       round: nextRound,
     });
+    bumpStageRevision(status);
     saveStatus(taskId, status);
 
     console.log(`🔁 ${currentStage} requires changes; returning to ${fixStage}.`);
@@ -1771,6 +1919,7 @@ function cmdAdvance(taskId, opts = {}) {
     status.commitRequiredForSubtask = currentSubtask;
 
     addHistory(status, 'delivery-passed-awaiting-commit', { subtask: currentSubtask });
+    bumpStageRevision(status);
     saveStatus(taskId, status);
 
     console.log('═══════════════════════════════════════════════');
@@ -1817,6 +1966,7 @@ function cmdAdvance(taskId, opts = {}) {
     addHistory(status, 'subtask-completed', { subtask: currentSubtask });
     console.log(`✅ All stages completed for ${currentSubtask}.`);
     console.log(`   Task ${taskId} completed.`);
+    bumpStageRevision(status);
     saveStatus(taskId, status);
     return { success: true, advanced: true, taskDone: true };
   }
@@ -1857,6 +2007,7 @@ function cmdAdvance(taskId, opts = {}) {
   ensureDir(outputsDir(taskId, currentSubtask));
 
   addHistory(status, 'stage-advanced', { subtask: currentSubtask, stage: nextStage });
+  bumpStageRevision(status);
   saveStatus(taskId, status);
 
   console.log(`✅ Advanced to ${currentSubtask} / ${nextStage}`);
@@ -1870,7 +2021,7 @@ function cmdAdvance(taskId, opts = {}) {
 // Status
 // ---------------------------------------------------------------------------
 function cmdStatus(taskId) {
-  const status = loadStatus(taskId);
+  const status = loadStatus(taskId, { persistMigration: false });
 
   console.log(`\n📊 ${taskId} Status`);
   console.log(`${'─'.repeat(60)}`);
@@ -1924,7 +2075,7 @@ function cmdStatus(taskId) {
 // Summary (V2: enhanced with awaitingCommit, open findings, next command)
 // ---------------------------------------------------------------------------
 function cmdSummary(taskId) {
-  const status = loadStatus(taskId);
+  const status = loadStatus(taskId, { persistMigration: false });
   const allSubtasks = getSubtasksForTask();
   const allStages = getStages();
 
@@ -2072,6 +2223,7 @@ function cmdAccept(taskId, opts = {}) {
     subtask: status.currentSubtask,
     note,
   });
+  bumpStageRevision(status);
   saveStatus(taskId, status);
   console.log(`✅ Manual acceptance recorded for ${status.currentSubtask}`);
   console.log(`   note: ${note}`);
@@ -2143,6 +2295,7 @@ function cmdImport(taskId, opts = {}) {
   }
 
   addHistory(status, 'import', { completed });
+  bumpStageRevision(status);
   saveStatus(taskId, status);
 
   console.log(`✅ Imported ${completed} as completed`);
@@ -2229,6 +2382,7 @@ function cmdResume(taskId, opts = {}) {
   }
 
   addHistory(status, 'resume', { from, stage });
+  bumpStageRevision(status);
   saveStatus(taskId, status);
 
   const cfg = getWorkflowConfig();
@@ -2253,6 +2407,7 @@ function cmdSetCurrent(taskId, subtaskId, stage) {
   status.currentStage = stage;
 
   addHistory(status, 'set-current', { subtask: subtaskId, stage });
+  bumpStageRevision(status);
   saveStatus(taskId, status);
 
   console.log(`✅ Set current position to ${subtaskId} / ${stage}`);
@@ -2281,6 +2436,7 @@ function cmdInterrupt(taskId, opts = {}) {
   }
 
   addHistory(status, 'interrupt', { subtask: currentSubtask, stage: currentStage, reason });
+  bumpStageRevision(status);
   saveStatus(taskId, status);
 
   console.log(`⚠️  Interrupted ${currentSubtask} / ${currentStage}`);
@@ -2332,7 +2488,7 @@ function cmdResumeCurrent(taskId) {
 // Brief
 // ---------------------------------------------------------------------------
 function cmdBrief(taskId) {
-  const status = loadStatus(taskId);
+  const status = loadStatus(taskId, { persistMigration: false });
   const { currentSubtask, currentStage } = status;
   const allSubtasks = getSubtasksForTask();
   const subtask = allSubtasks.find(s => s.id === currentSubtask);
@@ -2556,7 +2712,10 @@ function main() {
       loadWorkflowConfig(taskId);
     }
 
-    switch (command) {
+    let commandResult;
+    const dispatch = () => {
+      assertNoActiveExecution(taskId, command);
+      switch (command) {
       case 'init': {
         if (!taskId) throw new Error('taskId required');
         cmdInit(taskId, {
@@ -2569,12 +2728,12 @@ function main() {
       }
       case 'next': {
         if (!taskId) throw new Error('taskId required');
-        cmdNext(taskId, { copy: opts.copy === true || opts.copy === 'true' });
+        commandResult = cmdNext(taskId, { copy: opts.copy === true || opts.copy === 'true' });
         break;
       }
       case 'step': {
         if (!taskId) throw new Error('taskId required');
-        cmdStep(taskId, { copy: !(opts['no-copy'] === true || opts['no-copy'] === 'true') });
+        commandResult = cmdStep(taskId, { copy: !(opts['no-copy'] === true || opts['no-copy'] === 'true') });
         break;
       }
       case 'current': {
@@ -2584,12 +2743,12 @@ function main() {
       }
       case 'check': {
         if (!taskId) throw new Error('taskId required');
-        cmdCheck(taskId);
+        commandResult = cmdCheck(taskId);
         break;
       }
       case 'advance': {
         if (!taskId) throw new Error('taskId required');
-        cmdAdvance(taskId, { confirmCommitted: opts['confirm-committed'] === true || opts['confirm-committed'] === 'true' });
+        commandResult = cmdAdvance(taskId, { confirmCommitted: opts['confirm-committed'] === true || opts['confirm-committed'] === 'true' });
         break;
       }
       case 'status': {
@@ -2630,7 +2789,7 @@ function main() {
       }
       case 'resume-current': {
         if (!taskId) throw new Error('taskId required');
-        cmdResumeCurrent(taskId);
+        commandResult = cmdResumeCurrent(taskId);
         break;
       }
       case 'brief': {
@@ -2642,10 +2801,20 @@ function main() {
         console.error(`Unknown command: ${command}`);
         printUsage();
         process.exit(1);
+      }
+    };
+
+    if (taskId && MANUAL_PROGRESS_COMMANDS.has(command)) {
+      withTaskExecutionLock(taskId, command, dispatch);
+    } else {
+      dispatch();
+    }
+    if (commandResult?.success === false || commandResult?.pass === false || commandResult?.error) {
+      process.exitCode = 1;
     }
   } catch (err) {
     console.error(`❌ Error: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
