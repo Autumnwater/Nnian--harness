@@ -22,7 +22,7 @@
 ## 产物路径
 
 - **primaryReportPath:** {{primaryReportPath}}
-- **mirrorOutputPath:** {{mirrorOutputPath}}
+- **mirrorOutputPath（Harness 自动生成，只读）:** {{mirrorOutputPath}}
 - **planToReview:** {{planToReview}}
 
 ## 边界规则
@@ -93,7 +93,7 @@ Acceptance:
 
 1. 如果 `{{reportDir}}` 目录不存在，请先创建。
 2. 将 Review 意见写入：`{{primaryReportPath}}`
-3. 将机器可读副本写入：`{{mirrorOutputPath}}`
+3. 不要写入 `{{mirrorOutputPath}}`；Harness 会在 check 通过后自动同步 mirror。
 
 ## 中断交接
 

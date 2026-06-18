@@ -5,6 +5,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -139,6 +140,17 @@ function getTargetWindowInstruction(targetWindow) {
   return '请返回 Harness 窗口继续操作';
 }
 
+function getNextRecommendedCommand(taskId, status, stageData = {}) {
+  if (status.awaitingCommit) return `pnpm harness advance ${taskId} --confirm-committed`;
+  if (status.currentStage === 'done' || status.taskStatus === 'completed') return '(task completed)';
+  if (stageData.stageStatus === 'interrupted') return `pnpm harness resume-current ${taskId}`;
+  if (stageData.stageStatus === 'completed') return `pnpm harness advance ${taskId}`;
+  if (stageData.primaryReportPath && fs.existsSync(stageData.primaryReportPath)) {
+    return `pnpm harness step ${taskId}`;
+  }
+  return `pnpm harness next ${taskId} --copy`;
+}
+
 // ---------------------------------------------------------------------------
 // V2: Prompt file path
 // ---------------------------------------------------------------------------
@@ -177,6 +189,29 @@ function ensureDir(dirPath) {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true });
   }
+}
+
+function getFileSnapshot(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return { exists: false, size: 0, mtimeMs: 0, sha256: '' };
+  }
+  const content = fs.readFileSync(filePath);
+  const stat = fs.statSync(filePath);
+  return {
+    exists: true,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    sha256: createHash('sha256').update(content).digest('hex'),
+  };
+}
+
+function hasFreshOutput(stageData) {
+  const primaryPath = stageData?.primaryReportPath;
+  if (!primaryPath || !fs.existsSync(primaryPath)) return false;
+  const baseline = stageData.outputBaseline;
+  if (!baseline || baseline.legacy) return true;
+  const current = getFileSnapshot(primaryPath);
+  return !baseline.exists || current.sha256 !== baseline.sha256;
 }
 
 function readJSON(filePath) {
@@ -249,8 +284,8 @@ function loadStatus(taskId) {
     }
   }
   // P2-2: Migration defaults for V2 fields
-  if (status.schemaVersion === undefined) {
-    status.schemaVersion = 2;
+  if (!status.schemaVersion || status.schemaVersion < 3) {
+    status.schemaVersion = 3;
     migrated = true;
   }
   if (status.awaitingCommit === undefined) {
@@ -262,6 +297,7 @@ function loadStatus(taskId) {
     migrated = true;
   }
   if (!status.residualRisks) { status.residualRisks = []; migrated = true; }
+  if (!status.acceptances) { status.acceptances = {}; migrated = true; }
   if (migrated) {
     saveStatus(taskId, status);
   }
@@ -271,7 +307,7 @@ function loadStatus(taskId) {
 function saveStatus(taskId, status) {
   status.updatedAt = now();
   // P2-2: Normalize schemaVersion on every write (handles both fresh and migrated status)
-  if (status.schemaVersion === undefined) status.schemaVersion = 2;
+  if (!status.schemaVersion || status.schemaVersion < 3) status.schemaVersion = 3;
   if (status.awaitingCommit === undefined) status.awaitingCommit = false;
   if (status.commitRequiredForSubtask === undefined) status.commitRequiredForSubtask = null;
   writeJSON(statusPath(taskId), status);
@@ -783,12 +819,13 @@ function cmdInit(taskId, opts = {}) {
     taskTitle: getWorkflowConfig().taskTitle || `${taskId} 画布本体UIUX收口`,
     createdAt: now(),
     updatedAt: now(),
-    schemaVersion: 2,  // P2-2
+    schemaVersion: 3,
     currentSubtask: fromSubtask,
     currentStage: startStage,
     awaitingCommit: false,     // P2-2
     commitRequiredForSubtask: null,  // P2-2
     residualRisks: [],
+    acceptances: {},
     subtasks: {},
     history: [],
   };
@@ -954,6 +991,10 @@ function cmdNext(taskId, opts = {}) {
 
   // Set currentOutputPath (P1-5)
   stageData.currentOutputPath = stageData.primaryReportPath;
+  if (!stageData.outputBaseline) {
+    stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
+    stageData.outputBaselineCapturedAt = now();
+  }
 
   saveStatus(taskId, status);
 
@@ -1052,7 +1093,7 @@ function cmdStep(taskId, opts = {}) {
 
   // Step 2: Advance
   console.log('▶ ADVANCE');
-  const advanceResult = cmdAdvance(taskId);
+  const advanceResult = cmdAdvance(taskId, { checkResult });
   if (!advanceResult.success) {
     console.log('\n⛔ STEP STOPPED at advance.');
     process.exitCode = 1;
@@ -1126,16 +1167,7 @@ function cmdCurrent(taskId) {
   }
 
   // Next recommended command
-  let nextCmd;
-  if (status.awaitingCommit) {
-    nextCmd = `pnpm harness advance ${taskId} --confirm-committed`;
-  } else if (stageData.stageStatus === 'interrupted') {
-    nextCmd = `pnpm harness resume-current ${taskId}`;
-  } else if (stageData.stageStatus === 'completed') {
-    nextCmd = `pnpm harness advance ${taskId}`;
-  } else {
-    nextCmd = `pnpm harness next ${taskId} --copy`;
-  }
+  const nextCmd = getNextRecommendedCommand(taskId, status, stageData);
 
   console.log('═══════════════════════════════════════════════');
   console.log(`📍 ${taskId} — CURRENT STATE`);
@@ -1288,6 +1320,8 @@ function cmdCheck(taskId) {
   const issues = [];
   const warnings = [];
   let requiresFixLoop = false;
+  let reviewDecision = '';
+  let openFindingCount = 0;
   const config = getStageConfig(currentStage) || {};
 
   // 1. Check primaryReportPath exists and non-empty
@@ -1301,19 +1335,15 @@ function cmdCheck(taskId) {
     if (content.length === 0) {
       issues.push(`primaryReportPath is empty: ${primaryPath}`);
     }
-  }
-
-  // 2. Check mirrorOutputPath
-  const mirrorPath = stageData.mirrorOutputPath;
-  if (mirrorPath && !fs.existsSync(mirrorPath)) {
-    warnings.push(`mirrorOutputPath does not exist: ${mirrorPath}`);
-  } else if (mirrorPath && primaryPath && fs.existsSync(primaryPath) && fs.existsSync(mirrorPath)) {
-    const primaryContent = fs.readFileSync(primaryPath, 'utf-8');
-    const mirrorContent = fs.readFileSync(mirrorPath, 'utf-8');
-    if (primaryContent !== mirrorContent) {
-      issues.push(`mirrorOutputPath content differs from primaryReportPath: ${mirrorPath}`);
+    if (!stageData.outputBaseline) {
+      warnings.push('Legacy stage has no output baseline; freshness check skipped once.');
+    } else if (!hasFreshOutput(stageData)) {
+      issues.push(`primaryReportPath was not updated for the current stage: ${primaryPath}`);
     }
   }
+
+  // 2. Mirror is a Harness-managed derived artifact.
+  const mirrorPath = stageData.mirrorOutputPath;
 
   // 3. Stage-specific gate checks
   if (primaryPath && fs.existsSync(primaryPath)) {
@@ -1323,6 +1353,8 @@ function cmdCheck(taskId) {
       const findings = parseFindings(content);
       const legacyFindingHeading = content.match(/^#{3,6}\s+(?!Finding\s+)(?:NEW\s+)?(?:W\d+-[A-Z]-\d{2}-)?P[012](?:#|-)\d+/m);
       const decision = detectReviewDecision(content);
+      reviewDecision = decision;
+      openFindingCount = findings.filter(f => f.status === 'open' || f.status === 'reopened').length;
 
       if (legacyFindingHeading) {
         issues.push(`${currentStage}: Legacy finding heading "${legacyFindingHeading[0]}" is not machine-readable. Use "### Finding ${currentSubtask}-P{0|1|2}-NN".`);
@@ -1330,6 +1362,9 @@ function cmdCheck(taskId) {
       issues.push(...validateFindingContract(findings, currentSubtask).map(issue => `${currentStage}: ${issue}`));
       if (decision === 'changes-required' && findings.length === 0) {
         issues.push(`${currentStage}: Review requires changes but contains no machine-readable "### Finding ..." blocks.`);
+      }
+      if (decision === 'pass' && openFindingCount > 0) {
+        issues.push(`${currentStage}: Decision is pass but ${openFindingCount} finding(s) remain open/reopened.`);
       }
     }
 
@@ -1464,9 +1499,13 @@ function cmdCheck(taskId) {
       }
 
       // Check for finding status table or residual risk
-      const hasResidual = content.includes('residual risk') || content.includes('Residual Risk') || content.includes('残差') || content.includes('残余风险');
+      const hasResidual = content.includes('residual risk') || content.includes('Residual Risk') || content.includes('残差') || content.includes('残余风险') || content.includes('残留风险');
       if (!hasResidual) {
         warnings.push('Delivery report may be missing residual risk section');
+      }
+
+      if (!status.acceptances?.[currentSubtask]) {
+        issues.push(`Delivery blocked: manual acceptance is missing. Run: pnpm harness accept ${taskId} --note "<验收说明>"`);
       }
 
       // Check all findings for the subtask
@@ -1524,12 +1563,18 @@ function cmdCheck(taskId) {
 
   // Output results
   if (issues.length === 0) {
+    if (mirrorPath && primaryPath && fs.existsSync(primaryPath)) {
+      ensureDir(path.dirname(mirrorPath));
+      fs.copyFileSync(primaryPath, mirrorPath);
+      stageData.mirrorSyncedAt = now();
+      saveStatus(taskId, status);
+    }
     console.log('✅ CHECK PASSED');
     if (warnings.length > 0) {
       console.log(`   Warnings: ${warnings.length}`);
       warnings.forEach(w => console.log(`   ⚠️  ${w}`));
     }
-    return { pass: true, warnings, requiresFixLoop };
+    return { pass: true, warnings, requiresFixLoop, reviewDecision, openFindingCount };
   } else {
     console.log('❌ CHECK FAILED:');
     issues.forEach(i => console.log(`   ❌ ${i}`));
@@ -1537,7 +1582,7 @@ function cmdCheck(taskId) {
       warnings.forEach(w => console.log(`   ⚠️  ${w}`));
     }
     process.exitCode = 1;
-    return { pass: false, reasons: issues, warnings, requiresFixLoop: false };
+    return { pass: false, reasons: issues, warnings, requiresFixLoop: false, reviewDecision, openFindingCount };
   }
 }
 
@@ -1643,7 +1688,7 @@ function cmdAdvance(taskId, opts = {}) {
   }
 
   // Run check first
-  const checkResult = cmdCheck(taskId);
+  const checkResult = opts.checkResult || cmdCheck(taskId);
   if (!checkResult.pass) {
     console.log('\n❌ Cannot advance: gate check failed. Fix issues before advancing.');
     process.exitCode = 1;
@@ -1748,7 +1793,12 @@ function cmdAdvance(taskId, opts = {}) {
   addHistory(status, 'stage-completed', { subtask: currentSubtask, stage: currentStage });
 
   // Determine next stage
-  const nextStage = config.nextStage;
+  let nextStage = config.nextStage;
+  if (currentStage === 'plan-review' && checkResult.openFindingCount === 0) {
+    nextStage = 'code-implementation';
+  } else if (currentStage === 'code-review' && checkResult.openFindingCount === 0) {
+    nextStage = 'delivery';
+  }
 
   if (!nextStage) {
     // Done stage or no next stage
@@ -1976,26 +2026,37 @@ function cmdSummary(taskId) {
   console.log();
 
   // Next recommended command
-  let nextCmd;
-  if (status.awaitingCommit) {
-    nextCmd = `pnpm harness advance ${taskId} --confirm-committed`;
-  } else if (status.currentStage === 'done' || status.taskStatus === 'completed') {
-    nextCmd = '(task completed)';
-  } else {
-    const stageData = subtaskStages[status.currentStage];
-    if (stageData?.stageStatus === 'interrupted') {
-      nextCmd = `pnpm harness resume-current ${taskId}`;
-    } else if (stageData?.stageStatus === 'completed') {
-      nextCmd = `pnpm harness advance ${taskId}`;
-    } else {
-      nextCmd = `pnpm harness next ${taskId} --copy`;
-    }
-  }
+  const nextCmd = getNextRecommendedCommand(taskId, status, subtaskStages[status.currentStage] || {});
 
   console.log('## Next Recommended Command');
   console.log();
   console.log(`\`${nextCmd}\``);
   console.log();
+}
+
+// ---------------------------------------------------------------------------
+// Manual acceptance
+// ---------------------------------------------------------------------------
+function cmdAccept(taskId, opts = {}) {
+  const status = loadStatus(taskId);
+  const note = String(opts.note || '').trim();
+  if (!note) throw new Error('--note "<acceptance evidence>" is required');
+  if (status.currentStage !== 'delivery') {
+    throw new Error(`Manual acceptance can only be recorded at delivery; currentStage=${status.currentStage}`);
+  }
+
+  if (!status.acceptances) status.acceptances = {};
+  status.acceptances[status.currentSubtask] = {
+    acceptedAt: now(),
+    note,
+  };
+  addHistory(status, 'manual-acceptance', {
+    subtask: status.currentSubtask,
+    note,
+  });
+  saveStatus(taskId, status);
+  console.log(`✅ Manual acceptance recorded for ${status.currentSubtask}`);
+  console.log(`   note: ${note}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2103,12 +2164,15 @@ function cmdResume(taskId, opts = {}) {
 
   const curSt = status.subtasks[from];
   curSt.status = 'active';
+  const newlyAssumedStages = [];
   for (let si = 0; si < startStageIdx; si++) {
     const sid = allStages[si];
     if (!curSt.stages[sid] || curSt.stages[sid].stageStatus === 'pending') {
       curSt.stages[sid] = { stageStatus: 'assumed-completed', currentOutputPath: '', latestAcceptedOutputPath: '', outputs: [] };
+      newlyAssumedStages.push(sid);
     } else if (curSt.stages[sid].stageStatus === 'active') {
       curSt.stages[sid].stageStatus = 'assumed-completed';
+      newlyAssumedStages.push(sid);
     }
   }
 
@@ -2134,8 +2198,7 @@ function cmdResume(taskId, opts = {}) {
   };
 
   if (!status.residualRisks) status.residualRisks = [];
-  for (let si = 0; si < startStageIdx; si++) {
-    const sid = allStages[si];
+  for (const sid of newlyAssumedStages) {
     const existing = status.residualRisks.find(r => r.subtask === from && r.stage === sid);
     if (!existing) {
       status.residualRisks.push({
@@ -2427,6 +2490,7 @@ Usage:
   harness advance <taskId> [--confirm-committed]
   harness status <taskId>
   harness summary <taskId>
+  harness accept <taskId> --note "<acceptance evidence>"
   harness import <taskId> --completed <subtask>
   harness resume <taskId> --from <subtask> --stage <stage>
   harness set-current <taskId> <subtask> <stage>
@@ -2455,6 +2519,7 @@ Examples:
   harness advance W6-A --confirm-committed
   harness status W6-A
   harness brief W6-A
+  harness accept W6-A --note "人工验收通过"
 `);
 }
 
@@ -2468,7 +2533,7 @@ function main() {
   try {
     // Load workflow config for any command that needs it
     const commandsNeedingConfig = ['init', 'next', 'step', 'current', 'check', 'advance', 'status', 'summary',
-      'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief'];
+      'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
     }
@@ -2517,6 +2582,11 @@ function main() {
       case 'summary': {
         if (!taskId) throw new Error('taskId required');
         cmdSummary(taskId);
+        break;
+      }
+      case 'accept': {
+        if (!taskId) throw new Error('taskId required');
+        cmdAccept(taskId, { note: opts.note });
         break;
       }
       case 'import': {

@@ -22,7 +22,7 @@
 ## 产物路径
 
 - **primaryReportPath:** {{primaryReportPath}}
-- **mirrorOutputPath:** {{mirrorOutputPath}}
+- **mirrorOutputPath（Harness 自动生成，只读）:** {{mirrorOutputPath}}
 - **codeMappingToReview:** {{codeMappingToReview}}
 
 ## 边界规则
@@ -82,7 +82,7 @@ Acceptance:
 ## 产物要求
 
 1. 将 Code Review 意见写入：`{{primaryReportPath}}`
-2. 将机器可读副本写入：`{{mirrorOutputPath}}`
+2. 不要写入 `{{mirrorOutputPath}}`；Harness 会在 check 通过后自动同步 mirror。
 
 ## 中断交接
 

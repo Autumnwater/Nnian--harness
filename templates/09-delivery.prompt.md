@@ -23,7 +23,7 @@
 ## 产物路径
 
 - **primaryReportPath:** {{primaryReportPath}}
-- **mirrorOutputPath:** {{mirrorOutputPath}}
+- **mirrorOutputPath（Harness 自动生成，只读）:** {{mirrorOutputPath}}
 - **implementationPlan:** {{implementationPlan}}
 - **codeMapping:** {{codeMapping}}
 - **allReviewFindings:** {{allReviewFindings}}
@@ -33,7 +33,7 @@
 1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{reviewRoot}}`。
 2. 你可以读取 `{{codeRepo}}` 并在其中运行非破坏性的验证命令。
 3. **禁止写入或修改** `{{codeRepo}}` 业务代码。
-4. 你只能写入 `{{primaryReportPath}}` 和 `{{mirrorOutputPath}}` 对应的交付报告。
+4. 你只能写入 `{{primaryReportPath}}`；mirror 由 Harness 自动生成。
 5. **你不可批准自己的交付物。** 最终准入由 Codex 负责。
 6. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
 7. **不可**执行 destructive git、commit、push，除非用户明确要求。
@@ -50,7 +50,7 @@
 ## 产物要求
 
 1. 将交付物报告写入：`{{primaryReportPath}}`
-2. 将机器可读副本写入：`{{mirrorOutputPath}}`
+2. 不要写入 `{{mirrorOutputPath}}`；Harness 会在 check 通过后自动同步 mirror。
 
 交付物报告格式：
 

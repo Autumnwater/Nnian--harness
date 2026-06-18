@@ -24,7 +24,7 @@
 ## 产物路径
 
 - **primaryReportPath:** {{primaryReportPath}}
-- **mirrorOutputPath:** {{mirrorOutputPath}}
+- **mirrorOutputPath（Harness 自动生成，只读）:** {{mirrorOutputPath}}
 - **codeMappingToReview:** {{codeMappingToReview}}
 - **fixReportToReview:** {{fixReportToReview}}
 - **previousReviewFindings:** {{previousReviewFindings}}
@@ -91,9 +91,9 @@ Acceptance:
 ## 产物要求
 
 1. 将复审意见写入：`{{primaryReportPath}}`
-2. 将机器可读副本写入：`{{mirrorOutputPath}}`
-3. 写入后必须检查以上两个目标文件真实存在；未落盘不得声称完成。
-4. 除 `primaryReportPath` 和 `mirrorOutputPath` 外，不得写入任何 CodeReview/复审报告路径。
+2. 不要写入 `{{mirrorOutputPath}}`；Harness 会在 check 通过后自动同步 mirror。
+3. 写入后必须检查主报告真实存在；未落盘不得声称完成。
+4. 除 `primaryReportPath` 外，不得写入任何 CodeReview/复审报告路径。
 
 ## 中断交接
 
