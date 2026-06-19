@@ -36,6 +36,35 @@ const targetBindingIdentity = target => {
   return bindingIdentity(target);
 };
 
+const targetAdapterIdentity = target => {
+  if (!target?.adapterIdentity && !target?.targetFingerprintHash) return null;
+  const identity = target.adapterIdentity || {};
+  return {
+    adapter: identity.adapter || target.adapter || null,
+    role: identity.role || target.role || null,
+    bindingId: identity.bindingId || target.bindingId || null,
+    bindingGeneration: identity.bindingGeneration ?? target.bindingGeneration ?? null,
+    sessionId: identity.sessionId || target.sessionId || null,
+    sessionNonceHash: identity.sessionNonceHash || target.sessionNonceHash || null,
+    targetFingerprintHash: identity.targetFingerprintHash || target.targetFingerprintHash || null,
+    targetChallengeId: identity.targetChallengeId || target.targetChallengeId || null,
+    targetBindingVerifiedAt: identity.targetBindingVerifiedAt || target.targetBindingVerifiedAt || null,
+    capabilityEvidenceId: identity.capabilityEvidenceId || target.capabilityEvidenceId || null,
+  };
+};
+
+const assertAdapterIdentity = (expected, actual) => {
+  if (!expected && !actual) return;
+  if (!expected || !actual) throw new Error('adapter-identity-fence-conflict');
+  const fields = [
+    'adapter', 'role', 'bindingId', 'bindingGeneration', 'sessionId',
+    'sessionNonceHash', 'targetFingerprintHash', 'targetChallengeId',
+    'targetBindingVerifiedAt', 'capabilityEvidenceId',
+  ];
+  const mismatches = fields.filter(field => (expected[field] || null) !== (actual[field] || null));
+  if (mismatches.length > 0) throw new Error(`adapter-identity-fence-conflict: ${mismatches.join(', ')}`);
+};
+
 const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
   if (receipt?.protocolVersion !== 1) throw new Error('receipt-rejected:invalid-protocol-version');
   for (const field of ['eventId', 'jobId', 'attemptId', 'leaseToken', 'kind', 'occurredAt', 'source']) {
@@ -107,6 +136,7 @@ export class ExecutionSupervisor {
 
     const operationId = randomUUID();
     const capturedBindingIdentity = targetBindingIdentity(target);
+    const capturedAdapterIdentity = targetAdapterIdentity(target);
     const jobBase = createJob(jobInput);
     const attemptBase = createAttempt({ jobId: jobBase.jobId, lockEpoch: status.execution.lockEpoch });
     let job = {
@@ -117,12 +147,14 @@ export class ExecutionSupervisor {
       workflowState: 'pending',
       target,
       bindingIdentity: capturedBindingIdentity,
+      adapterIdentity: capturedAdapterIdentity,
     };
     let attempt = {
       ...attemptBase,
       operationId,
       bindingId: target.bindingId,
       bindingIdentity: capturedBindingIdentity,
+      adapterIdentity: capturedAdapterIdentity,
       state: 'prepared',
       transportState: 'prepared',
       dispatchingPersisted: false,
@@ -136,6 +168,7 @@ export class ExecutionSupervisor {
       operationId,
       state: 'pending',
       bindingIdentity: capturedBindingIdentity,
+      adapterIdentity: capturedAdapterIdentity,
     };
     const payloads = { job, attempt, lease };
     const payloadHash = canonicalPayloadHash(payloads);
@@ -286,6 +319,8 @@ export class ExecutionSupervisor {
       assertAttemptRef(operation.attemptRef, attemptRef(attempt));
       const lease = this.store.readLease(operation.bindingId);
       assertAttemptRef(operation.attemptRef, lease);
+      assertAdapterIdentity(job.adapterIdentity || null, attempt.adapterIdentity || null);
+      assertAdapterIdentity(job.adapterIdentity || null, lease.adapterIdentity || null);
       const status = this.statusStore.load();
       assertAttemptRef(operation.attemptRef, {
         jobId: status.execution.activeJobId,
@@ -518,6 +553,8 @@ export class ExecutionSupervisor {
     const operation = this.store.readOperation(attempt.operationId);
     const lease = this.store.readLease(attempt.bindingId);
     assertAttemptRef(expected, lease);
+    assertAdapterIdentity(job?.adapterIdentity || null, attempt.adapterIdentity || null);
+    assertAdapterIdentity(job?.adapterIdentity || null, lease.adapterIdentity || null);
     if (attempt.lockEpoch !== status.execution.lockEpoch || lease.lockEpoch !== status.execution.lockEpoch) {
       throw new Error('attempt-fence-conflict: lockEpoch');
     }
@@ -675,6 +712,7 @@ export class ExecutionSupervisor {
         operationId,
         bindingId: previousAttempt.bindingId,
         bindingIdentity: previousAttempt.bindingIdentity || previousJob.bindingIdentity || null,
+        adapterIdentity: previousAttempt.adapterIdentity || previousJob.adapterIdentity || null,
         state: 'prepared',
         transportState: 'prepared',
         dispatchingPersisted: false,
@@ -697,6 +735,7 @@ export class ExecutionSupervisor {
         operationId,
         state: 'pending',
         bindingIdentity: attempt.bindingIdentity || null,
+        adapterIdentity: attempt.adapterIdentity || null,
       };
       const payloads = { job, attempt, lease };
       const operation = {
@@ -908,10 +947,17 @@ export class ExecutionSupervisor {
         lease.leaseToken !== attempt.leaseToken) {
       throw new Error('receipt-rejected:lease-fence-conflict');
     }
+    const jobForReceipt = this.store.readJob(receipt.jobId);
+    try {
+      assertAdapterIdentity(jobForReceipt?.adapterIdentity || null, attempt.adapterIdentity || null);
+      assertAdapterIdentity(jobForReceipt?.adapterIdentity || null, lease.adapterIdentity || null);
+    } catch {
+      throw new Error('receipt-rejected:adapter-identity-fence-conflict');
+    }
     if (attempt.lockEpoch !== status.execution.lockEpoch || lease.lockEpoch !== status.execution.lockEpoch) {
       throw new Error('receipt-rejected:fenced-lock-epoch');
     }
-    this.validateReceiptBinding(receipt, attempt, this.store.readJob(receipt.jobId), lease);
+    this.validateReceiptBinding(receipt, attempt, jobForReceipt, lease);
     const operation = this.store.readOperation(attempt.operationId);
     if (!operation || operation.attemptRef?.attemptId !== attempt.attemptId ||
         operation.attemptRef?.leaseToken !== attempt.leaseToken) {

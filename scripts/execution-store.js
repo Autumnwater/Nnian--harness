@@ -96,6 +96,7 @@ export class ExecutionStore {
       capabilities: path.join(runRoot, 'capabilities'),
       applications: path.join(runRoot, 'receipt-applications'),
       receipts: path.join(runRoot, 'receipts'),
+      targetChallenges: path.join(runRoot, 'target-challenges'),
     };
   }
 
@@ -240,6 +241,64 @@ export class ExecutionStore {
 
   readCapability(name) {
     return this.readRecord('capabilities', name);
+  }
+
+  targetChallengePath(bucket, challengeId, eventId = null) {
+    if (!['pending', 'inbox', 'processed', 'rejected'].includes(bucket)) {
+      throw new Error(`invalid-target-challenge-bucket: ${bucket}`);
+    }
+    if (bucket === 'pending') return path.join(this.paths.targetChallenges, bucket, `${challengeId}.json`);
+    return path.join(this.paths.targetChallenges, bucket, challengeId, `${eventId}.json`);
+  }
+
+  writeTargetChallenge(challenge) {
+    if (!challenge?.payload?.challengeId) throw new Error('target challengeId is required');
+    const filePath = this.targetChallengePath('pending', challenge.payload.challengeId);
+    const existing = readJson(filePath);
+    if (existing && canonicalPayloadHash(existing) !== canonicalPayloadHash(challenge)) {
+      throw new Error(`target-challenge-conflict: ${challenge.payload.challengeId}`);
+    }
+    atomicWriteJson(filePath, challenge, this.faultInjector);
+    return challenge;
+  }
+
+  readTargetChallenge(challengeId) {
+    return readJson(this.targetChallengePath('pending', challengeId));
+  }
+
+  publishTargetChallengeResponse(response) {
+    if (!response?.challengeId || !response?.eventId) throw new Error('challengeId and eventId are required');
+    const filePath = this.targetChallengePath('inbox', response.challengeId, response.eventId);
+    const existing = readJson(filePath);
+    if (existing && canonicalPayloadHash(existing) !== canonicalPayloadHash(response)) {
+      throw new Error(`target-challenge-response-conflict: ${response.eventId}`);
+    }
+    atomicWriteJson(filePath, response, this.faultInjector);
+    return { status: existing ? 'duplicate' : 'published', payloadHash: canonicalPayloadHash(response) };
+  }
+
+  finalizeTargetChallengeResponse(challengeId, eventId, destination) {
+    if (!['processed', 'rejected'].includes(destination)) {
+      throw new Error(`invalid-target-challenge-destination: ${destination}`);
+    }
+    const source = this.targetChallengePath('inbox', challengeId, eventId);
+    const target = this.targetChallengePath(destination, challengeId, eventId);
+    if (!fs.existsSync(source)) {
+      if (fs.existsSync(target)) return { finalized: false, alreadyFinalized: true };
+      throw new Error(`target-challenge-response-not-found: ${challengeId}/${eventId}`);
+    }
+    ensureDir(path.dirname(target));
+    if (fs.existsSync(target)) {
+      if (canonicalPayloadHash(readJson(source)) !== canonicalPayloadHash(readJson(target))) {
+        throw new Error(`target-challenge-finalize-conflict: ${eventId}`);
+      }
+      fs.unlinkSync(source);
+    } else {
+      fs.renameSync(source, target);
+    }
+    fsyncDirectory(path.dirname(source));
+    fsyncDirectory(path.dirname(target));
+    return { finalized: true, destination };
   }
 
   receiptPath(bucket, attemptId, eventId) {
