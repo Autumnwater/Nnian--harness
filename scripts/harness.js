@@ -19,6 +19,7 @@ import {
   createEvent,
   createStageCursor,
   migrateExecutionState,
+  verifySessionProof,
 } from './execution-protocol.js';
 import { ExecutionStore } from './execution-store.js';
 import { ExecutionSupervisor } from './execution-supervisor.js';
@@ -39,6 +40,14 @@ const HARNESS_ROOT = process.env.HARNESS_ROOT || path.resolve(__dirname, '..');
 const REVIEW_ROOT = process.env.REVIEW_ROOT || '/Users/admin/project/ai/review';
 const CODE_REPO = process.env.CODE_REPO || '/Users/admin/project/ai/work/HEXAI';
 const REVIEW_PLAYBOOKS = path.join(REVIEW_ROOT, 'ReviewPlaybooks');
+const BINDING_HEARTBEAT_STALE_MS = 300_000;
+const CAPABILITY_EVIDENCE_TTL_MS = 24 * 60 * 60 * 1000;
+const NEEDS_INPUT_CATEGORIES = new Set([
+  'permission-request',
+  'agent-question',
+  'authentication-required',
+  'external-intervention',
+]);
 
 // Use env override if set, else fall back to config, then hardcoded default
 function getEffectiveReviewRoot() {
@@ -443,6 +452,8 @@ function getCurrentAttemptRef(status) {
 const MANUAL_PROGRESS_COMMANDS = new Set([
   'init', 'next', 'step', 'check', 'advance', 'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current',
 ]);
+
+const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set(['worker-attach']);
 
 function assertNoActiveExecution(taskId, command) {
   if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
@@ -2827,35 +2838,65 @@ function bindingDiagnostics(store) {
       sessionNonceHash: binding.sessionNonceHash,
       heartbeatAt,
       heartbeatAgeMs: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs : null,
-      stale: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs > 300_000 : true,
+      stale: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs > BINDING_HEARTBEAT_STALE_MS : true,
     };
   });
 }
 
+function assertFreshBinding(binding, nowMs = Date.now()) {
+  if (!binding) throw new Error('binding-not-found');
+  if (['terminal', 'revoked', 'detached'].includes(binding.state)) throw new Error('binding-unavailable');
+  const heartbeatAt = binding.heartbeatAt || binding.createdAt;
+  const heartbeatMs = Date.parse(heartbeatAt);
+  if (!Number.isFinite(heartbeatMs) || nowMs - heartbeatMs > BINDING_HEARTBEAT_STALE_MS) {
+    throw new Error('binding-stale');
+  }
+  return binding;
+}
+
 function deriveHookCapabilities(evidence) {
+  const unavailable = reason => ({
+    completionReceiptCapability: 'unavailable',
+    needsInputCapability: 'unavailable',
+    reason,
+  });
   if (!evidence) {
-    return {
-      completionReceiptCapability: 'unavailable',
-      needsInputCapability: 'unavailable',
-      reason: 'missing-capability-evidence',
-    };
+    return unavailable('missing-capability-evidence');
   }
   if (evidence.compatible === false || evidence.versionDrift === true) {
-    return {
-      completionReceiptCapability: 'unavailable',
-      needsInputCapability: 'unavailable',
-      reason: evidence.reason || 'capability-evidence-incompatible',
-    };
+    return unavailable(evidence.reason || 'capability-evidence-incompatible');
+  }
+  const capturedAtMs = Date.parse(evidence.capturedAt);
+  if (!Number.isFinite(capturedAtMs) || Date.now() - capturedAtMs > CAPABILITY_EVIDENCE_TTL_MS || capturedAtMs > Date.now() + 60_000) {
+    return unavailable('capability-evidence-stale');
+  }
+  if (!evidence.hookSource || !evidence.hookVersion) {
+    return unavailable('missing-hook-source-version');
+  }
+  if (evidence.completionPhase !== 'claude-completed') {
+    return unavailable('missing-completion-phase');
+  }
+  if (!['hook-payload', 'wrapper-injected'].includes(evidence.attemptRefSource) ||
+      !['hook-payload', 'wrapper-injected'].includes(evidence.bindingSessionSource)) {
+    return unavailable('missing-injection-proof');
   }
   const fields = new Set(evidence.observedFields || []);
-  const completionRequired = ['kind', 'attemptId', 'jobId', 'leaseToken', 'occurredAt', 'bindingId', 'sessionId'];
+  const completionRequired = ['kind', 'occurredAt'];
+  if (evidence.attemptRefSource === 'hook-payload') completionRequired.push('attemptId', 'jobId', 'leaseToken');
+  if (evidence.bindingSessionSource === 'hook-payload') completionRequired.push('bindingId', 'sessionId');
   const missingCompletion = completionRequired.filter(field => !fields.has(field));
-  const needsInputAvailable = fields.has('needsInputCategory') || evidence.needsInputCapability === 'available';
+  if (missingCompletion.length > 0) return unavailable(`missing-fields:${missingCompletion.join(',')}`);
+  const needsInputAvailable = evidence.needsInputCategorySource === 'hook-payload' &&
+    fields.has('needsInputCategory') &&
+    NEEDS_INPUT_CATEGORIES.has(evidence.sampleNeedsInputCategory || 'agent-question');
   return {
-    completionReceiptCapability: missingCompletion.length === 0 ? 'available' : 'unavailable',
+    completionReceiptCapability: 'available',
     needsInputCapability: needsInputAvailable ? 'available' : 'unavailable',
     missingCompletionFields: missingCompletion,
+    needsInputReason: needsInputAvailable ? null : 'missing-needs-input-category-source',
     source: evidence.source || null,
+    hookSource: evidence.hookSource,
+    hookVersion: evidence.hookVersion,
     capturedAt: evidence.capturedAt || null,
   };
 }
@@ -3020,11 +3061,17 @@ function cmdWorkerChallenge(taskId, opts = {}) {
     const payload = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
     const evidence = {
       source: fixturePath,
-      capturedAt: new Date().toISOString(),
-      observedFields: Object.keys(payload),
+      capturedAt: payload.capturedAt || new Date().toISOString(),
+      observedFields: payload.observedFields || Object.keys(payload),
       compatible: payload.versionDrift === true ? false : true,
-      version: payload.version || null,
-      needsInputCapability: payload.needsInputCategory ? 'available' : 'unavailable',
+      versionDrift: payload.versionDrift === true,
+      hookSource: payload.hookSource || payload.source || null,
+      hookVersion: payload.hookVersion || payload.version || null,
+      completionPhase: payload.completionPhase || payload.hookPhase || null,
+      attemptRefSource: payload.attemptRefSource || null,
+      bindingSessionSource: payload.bindingSessionSource || null,
+      needsInputCategorySource: payload.needsInputCategorySource || null,
+      sampleNeedsInputCategory: payload.needsInputCategory || null,
     };
     store.writeCapability('claude-hook', evidence);
     const result = deriveHookCapabilities(evidence);
@@ -3033,19 +3080,58 @@ function cmdWorkerChallenge(taskId, opts = {}) {
   }
   const bindingId = opts.binding;
   if (!bindingId) throw new Error('--binding required');
-  const binding = store.readBinding(bindingId);
-  if (!binding) throw new Error('binding-not-found');
-  const rawNonce = store.readBindingSecret(bindingId);
-  if (!rawNonce) throw new Error('binding-secret-unavailable');
-  const result = {
+  const binding = assertFreshBinding(store.readBinding(bindingId));
+  const challengeId = opts['challenge-id'] || randomUUID();
+  const challengeRecordId = `binding-challenge-${challengeId}`;
+  const existing = store.readCapability(challengeRecordId);
+  if (opts.proof) {
+    if (!existing) throw new Error('challenge-not-found');
+    if (existing.verifiedAt) throw new Error('challenge-already-used');
+    const existingPayload = existing.payload || {};
+    if (existingPayload.bindingId !== binding.bindingId ||
+        existingPayload.bindingGeneration !== binding.bindingGeneration ||
+        existingPayload.sessionId !== binding.sessionId ||
+        existingPayload.sessionNonceHash !== binding.sessionNonceHash) {
+      throw new Error('challenge-binding-mismatch');
+    }
+    const rawNonce = store.readBindingSecret(bindingId);
+    if (!rawNonce) throw new Error('session-secret-unavailable');
+    const proofPayload = { ...existing.payload, proof: opts.proof };
+    if (!verifySessionProof(rawNonce, proofPayload)) throw new Error('challenge-proof-invalid');
+    const verified = { ...existing, status: 'verified', verifiedAt: new Date().toISOString() };
+    store.writeCapability(challengeRecordId, verified);
+    const result = {
+      status: 'verified',
+      challengeId,
+      bindingId,
+      role: binding.role,
+      bindingGeneration: binding.bindingGeneration,
+      sessionId: binding.sessionId,
+      verifiedAt: verified.verifiedAt,
+    };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  if (existing) throw new Error('challenge-already-issued');
+  const payload = {
+    protocolVersion: 1,
+    kind: 'binding.challenge',
+    challengeId,
     bindingId,
     role: binding.role,
     bindingGeneration: binding.bindingGeneration,
     sessionId: binding.sessionId,
-    verified: true,
-    verifiedAt: new Date().toISOString(),
+    sessionNonceHash: binding.sessionNonceHash,
+    issuedAt: new Date().toISOString(),
   };
-  store.writeCapability(`binding-challenge-${bindingId}`, result);
+  const result = {
+    status: 'issued',
+    challengeId,
+    bindingId,
+    payload,
+    proofRequired: true,
+  };
+  store.writeCapability(challengeRecordId, { ...result, type: 'binding-challenge' });
   console.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -3071,8 +3157,7 @@ function cmdWorkerReceipt(taskId, opts = {}) {
   }
   const category = opts.category || opts['needs-input-category'];
   if (kind === 'job.needs-input') {
-    const allowed = new Set(['permission', 'agent-question', 'authentication', 'external-intervention']);
-    if (!allowed.has(category)) throw new Error('needs-input-invalid-category');
+    if (!NEEDS_INPUT_CATEGORIES.has(category)) throw new Error('needs-input-invalid-category');
   }
   const receipt = createEvent({
     kind,
@@ -3158,7 +3243,8 @@ async function main() {
     // Load workflow config for any command that needs it
     const commandsNeedingConfig = ['init', 'next', 'step', 'current', 'check', 'advance', 'status', 'summary',
       'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief',
-      'doctor', 'run', 'pump', 'jobs', 'retry', 'cancel', 'reconcile'];
+      'doctor', 'run', 'pump', 'jobs', 'retry', 'cancel', 'reconcile',
+      'worker-attach', 'worker-bindings', 'worker-challenge', 'worker-receipt'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
     }
@@ -3287,6 +3373,26 @@ async function main() {
         commandResult = await cmdWorkerReconcile(taskId, { ...opts, adapter: opts.adapter || 'fake' });
         break;
       }
+      case 'worker-attach': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerAttach(taskId, opts);
+        break;
+      }
+      case 'worker-bindings': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerBindings(taskId, opts);
+        break;
+      }
+      case 'worker-challenge': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerChallenge(taskId, opts);
+        break;
+      }
+      case 'worker-receipt': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerReceipt(taskId, opts);
+        break;
+      }
       default:
         console.error(`Unknown command: ${command}`);
         printUsage();
@@ -3295,6 +3401,9 @@ async function main() {
     };
 
     if (taskId && MANUAL_PROGRESS_COMMANDS.has(command)) {
+      await withTaskExecutionLockRetry(taskId, command, dispatch);
+    } else if (taskId && LOCKED_WORKER_ARTIFACT_COMMANDS.has(command) &&
+        !(opts['dry-run'] === true || opts['dry-run'] === 'true')) {
       await withTaskExecutionLockRetry(taskId, command, dispatch);
     } else {
       await dispatch();

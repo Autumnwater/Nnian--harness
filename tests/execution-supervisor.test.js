@@ -471,7 +471,7 @@ describe('V3 Phase 2 execution supervisor', () => {
       attempt,
       sequence: 1,
       eventId: 'needs-input',
-      details: { prompt: 'Need operator input' },
+      details: { category: 'agent-question', prompt: 'Need operator input' },
     }));
 
     const needsInput = await supervisor.pumpOnce();
@@ -494,6 +494,122 @@ describe('V3 Phase 2 execution supervisor', () => {
     assert.equal(completed.status, 'check-blocked');
     assert.equal(statusStore.status.execution.activeAttemptId, attempt.attemptId);
     assert.equal(store.readAttempt(attempt.attemptId).lastSequence, 2);
+  });
+
+  it('rejects stale wrapper heartbeat receipts without changing workflow state', async () => {
+    const staleAt = '2026-06-19T00:00:00.000Z';
+    const { binding, rawNonce } = createBinding({
+      taskId: 'W9-A',
+      bindingId: 'wrapper.work',
+      role: 'work',
+      bindingGeneration: 1,
+      sessionId: 'session-stale',
+      rawNonce: 'raw-secret-nonce',
+      createdAt: staleAt,
+      heartbeatAt: staleAt,
+    });
+    const adapter = new FakeWorkerAdapter({ targets: [binding] });
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-stale-binding-'));
+    const store = new ExecutionStore({ harnessRoot: root, taskId: 'W9-A' });
+    const statusStore = new MemoryStatusStore();
+    const supervisor = new ExecutionSupervisor({
+      taskId: 'W9-A',
+      store,
+      statusStore,
+      adapter,
+      clock: () => '2026-06-19T00:10:01.000Z',
+      workflow: { evaluate: () => ({ pass: true }), derive: () => { throw new Error('must not derive'); } },
+    });
+    store.writeBinding(binding);
+    store.writeBindingSecret(binding.bindingId, rawNonce);
+    const prepared = await supervisor.prepare({ ...jobInput, targetBinding: binding.bindingId });
+    await supervisor.dispatch(prepared.operationId, { timeoutMs: 100 });
+    const attempt = store.readAttempt(prepared.attempt.attemptId);
+    store.publishReceipt(createEvent({
+      kind: 'job.completed',
+      source: 'wrapper-hook',
+      attempt,
+      sequence: 1,
+      eventId: 'stale-completion',
+      occurredAt: '2026-06-19T00:10:00.000Z',
+      binding,
+      rawNonce,
+    }));
+    store.publishReceipt(createEvent({
+      kind: 'job.needs-input',
+      source: 'wrapper-hook',
+      attempt,
+      sequence: 1,
+      eventId: 'stale-needs-input',
+      occurredAt: '2026-06-19T00:10:00.000Z',
+      details: { category: 'agent-question' },
+      binding,
+      rawNonce,
+    }));
+
+    await supervisor.pumpOnce();
+
+    assert.equal(store.readReceiptApplication(attempt.attemptId, 'stale-completion').reason, 'binding-stale');
+    assert.equal(store.readReceiptApplication(attempt.attemptId, 'stale-needs-input').reason, 'binding-stale');
+    assert.equal(store.readJob(prepared.job.jobId).workflowState, 'pending');
+    assert.equal(statusStore.status.execution.activeAttemptId, attempt.attemptId);
+  });
+
+  it('accepts only the approved needs-input category enum', async () => {
+    for (const category of ['permission-request', 'agent-question', 'authentication-required', 'external-intervention']) {
+      const { supervisor, store } = makeHarness();
+      const prepared = await supervisor.prepare(jobInput);
+      await supervisor.dispatch(prepared.operationId, { timeoutMs: 100 });
+      const attempt = store.readAttempt(prepared.attempt.attemptId);
+      store.publishReceipt(createEvent({
+        kind: 'job.needs-input',
+        source: 'fake-adapter',
+        attempt,
+        sequence: 1,
+        eventId: `needs-input-${category}`,
+        details: { category },
+      }));
+      assert.equal((await supervisor.pumpOnce()).status, 'needs-input');
+    }
+    for (const category of ['permission', 'authentication']) {
+      const { supervisor, store } = makeHarness();
+      const prepared = await supervisor.prepare(jobInput);
+      await supervisor.dispatch(prepared.operationId, { timeoutMs: 100 });
+      const attempt = store.readAttempt(prepared.attempt.attemptId);
+      store.publishReceipt(createEvent({
+        kind: 'job.needs-input',
+        source: 'fake-adapter',
+        attempt,
+        sequence: 1,
+        eventId: `needs-input-${category}`,
+        details: { category },
+      }));
+      await supervisor.pumpOnce();
+      assert.equal(store.readReceiptApplication(attempt.attemptId, `needs-input-${category}`).reason, 'needs-input-invalid-category');
+    }
+  });
+
+  it('rejects needs-input receipts without an authoritative category', async () => {
+    const { supervisor, store } = makeHarness();
+    const prepared = await supervisor.prepare(jobInput);
+    await supervisor.dispatch(prepared.operationId, { timeoutMs: 100 });
+    const attempt = store.readAttempt(prepared.attempt.attemptId);
+    store.publishReceipt(createEvent({
+      kind: 'job.needs-input',
+      source: 'fake-adapter',
+      attempt,
+      sequence: 1,
+      eventId: 'needs-input-missing-category',
+      details: {},
+    }));
+
+    await supervisor.pumpOnce();
+
+    assert.equal(
+      store.readReceiptApplication(attempt.attemptId, 'needs-input-missing-category').reason,
+      'needs-input-invalid-category'
+    );
+    assert.equal(store.readAttempt(attempt.attemptId).workflowState, 'pending');
   });
 
   it('keeps a sequence gap pending and rejects duplicate and stale sequences', async () => {

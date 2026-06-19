@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import os from 'node:os';
+import { createSessionProof } from '../scripts/execution-protocol.js';
 
 // Create temp directories for isolated testing
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-test-'));
@@ -2608,6 +2609,162 @@ Expected: Should be fixed
       assert.equal(status.currentStage, 'delivery');
       assert.equal(status.awaitingCommit, true);
       assert.equal(status.execution.activeAttemptId, null);
+    });
+  });
+
+  describe('V3 Phase 3: worker binding and receipt CLI', () => {
+    it('keeps worker-attach dry-run read-only and stores raw nonce only in the secret file', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const statusFile = path.join(HARNESS_DIR, 'runs', 'W6-A', 'status.json');
+      const before = fs.readFileSync(statusFile, 'utf8');
+
+      const dryRun = harness('worker-attach W6-A --role work --binding wrapper.work --dry-run');
+      assert.equal(dryRun.success, true, dryRun.stderr);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
+      assert.equal(fs.existsSync(path.join(HARNESS_DIR, 'runs', 'W6-A', 'bindings', 'wrapper.work.json')), false);
+      assert.match(dryRun.stdout, /"wouldWrite": false/);
+      assert.doesNotMatch(dryRun.stdout, /rawNonce|sessionNonce[^H]/);
+
+      const attached = harness('worker-attach W6-A --role work --binding wrapper.work');
+      assert.equal(attached.success, true, attached.stderr);
+      assert.doesNotMatch(attached.stdout, /rawNonce|sessionNonce[^H]/);
+      const bindingPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'bindings', 'wrapper.work.json');
+      const secretPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'bindings', '.secrets', 'wrapper.work.nonce');
+      assert.equal(fs.existsSync(bindingPath), true);
+      assert.equal(fs.existsSync(secretPath), true);
+      assert.doesNotMatch(fs.readFileSync(bindingPath, 'utf8'), /rawNonce|sessionNonce[^H]/);
+      assert.equal((fs.statSync(secretPath).mode & 0o777), 0o600);
+
+      const bindings = harness('worker-bindings W6-A --json');
+      assert.equal(bindings.success, true, bindings.stderr);
+      assert.equal(bindings.stdout.includes(fs.readFileSync(secretPath, 'utf8')), false);
+      assert.match(bindings.stdout, /wrapper\.work/);
+
+      const issued = harness('worker-challenge W6-A --binding wrapper.work');
+      assert.equal(issued.success, true, issued.stderr);
+      const challenge = JSON.parse(issued.stdout);
+      assert.equal(challenge.status, 'issued');
+      assert.ok(challenge.payload.challengeId);
+      const badVerify = harness(`worker-challenge W6-A --binding wrapper.work --challenge-id ${challenge.challengeId} --proof bad-proof`);
+      assert.equal(badVerify.success, false);
+      assert.match(badVerify.stderr, /challenge-proof-invalid/);
+      const proof = createSessionProof(fs.readFileSync(secretPath, 'utf8'), challenge.payload);
+      const verified = harness(`worker-challenge W6-A --binding wrapper.work --challenge-id ${challenge.challengeId} --proof ${proof}`);
+      assert.equal(verified.success, true, verified.stderr);
+      assert.match(verified.stdout, /"status": "verified"/);
+      const replay = harness(`worker-challenge W6-A --binding wrapper.work --challenge-id ${challenge.challengeId} --proof ${proof}`);
+      assert.equal(replay.success, false);
+      assert.match(replay.stderr, /challenge-already-used/);
+
+      const binding = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+      fs.writeFileSync(bindingPath, JSON.stringify({
+        ...binding,
+        heartbeatAt: '2000-01-01T00:00:00.000Z',
+      }, null, 2), 'utf8');
+      const stale = harness('worker-challenge W6-A --binding wrapper.work');
+      assert.equal(stale.success, false);
+      assert.match(stale.stderr, /binding-stale/);
+    });
+
+    it('rejects binding replacement while an active attempt for the role exists', async () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+
+      const replace = harness('worker-attach W6-A --role work --binding wrapper.work --replace');
+
+      assert.equal(replace.success, false);
+      assert.match(replace.stderr, /active-attempt-binding-replacement-conflict/);
+      const status = readStatus('W6-A');
+      const cancelled = harness(`cancel W6-A --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token ${status.execution.activeLeaseToken}`);
+      assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
+      await running.completed;
+    });
+
+    it('publishes needs-input through worker-receipt and makes foreground run stop without clearing active refs', async () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      const status = await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+
+      const receipt = harness(`worker-receipt W6-A --attempt ${status.execution.activeAttemptId} --kind job.needs-input --sequence 1 --needs-input-category agent-question --event-id needs-input-cli`);
+      assert.equal(receipt.success, true, `${receipt.stderr}\n${receipt.stdout}`);
+      assert.doesNotMatch(receipt.stdout, /rawNonce|sessionNonce[^H]/);
+      const run = await running.completed;
+
+      assert.equal(run.success, false, `${run.stderr}\n${run.stdout}`);
+      assert.match(run.stdout, /"status": "needs-input"/);
+      const after = readStatus('W6-A');
+      assert.equal(after.execution.activeAttemptId, status.execution.activeAttemptId);
+      assert.equal(after.execution.activeLeaseToken, status.execution.activeLeaseToken);
+      assert.equal(fs.existsSync(path.join(HARNESS_DIR, 'runs', 'W6-A', 'leases', 'fake.work.json')), true);
+
+      const invalid = harness(`worker-receipt W6-A --attempt ${status.execution.activeAttemptId} --kind job.needs-input --sequence 2 --event-id needs-input-invalid`);
+      assert.equal(invalid.success, false);
+      assert.match(invalid.stderr, /needs-input-invalid-category/);
+      const cancelled = harness(`cancel W6-A --job ${after.execution.activeJobId} --attempt ${after.execution.activeAttemptId} --lease-token ${after.execution.activeLeaseToken}`);
+      assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
+    });
+
+    it('records hook payload capability evidence and reports it from doctor without writing status', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const fixture = path.join(TEST_ROOT, 'hook-payload.json');
+      fs.writeFileSync(fixture, JSON.stringify({
+        hookSource: 'claude-code-hook',
+        hookVersion: 'test-1',
+        completionPhase: 'claude-completed',
+        attemptRefSource: 'wrapper-injected',
+        bindingSessionSource: 'wrapper-injected',
+        needsInputCategorySource: 'hook-payload',
+        kind: 'job.completed',
+        occurredAt: new Date().toISOString(),
+        needsInputCategory: 'agent-question',
+      }), 'utf8');
+      const statusFile = path.join(HARNESS_DIR, 'runs', 'W6-A', 'status.json');
+      const before = fs.readFileSync(statusFile, 'utf8');
+
+      const challenge = harness(`worker-challenge W6-A --probe-hook-payload ${fixture}`);
+      assert.equal(challenge.success, true, challenge.stderr);
+      assert.match(challenge.stdout, /"completionReceiptCapability": "available"/);
+      const afterProbe = fs.readFileSync(statusFile, 'utf8');
+      assert.equal(afterProbe, before);
+
+      const doctor = harness('doctor W6-A --adapter fake');
+      assert.equal(doctor.success, true, doctor.stderr);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
+      assert.match(doctor.stdout, /"completionReceiptCapability": "available"/);
+      assert.match(doctor.stdout, /"needsInputCapability": "available"/);
+    });
+
+    it('keeps hook capability unavailable for missing, stale, drifted, or incomplete evidence', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const writeProbe = (name, payload) => {
+        const fixture = path.join(TEST_ROOT, name);
+        fs.writeFileSync(fixture, JSON.stringify(payload), 'utf8');
+        return harness(`worker-challenge W6-A --probe-hook-payload ${fixture}`);
+      };
+      const base = {
+        hookSource: 'claude-code-hook',
+        hookVersion: 'test-1',
+        completionPhase: 'claude-completed',
+        attemptRefSource: 'wrapper-injected',
+        bindingSessionSource: 'wrapper-injected',
+        needsInputCategorySource: 'hook-payload',
+        kind: 'job.completed',
+        occurredAt: new Date().toISOString(),
+        needsInputCategory: 'agent-question',
+      };
+      for (const [name, payload, reason] of [
+        ['hook-drift.json', { ...base, versionDrift: true }, 'capability-evidence-incompatible'],
+        ['hook-stale.json', { ...base, capturedAt: '2000-01-01T00:00:00.000Z' }, 'capability-evidence-stale'],
+        ['hook-missing-phase.json', { ...base, completionPhase: undefined }, 'missing-completion-phase'],
+        ['hook-missing-source.json', { ...base, needsInputCategorySource: undefined }, 'missing-needs-input-category-source'],
+      ]) {
+        const result = writeProbe(name, payload);
+        assert.equal(result.success, true, result.stderr);
+        assert.match(result.stdout, /"completionReceiptCapability": "unavailable"|"needsInputCapability": "unavailable"/);
+        assert.match(result.stdout, new RegExp(reason));
+      }
     });
   });
 });

@@ -12,6 +12,13 @@ import {
 import { canonicalPayloadHash } from './execution-store.js';
 
 const isoNow = () => new Date().toISOString();
+const BINDING_HEARTBEAT_STALE_MS = 300_000;
+const NEEDS_INPUT_CATEGORIES = new Set([
+  'permission-request',
+  'agent-question',
+  'authentication-required',
+  'external-intervention',
+]);
 
 const required = (value, field) => {
   if (typeof value !== 'string' || value.length === 0) throw new Error(`${field} is required`);
@@ -38,6 +45,11 @@ const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
   }
   if (!['job.running', 'job.completed', 'job.failed', 'job.needs-input'].includes(receipt.kind)) {
     throw new Error('receipt-rejected:invalid-kind');
+  }
+  if (receipt.kind === 'job.needs-input') {
+    if (!NEEDS_INPUT_CATEGORIES.has(receipt.details?.category)) {
+      throw new Error('receipt-rejected:needs-input-invalid-category');
+    }
   }
   if (!Number.isInteger(receipt.sequence) || receipt.sequence <= 0) {
     throw new Error('receipt-rejected:invalid-sequence');
@@ -843,8 +855,25 @@ export class ExecutionSupervisor {
         throw new Error(`receipt-rejected:binding-${field}-mismatch`);
       }
     }
+    const binding = this.store.readBinding(expected.bindingId);
+    if (!binding) throw new Error('receipt-rejected:binding-unavailable');
+    for (const field of ['bindingId', 'role', 'bindingGeneration', 'sessionId', 'sessionNonceHash']) {
+      if (binding[field] !== expected[field]) {
+        throw new Error(`receipt-rejected:binding-${field}-mismatch`);
+      }
+    }
+    if (['terminal', 'revoked', 'detached'].includes(binding.state)) {
+      throw new Error('receipt-rejected:binding-unavailable');
+    }
+    const heartbeatAt = binding.heartbeatAt || binding.createdAt;
+    const heartbeatMs = Date.parse(heartbeatAt);
+    const nowMs = Date.parse(this.clock());
+    if (!Number.isFinite(heartbeatMs) || !Number.isFinite(nowMs) ||
+        nowMs - heartbeatMs > BINDING_HEARTBEAT_STALE_MS) {
+      throw new Error('receipt-rejected:binding-stale');
+    }
     const rawNonce = this.store.readBindingSecret(expected.bindingId);
-    if (!rawNonce) throw new Error('receipt-rejected:binding-secret-unavailable');
+    if (!rawNonce) throw new Error('receipt-rejected:session-secret-unavailable');
     if (hashSessionNonce(rawNonce) !== expected.sessionNonceHash) {
       throw new Error('receipt-rejected:binding-secret-mismatch');
     }
