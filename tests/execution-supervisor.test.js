@@ -6,7 +6,7 @@ import path from 'node:path';
 
 import { ExecutionStore } from '../scripts/execution-store.js';
 import { ExecutionSupervisor } from '../scripts/execution-supervisor.js';
-import { FakeWorkerAdapter } from '../scripts/execution-protocol.js';
+import { FakeWorkerAdapter, createBinding, createEvent } from '../scripts/execution-protocol.js';
 
 const baseStatus = () => ({
   schemaVersion: 4,
@@ -412,6 +412,88 @@ describe('V3 Phase 2 execution supervisor', () => {
     assert.equal(store.listReceipts('rejected').length, 1);
     assert.equal(store.listReceipts('processed').length, 1);
     assert.equal(store.readReceiptApplication(prepared.attempt.attemptId, 'a-invalid').reason, 'invalid-protocol-version');
+  });
+
+  it('verifies wrapper receipt proof against the attempt-captured binding identity', async () => {
+    const { binding, rawNonce } = createBinding({
+      taskId: 'W9-A',
+      bindingId: 'wrapper.work',
+      role: 'work',
+      bindingGeneration: 1,
+      sessionId: 'session-1',
+      rawNonce: 'raw-secret-nonce',
+    });
+    const adapter = new FakeWorkerAdapter({ targets: [binding] });
+    const { supervisor, store } = makeHarness({ adapter });
+    store.writeBinding(binding);
+    store.writeBindingSecret(binding.bindingId, rawNonce);
+    const prepared = await supervisor.prepare({ ...jobInput, targetBinding: binding.bindingId });
+    await supervisor.dispatch(prepared.operationId, { timeoutMs: 100 });
+    const attempt = store.readAttempt(prepared.attempt.attemptId);
+
+    store.publishReceipt({
+      ...createEvent({
+        kind: 'job.completed',
+        source: 'wrapper-hook',
+        attempt,
+        sequence: 1,
+        eventId: 'a-bad-proof',
+        binding,
+        rawNonce,
+      }),
+      proof: 'bad-proof',
+    });
+    store.publishReceipt(createEvent({
+      kind: 'job.completed',
+      source: 'wrapper-hook',
+      attempt,
+      sequence: 1,
+      eventId: 'b-good-proof',
+      binding,
+      rawNonce,
+    }));
+
+    const result = await supervisor.pumpOnce();
+
+    assert.equal(result.status, 'check-blocked');
+    assert.equal(store.readReceiptApplication(attempt.attemptId, 'a-bad-proof').reason, 'session-proof-invalid');
+    assert.equal(store.readReceiptApplication(attempt.attemptId, 'b-good-proof').classification, 'accepted');
+  });
+
+  it('keeps active refs and lease after needs-input, then accepts a monotonic completion', async () => {
+    const { supervisor, store, statusStore } = makeHarness();
+    const prepared = await supervisor.prepare(jobInput);
+    await supervisor.dispatch(prepared.operationId, { timeoutMs: 100 });
+    const attempt = store.readAttempt(prepared.attempt.attemptId);
+    store.publishReceipt(createEvent({
+      kind: 'job.needs-input',
+      source: 'fake-adapter',
+      attempt,
+      sequence: 1,
+      eventId: 'needs-input',
+      details: { prompt: 'Need operator input' },
+    }));
+
+    const needsInput = await supervisor.pumpOnce();
+
+    assert.equal(needsInput.status, 'needs-input');
+    assert.equal(statusStore.status.execution.activeAttemptId, attempt.attemptId);
+    assert.ok(store.readLease('fake.work'));
+    assert.equal(store.readAttempt(attempt.attemptId).workflowState, 'needs-input-awaiting-operator');
+    await assert.rejects(() => supervisor.retry(prepared.job.jobId), /active-job-conflict/);
+
+    store.publishReceipt(createEvent({
+      kind: 'job.completed',
+      source: 'fake-adapter',
+      attempt,
+      sequence: 2,
+      eventId: 'completion-after-needs-input',
+    }));
+    const completed = await supervisor.pumpOnce();
+
+    assert.equal(completed.status, 'check-blocked');
+    assert.equal(statusStore.status.execution.activeAttemptId, attempt.attemptId);
+    assert.equal(store.readAttempt(attempt.attemptId).lastSequence, 2);
   });
 
   it('keeps a sequence gap pending and rejects duplicate and stale sequences', async () => {

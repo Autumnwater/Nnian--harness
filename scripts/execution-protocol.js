@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 
 export const STATUS_SCHEMA_VERSION = 4;
 export const WORKER_PROTOCOL_VERSION = 1;
@@ -13,6 +13,21 @@ const EXECUTION_DEFAULTS = Object.freeze({
 });
 
 const isoNow = () => new Date().toISOString();
+
+const stableValue = value => {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => {
+        if (value[key] === undefined) return null;
+        return [key, stableValue(value[key])];
+      }).filter(Boolean)
+    );
+  }
+  return value;
+};
+
+const canonicalJson = value => JSON.stringify(stableValue(value));
 
 const requiredString = (value, field) => {
   if (typeof value !== 'string' || value.length === 0) {
@@ -204,18 +219,90 @@ export const createLease = ({ bindingId, attempt, ttlMs = 60_000, createdAt }) =
   };
 };
 
-export const createEvent = ({ kind, source, attempt, eventId, sequence, occurredAt, details = {} }) => ({
-  protocolVersion: WORKER_PROTOCOL_VERSION,
-  eventId: eventId || randomUUID(),
-  jobId: requiredString(attempt?.jobId, 'attempt.jobId'),
-  attemptId: requiredString(attempt?.attemptId, 'attempt.attemptId'),
-  leaseToken: requiredString(attempt?.leaseToken, 'attempt.leaseToken'),
-  kind: requiredString(kind, 'kind'),
-  source: requiredString(source, 'source'),
-  sequence: positiveInteger(sequence, 'sequence'),
-  occurredAt: occurredAt || isoNow(),
-  details,
+export const createSessionNonce = () => randomBytes(32).toString('base64url');
+
+export const hashSessionNonce = rawNonce => createHash('sha256')
+  .update(requiredString(rawNonce, 'rawNonce'))
+  .digest('hex');
+
+export const createBinding = ({
+  taskId,
+  bindingId,
+  role,
+  sessionId = randomUUID(),
+  bindingGeneration = 1,
+  rawNonce = createSessionNonce(),
+  createdAt = isoNow(),
+  heartbeatAt = null,
+  metadata = {},
+}) => {
+  const binding = {
+    workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+    taskId: requiredString(taskId, 'taskId'),
+    bindingId: requiredString(bindingId, 'bindingId'),
+    role: requiredString(role, 'role'),
+    bindingGeneration: positiveInteger(bindingGeneration, 'bindingGeneration'),
+    sessionId: requiredString(sessionId, 'sessionId'),
+    sessionNonceHash: hashSessionNonce(rawNonce),
+    createdAt,
+    heartbeatAt,
+    metadata,
+  };
+  return { binding, rawNonce };
+};
+
+export const bindingIdentity = binding => ({
+  bindingId: requiredString(binding?.bindingId, 'binding.bindingId'),
+  role: requiredString(binding?.role, 'binding.role'),
+  bindingGeneration: positiveInteger(binding?.bindingGeneration, 'binding.bindingGeneration'),
+  sessionId: requiredString(binding?.sessionId, 'binding.sessionId'),
+  sessionNonceHash: requiredString(binding?.sessionNonceHash, 'binding.sessionNonceHash'),
 });
+
+export const canonicalReceiptPayload = receipt => {
+  const { proof, rawNonce, ...payload } = receipt || {};
+  return payload;
+};
+
+export const createSessionProof = (rawNonce, receipt) => createHmac('sha256', requiredString(rawNonce, 'rawNonce'))
+  .update(canonicalJson(canonicalReceiptPayload(receipt)))
+  .digest('hex');
+
+export const verifySessionProof = (rawNonce, receipt) => {
+  if (typeof receipt?.proof !== 'string' || receipt.proof.length === 0) return false;
+  const expected = createSessionProof(rawNonce, receipt);
+  const actual = receipt.proof;
+  if (expected.length !== actual.length) return false;
+  return timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+};
+
+export const createEvent = ({
+  kind,
+  source,
+  attempt,
+  eventId,
+  sequence,
+  occurredAt,
+  details = {},
+  binding = null,
+  rawNonce = null,
+}) => {
+  const receipt = {
+    protocolVersion: WORKER_PROTOCOL_VERSION,
+    eventId: eventId || randomUUID(),
+    jobId: requiredString(attempt?.jobId, 'attempt.jobId'),
+    attemptId: requiredString(attempt?.attemptId, 'attempt.attemptId'),
+    leaseToken: requiredString(attempt?.leaseToken, 'attempt.leaseToken'),
+    kind: requiredString(kind, 'kind'),
+    source: requiredString(source, 'source'),
+    sequence: positiveInteger(sequence, 'sequence'),
+    occurredAt: occurredAt || isoNow(),
+    details,
+  };
+  if (binding) Object.assign(receipt, bindingIdentity(binding));
+  if (rawNonce) receipt.proof = createSessionProof(rawNonce, receipt);
+  return receipt;
+};
 
 export class ManualWorkerAdapter {
   async capabilities() {

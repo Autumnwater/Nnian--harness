@@ -14,7 +14,9 @@ import {
   ManualWorkerAdapter,
   assertAttemptRef,
   assertStageCursor,
+  createBinding,
   createExecutionDefaults,
+  createEvent,
   createStageCursor,
   migrateExecutionState,
 } from './execution-protocol.js';
@@ -2730,6 +2732,11 @@ Examples:
   harness cancel W6-A --job <jobId> --attempt <attemptId> --lease-token <token>
   harness reconcile W6-A --attempt <attemptId> --decision sent|not-sent|abandon [evidence]
   harness <manual-command> W6-A --takeover --reason "<reason>"
+  harness worker-attach W6-A --role work|review --binding <bindingId> [--cwd <path>] [--dry-run]
+  harness worker-bindings W6-A [--json]
+  harness worker-challenge W6-A --binding <bindingId>
+  harness worker-challenge W6-A --probe-hook-payload <fixture.json>
+  harness worker-receipt W6-A --attempt <attemptId> --kind job.completed --sequence 1 [--binding <bindingId>]
 `);
 }
 
@@ -2807,18 +2814,67 @@ function workerRoleForStage(stage) {
   return getReviewStages().includes(stage) ? 'review' : 'work';
 }
 
+function bindingDiagnostics(store) {
+  const now = Date.now();
+  return store.listBindings().map(binding => {
+    const heartbeatAt = binding.heartbeatAt || binding.createdAt;
+    const heartbeatAgeMs = heartbeatAt ? now - Date.parse(heartbeatAt) : null;
+    return {
+      bindingId: binding.bindingId,
+      role: binding.role,
+      bindingGeneration: binding.bindingGeneration,
+      sessionId: binding.sessionId,
+      sessionNonceHash: binding.sessionNonceHash,
+      heartbeatAt,
+      heartbeatAgeMs: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs : null,
+      stale: Number.isFinite(heartbeatAgeMs) ? heartbeatAgeMs > 300_000 : true,
+    };
+  });
+}
+
+function deriveHookCapabilities(evidence) {
+  if (!evidence) {
+    return {
+      completionReceiptCapability: 'unavailable',
+      needsInputCapability: 'unavailable',
+      reason: 'missing-capability-evidence',
+    };
+  }
+  if (evidence.compatible === false || evidence.versionDrift === true) {
+    return {
+      completionReceiptCapability: 'unavailable',
+      needsInputCapability: 'unavailable',
+      reason: evidence.reason || 'capability-evidence-incompatible',
+    };
+  }
+  const fields = new Set(evidence.observedFields || []);
+  const completionRequired = ['kind', 'attemptId', 'jobId', 'leaseToken', 'occurredAt', 'bindingId', 'sessionId'];
+  const missingCompletion = completionRequired.filter(field => !fields.has(field));
+  const needsInputAvailable = fields.has('needsInputCategory') || evidence.needsInputCapability === 'available';
+  return {
+    completionReceiptCapability: missingCompletion.length === 0 ? 'available' : 'unavailable',
+    needsInputCapability: needsInputAvailable ? 'available' : 'unavailable',
+    missingCompletionFields: missingCompletion,
+    source: evidence.source || null,
+    capturedAt: evidence.capturedAt || null,
+  };
+}
+
 async function cmdWorkerDoctor(taskId, opts = {}) {
   const { store, adapter } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
   const status = loadStatus(taskId, { persistMigration: false });
+  const hookCapabilities = deriveHookCapabilities(store.readCapability('claude-hook'));
   const result = {
     schemaVersion: status.schemaVersion,
     executionMode: status.execution.mode,
     capabilities: await adapter.capabilities(),
+    hookCapabilities,
+    bindings: bindingDiagnostics(store),
     activeJobId: status.execution.activeJobId,
     activeAttemptId: status.execution.activeAttemptId,
     pendingOperations: store.listOperations().filter(operation => !['rolled-back', 'workflow-completed'].includes(operation.phase)).length,
     pendingReceipts: store.listReceipts('inbox').length,
-    phase3Capabilities: 'unavailable',
+    phase3Capabilities: hookCapabilities.completionReceiptCapability,
   };
   console.log(JSON.stringify(result, null, 2));
   return result;
@@ -2868,7 +2924,7 @@ async function cmdWorkerRun(taskId, opts = {}) {
   const deadline = Date.now() + runTimeoutMs;
   let pumped = { status: 'dispatch-submitted' };
   const terminal = new Set(['workflow-completed', 'failed', 'cancelled', 'abandoned', 'idle']);
-  const stops = new Set(['check-blocked', 'sequence-gap', 'dispatch-uncertain']);
+  const stops = new Set(['check-blocked', 'sequence-gap', 'dispatch-uncertain', 'needs-input']);
   while (Date.now() < deadline) {
     pumped = await supervisor.pumpOnce();
     if (terminal.has(pumped.status) || stops.has(pumped.status)) break;
@@ -2904,8 +2960,143 @@ function cmdWorkerJobs(taskId, opts = {}) {
     activeJob: status.execution.activeJobId ? store.readJob(status.execution.activeJobId) : null,
     activeAttempt: status.execution.activeAttemptId ? store.readAttempt(status.execution.activeAttemptId) : null,
     operations: store.listOperations(),
+    bindings: bindingDiagnostics(store),
+    hookCapabilities: deriveHookCapabilities(store.readCapability('claude-hook')),
   };
   console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerAttach(taskId, opts = {}) {
+  const role = opts.role;
+  if (!['work', 'review'].includes(role)) throw new Error('--role must be work or review');
+  const bindingId = opts.binding || `wrapper.${role}`;
+  const dryRun = opts['dry-run'] === true || opts['dry-run'] === 'true';
+  const replace = opts.replace === true || opts.replace === 'true';
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const existing = store.readBinding(bindingId);
+  const generation = existing ? existing.bindingGeneration + 1 : 1;
+  const { binding, rawNonce } = createBinding({
+    taskId,
+    bindingId,
+    role,
+    bindingGeneration: generation,
+    metadata: { cwd: opts.cwd || CODE_REPO },
+  });
+  const result = { ...binding, wouldWrite: !dryRun };
+  if (dryRun) {
+    console.log(JSON.stringify({ ...result, wouldWrite: false }, null, 2));
+    return { ...result, wouldWrite: false };
+  }
+  if (existing && !replace) throw new Error('binding-already-exists');
+  const status = loadStatus(taskId, { persistMigration: false });
+  if (status.execution.activeAttemptId) {
+    const activeAttempt = store.readAttempt(status.execution.activeAttemptId);
+    const activeJob = activeAttempt ? store.readJob(activeAttempt.jobId) : null;
+    if (!activeJob || activeJob.role === role || activeAttempt.bindingId === bindingId) {
+      throw new Error('active-attempt-binding-replacement-conflict');
+    }
+  }
+  store.writeBinding({ ...binding, heartbeatAt: binding.createdAt });
+  store.writeBindingSecret(binding.bindingId, rawNonce);
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerBindings(taskId, opts = {}) {
+  const { store } = createWorkerRuntime(taskId, { adapterName: opts.adapter || 'fake' });
+  const result = {
+    bindings: bindingDiagnostics(store),
+    hookCapabilities: deriveHookCapabilities(store.readCapability('claude-hook')),
+  };
+  console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerChallenge(taskId, opts = {}) {
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  if (opts['probe-hook-payload']) {
+    const fixturePath = path.resolve(String(opts['probe-hook-payload']));
+    const payload = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+    const evidence = {
+      source: fixturePath,
+      capturedAt: new Date().toISOString(),
+      observedFields: Object.keys(payload),
+      compatible: payload.versionDrift === true ? false : true,
+      version: payload.version || null,
+      needsInputCapability: payload.needsInputCategory ? 'available' : 'unavailable',
+    };
+    store.writeCapability('claude-hook', evidence);
+    const result = deriveHookCapabilities(evidence);
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  const bindingId = opts.binding;
+  if (!bindingId) throw new Error('--binding required');
+  const binding = store.readBinding(bindingId);
+  if (!binding) throw new Error('binding-not-found');
+  const rawNonce = store.readBindingSecret(bindingId);
+  if (!rawNonce) throw new Error('binding-secret-unavailable');
+  const result = {
+    bindingId,
+    role: binding.role,
+    bindingGeneration: binding.bindingGeneration,
+    sessionId: binding.sessionId,
+    verified: true,
+    verifiedAt: new Date().toISOString(),
+  };
+  store.writeCapability(`binding-challenge-${bindingId}`, result);
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerReceipt(taskId, opts = {}) {
+  const attemptId = opts.attempt;
+  const kind = opts.kind;
+  const sequence = Number(opts.sequence);
+  if (!attemptId) throw new Error('--attempt required');
+  if (!kind) throw new Error('--kind required');
+  if (!Number.isInteger(sequence) || sequence <= 0) throw new Error('--sequence must be a positive integer');
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const attempt = store.readAttempt(attemptId);
+  if (!attempt) throw new Error('attempt-not-found');
+  let binding = null;
+  let rawNonce = null;
+  const bindingId = opts.binding || attempt.bindingIdentity?.bindingId || null;
+  if (bindingId) {
+    binding = store.readBinding(bindingId);
+    if (!binding) throw new Error('binding-not-found');
+    rawNonce = store.readBindingSecret(bindingId);
+    if (!rawNonce) throw new Error('binding-secret-unavailable');
+  }
+  const category = opts.category || opts['needs-input-category'];
+  if (kind === 'job.needs-input') {
+    const allowed = new Set(['permission', 'agent-question', 'authentication', 'external-intervention']);
+    if (!allowed.has(category)) throw new Error('needs-input-invalid-category');
+  }
+  const receipt = createEvent({
+    kind,
+    source: opts.source || (binding ? 'wrapper-hook' : 'fake-adapter'),
+    attempt,
+    sequence,
+    eventId: opts['event-id'],
+    occurredAt: opts['occurred-at'],
+    details: {
+      ...(category ? { category } : {}),
+      ...(opts.reason ? { reason: opts.reason } : {}),
+    },
+    binding,
+    rawNonce,
+  });
+  const published = store.publishReceipt(receipt);
+  const result = {
+    status: published.status,
+    eventId: receipt.eventId,
+    attemptId: receipt.attemptId,
+    receiptPath: store.receiptPath('inbox', receipt.attemptId, receipt.eventId),
+    payloadHash: published.payloadHash,
+  };
+  console.log(JSON.stringify(result, null, 2));
   return result;
 }
 

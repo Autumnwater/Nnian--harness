@@ -10,9 +10,11 @@ import {
   assertStageCursor,
   canAutomaticallyRetryAttempt,
   createAttempt,
+  createBinding,
   createEvent,
   createJob,
   createLease,
+  verifySessionProof,
   createStageCursor,
   markDispatchUncertain,
   migrateExecutionState,
@@ -300,6 +302,35 @@ describe('V3 Phase 1 execution protocol', () => {
       () => createEvent({ kind: 'job.completed', source: 'fake', attempt, sequence: 0 }),
       /sequence must be a positive integer/
     );
+  });
+
+  it('creates challenge-bound worker receipts without persisting raw nonce', () => {
+    const attempt = createAttempt({ jobId: 'job-1', lockEpoch: 0 });
+    const { binding, rawNonce } = createBinding({
+      taskId: 'W9-A',
+      bindingId: 'wrapper.work',
+      role: 'work',
+      bindingGeneration: 1,
+      sessionId: 'session-1',
+      rawNonce: 'raw-secret-nonce',
+    });
+    const event = createEvent({
+      kind: 'job.completed',
+      source: 'wrapper-hook',
+      attempt,
+      sequence: 1,
+      occurredAt: '2026-06-19T00:00:00.000Z',
+      binding,
+      rawNonce,
+    });
+
+    assert.equal(event.bindingId, 'wrapper.work');
+    assert.equal(event.sessionId, 'session-1');
+    assert.equal(event.rawNonce, undefined);
+    assert.equal(event.sessionNonce, undefined);
+    assert.equal(verifySessionProof(rawNonce, event), true);
+    assert.equal(verifySessionProof(rawNonce, { ...event, eventId: 'copied-event' }), false);
+    assert.equal(verifySessionProof(rawNonce, { ...event, sequence: 2 }), false);
   });
 
   it('manual adapter reports manual-required without dispatch side effects', async () => {

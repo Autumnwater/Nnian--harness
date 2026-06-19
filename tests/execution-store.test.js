@@ -119,6 +119,30 @@ describe('V3 Phase 2 execution store', () => {
     assert.deepEqual(store.finalizeReceipt(attempt.attemptId, receipt.eventId, 'processed'), { finalized: false, alreadyFinalized: true });
   });
 
+  it('stores binding identity separately from the raw session nonce', () => {
+    const { root, store } = makeStore();
+    const binding = {
+      bindingId: 'wrapper.work',
+      role: 'work',
+      bindingGeneration: 1,
+      sessionId: 'session-1',
+      sessionNonceHash: 'hash-only',
+    };
+
+    store.writeBinding(binding);
+    const secretPath = store.writeBindingSecret(binding.bindingId, 'raw-secret-nonce');
+
+    assert.deepEqual(store.readBinding(binding.bindingId), binding);
+    assert.equal(store.readBindingSecret(binding.bindingId), 'raw-secret-nonce');
+    assert.equal(store.listBindings().length, 1);
+    assert.equal(fs.readFileSync(path.join(root, 'runs', 'W9-A', 'bindings', 'wrapper.work.json'), 'utf8').includes('raw-secret-nonce'), false);
+    assert.equal((fs.statSync(secretPath).mode & 0o777), 0o600);
+    assert.throws(
+      () => store.writeBinding({ ...binding, rawNonce: 'must-not-persist' }),
+      /raw session nonce/
+    );
+  });
+
   it('replays an operation from its durable phase without overwriting payload identity', () => {
     const { store } = makeStore();
     const operation = {

@@ -2,9 +2,12 @@ import { randomUUID } from 'node:crypto';
 
 import {
   assertAttemptRef,
+  bindingIdentity,
   createAttempt,
   createJob,
   createLease,
+  hashSessionNonce,
+  verifySessionProof,
 } from './execution-protocol.js';
 import { canonicalPayloadHash } from './execution-store.js';
 
@@ -21,6 +24,11 @@ const attemptRef = attempt => ({
   leaseToken: attempt.leaseToken,
 });
 
+const targetBindingIdentity = target => {
+  if (!target?.sessionId && !target?.sessionNonceHash && target?.bindingGeneration === undefined) return null;
+  return bindingIdentity(target);
+};
+
 const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
   if (receipt?.protocolVersion !== 1) throw new Error('receipt-rejected:invalid-protocol-version');
   for (const field of ['eventId', 'jobId', 'attemptId', 'leaseToken', 'kind', 'occurredAt', 'source']) {
@@ -28,7 +36,7 @@ const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
       throw new Error(`receipt-rejected:missing-${field}`);
     }
   }
-  if (!['job.running', 'job.completed', 'job.failed'].includes(receipt.kind)) {
+  if (!['job.running', 'job.completed', 'job.failed', 'job.needs-input'].includes(receipt.kind)) {
     throw new Error('receipt-rejected:invalid-kind');
   }
   if (!Number.isInteger(receipt.sequence) || receipt.sequence <= 0) {
@@ -86,6 +94,7 @@ export class ExecutionSupervisor {
     }
 
     const operationId = randomUUID();
+    const capturedBindingIdentity = targetBindingIdentity(target);
     const jobBase = createJob(jobInput);
     const attemptBase = createAttempt({ jobId: jobBase.jobId, lockEpoch: status.execution.lockEpoch });
     let job = {
@@ -95,11 +104,13 @@ export class ExecutionSupervisor {
       executionState: 'preparing',
       workflowState: 'pending',
       target,
+      bindingIdentity: capturedBindingIdentity,
     };
     let attempt = {
       ...attemptBase,
       operationId,
       bindingId: target.bindingId,
+      bindingIdentity: capturedBindingIdentity,
       state: 'prepared',
       transportState: 'prepared',
       dispatchingPersisted: false,
@@ -112,6 +123,7 @@ export class ExecutionSupervisor {
       ...createLease({ bindingId: target.bindingId, attempt }),
       operationId,
       state: 'pending',
+      bindingIdentity: capturedBindingIdentity,
     };
     const payloads = { job, attempt, lease };
     const payloadHash = canonicalPayloadHash(payloads);
@@ -650,6 +662,7 @@ export class ExecutionSupervisor {
         ...attemptBase,
         operationId,
         bindingId: previousAttempt.bindingId,
+        bindingIdentity: previousAttempt.bindingIdentity || previousJob.bindingIdentity || null,
         state: 'prepared',
         transportState: 'prepared',
         dispatchingPersisted: false,
@@ -667,7 +680,12 @@ export class ExecutionSupervisor {
         executionState: 'prepared',
         workflowState: 'pending',
       };
-      const lease = { ...createLease({ bindingId: attempt.bindingId, attempt }), operationId, state: 'pending' };
+      const lease = {
+        ...createLease({ bindingId: attempt.bindingId, attempt }),
+        operationId,
+        state: 'pending',
+        bindingIdentity: attempt.bindingIdentity || null,
+      };
       const payloads = { job, attempt, lease };
       const operation = {
         operationId,
@@ -765,6 +783,10 @@ export class ExecutionSupervisor {
         }
       );
     }
+    if (job.workflowState === 'needs-input-awaiting-operator' ||
+        currentAttempt.workflowState === 'needs-input-awaiting-operator') {
+      return { status: 'needs-input', attemptId: currentAttempt.attemptId };
+    }
     if (job.workflowState === 'worker-completed-awaiting-check' || job.workflowState === 'check-blocked') {
       return this.evaluateAndCommitWorkflow(job, currentAttempt);
     }
@@ -804,6 +826,33 @@ export class ExecutionSupervisor {
     return { status: 'receipt-rejected', reason };
   }
 
+  validateReceiptBinding(receipt, attempt, job, lease) {
+    const expected = attempt.bindingIdentity || job.bindingIdentity || lease.bindingIdentity || null;
+    if (!expected) return;
+    if (Object.prototype.hasOwnProperty.call(receipt, 'rawNonce') ||
+        Object.prototype.hasOwnProperty.call(receipt, 'sessionNonce')) {
+      throw new Error('receipt-rejected:raw-nonce-forbidden');
+    }
+    for (const field of ['bindingId', 'role', 'bindingGeneration', 'sessionId', 'sessionNonceHash', 'proof']) {
+      if (receipt[field] === undefined || receipt[field] === null || receipt[field] === '') {
+        throw new Error(`receipt-rejected:missing-${field}`);
+      }
+    }
+    for (const field of ['bindingId', 'role', 'bindingGeneration', 'sessionId', 'sessionNonceHash']) {
+      if (receipt[field] !== expected[field]) {
+        throw new Error(`receipt-rejected:binding-${field}-mismatch`);
+      }
+    }
+    const rawNonce = this.store.readBindingSecret(expected.bindingId);
+    if (!rawNonce) throw new Error('receipt-rejected:binding-secret-unavailable');
+    if (hashSessionNonce(rawNonce) !== expected.sessionNonceHash) {
+      throw new Error('receipt-rejected:binding-secret-mismatch');
+    }
+    if (!verifySessionProof(rawNonce, receipt)) {
+      throw new Error('receipt-rejected:session-proof-invalid');
+    }
+  }
+
   async applyReceipt(receiptInput) {
     const receipt = validateReceipt(receiptInput, Date.parse(this.clock()), this.maxClockSkewMs);
     const payloadHash = canonicalPayloadHash(receipt);
@@ -833,6 +882,7 @@ export class ExecutionSupervisor {
     if (attempt.lockEpoch !== status.execution.lockEpoch || lease.lockEpoch !== status.execution.lockEpoch) {
       throw new Error('receipt-rejected:fenced-lock-epoch');
     }
+    this.validateReceiptBinding(receipt, attempt, this.store.readJob(receipt.jobId), lease);
     const operation = this.store.readOperation(attempt.operationId);
     if (!operation || operation.attemptRef?.attemptId !== attempt.attemptId ||
         operation.attemptRef?.leaseToken !== attempt.leaseToken) {
@@ -873,6 +923,10 @@ export class ExecutionSupervisor {
       } else if (receipt.kind === 'job.failed') {
         nextAttempt.executionState = 'failed';
         nextAttempt.failureEvidence = completionEvidence;
+      } else if (receipt.kind === 'job.needs-input') {
+        nextAttempt.executionState = 'needs-input';
+        nextAttempt.workflowState = 'needs-input-awaiting-operator';
+        nextAttempt.needsInputEvidence = completionEvidence;
       } else {
         nextAttempt.executionState = 'running';
       }
@@ -890,6 +944,10 @@ export class ExecutionSupervisor {
       } else if (receipt.kind === 'job.failed') {
         nextJob.executionState = 'failed';
         nextJob.failureEvidence = completionEvidence;
+      } else if (receipt.kind === 'job.needs-input') {
+        nextJob.executionState = 'needs-input';
+        nextJob.workflowState = 'needs-input-awaiting-operator';
+        nextJob.needsInputEvidence = completionEvidence;
       } else {
         nextJob.executionState = 'running';
       }

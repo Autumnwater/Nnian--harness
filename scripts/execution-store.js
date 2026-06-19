@@ -91,6 +91,9 @@ export class ExecutionStore {
       eventIndex: path.join(runRoot, 'events', 'index'),
       leases: path.join(runRoot, 'leases'),
       transports: path.join(runRoot, 'transports'),
+      bindings: path.join(runRoot, 'bindings'),
+      bindingSecrets: path.join(runRoot, 'bindings', '.secrets'),
+      capabilities: path.join(runRoot, 'capabilities'),
       applications: path.join(runRoot, 'receipt-applications'),
       receipts: path.join(runRoot, 'receipts'),
     };
@@ -175,6 +178,68 @@ export class ExecutionStore {
 
   readTransport(bindingId) {
     return this.readRecord('transports', bindingId);
+  }
+
+  writeBinding(binding) {
+    if (!binding?.bindingId) throw new Error('bindingId is required');
+    if (Object.prototype.hasOwnProperty.call(binding, 'rawNonce') ||
+        Object.prototype.hasOwnProperty.call(binding, 'sessionNonce')) {
+      throw new Error('raw session nonce must not be written to binding records');
+    }
+    return this.writeRecord('bindings', binding.bindingId, binding);
+  }
+
+  readBinding(bindingId) {
+    return this.readRecord('bindings', bindingId);
+  }
+
+  listBindings() {
+    return listJsonFiles(this.paths.bindings)
+      .filter(filePath => !filePath.includes(`${path.sep}.secrets${path.sep}`))
+      .map(readJson);
+  }
+
+  writeBindingSecret(bindingId, rawNonce) {
+    if (!bindingId || typeof rawNonce !== 'string' || rawNonce.length === 0) {
+      throw new Error('bindingId and rawNonce are required');
+    }
+    ensureDir(this.paths.bindingSecrets);
+    const filePath = path.join(this.paths.bindingSecrets, `${bindingId}.nonce`);
+    const tempPath = path.join(this.paths.bindingSecrets, `.${bindingId}.${process.pid}.${randomUUID()}.tmp`);
+    let fd;
+    try {
+      fd = fs.openSync(tempPath, 'wx', 0o600);
+      fs.writeFileSync(fd, rawNonce, 'utf8');
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(tempPath, filePath);
+      fs.chmodSync(filePath, 0o600);
+      fsyncDirectory(this.paths.bindingSecrets);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      try {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      } catch {
+        // Temporary secret files are not authoritative.
+      }
+    }
+    return filePath;
+  }
+
+  readBindingSecret(bindingId) {
+    const filePath = path.join(this.paths.bindingSecrets, `${bindingId}.nonce`);
+    if (!fs.existsSync(filePath)) return null;
+    return fs.readFileSync(filePath, 'utf8');
+  }
+
+  writeCapability(name, record) {
+    if (!name) throw new Error('capability name is required');
+    return this.writeRecord('capabilities', name, { ...record, name });
+  }
+
+  readCapability(name) {
+    return this.readRecord('capabilities', name);
   }
 
   receiptPath(bucket, attemptId, eventId) {
