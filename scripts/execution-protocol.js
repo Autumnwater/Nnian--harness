@@ -204,15 +204,16 @@ export const createLease = ({ bindingId, attempt, ttlMs = 60_000, createdAt }) =
   };
 };
 
-export const createEvent = ({ kind, source, attempt, eventId, timestamp, occurredAt, details = {} }) => ({
-  workerProtocolVersion: WORKER_PROTOCOL_VERSION,
+export const createEvent = ({ kind, source, attempt, eventId, sequence, occurredAt, details = {} }) => ({
+  protocolVersion: WORKER_PROTOCOL_VERSION,
   eventId: eventId || randomUUID(),
   jobId: requiredString(attempt?.jobId, 'attempt.jobId'),
   attemptId: requiredString(attempt?.attemptId, 'attempt.attemptId'),
   leaseToken: requiredString(attempt?.leaseToken, 'attempt.leaseToken'),
   kind: requiredString(kind, 'kind'),
   source: requiredString(source, 'source'),
-  timestamp: timestamp || occurredAt || isoNow(),
+  sequence: positiveInteger(sequence, 'sequence'),
+  occurredAt: occurredAt || isoNow(),
   details,
 });
 
@@ -248,10 +249,20 @@ export class ManualWorkerAdapter {
 }
 
 export class FakeWorkerAdapter {
-  constructor({ targets = [], dispatchController = null } = {}) {
+  constructor({ targets = [], dispatchController = null, transportStore = null } = {}) {
     this.targets = targets.map(target => ({ ...target }));
     this.activeAttempts = new Map();
     this.dispatchController = dispatchController;
+    this.transportStore = transportStore;
+  }
+
+  readActive(bindingId) {
+    return this.activeAttempts.get(bindingId) || this.transportStore?.readTransport(bindingId) || null;
+  }
+
+  writeActive(bindingId, record) {
+    this.activeAttempts.set(bindingId, { ...record });
+    this.transportStore?.writeTransport(bindingId, record);
   }
 
   async capabilities() {
@@ -273,8 +284,8 @@ export class FakeWorkerAdapter {
     requiredString(attempt?.attemptId, 'job.attempt.attemptId');
     requiredString(attempt?.leaseToken, 'job.attempt.leaseToken');
 
-    const existing = this.activeAttempts.get(target.bindingId);
-    if (existing) {
+    const existing = this.readActive(target.bindingId);
+    if (existing && existing.transportState !== 'quiesced') {
       const sameAttempt = existing.attemptId === attempt.attemptId &&
         existing.leaseToken === attempt.leaseToken;
       return {
@@ -284,36 +295,55 @@ export class FakeWorkerAdapter {
       };
     }
 
-    this.activeAttempts.set(target.bindingId, { ...attempt, operationId: options.operationId || null });
+    const inFlight = { ...attempt, operationId: options.operationId || null, transportState: 'transport-in-flight' };
+    this.writeActive(target.bindingId, inFlight);
     if (this.dispatchController?.dispatch) {
-      return this.dispatchController.dispatch(job, target, options);
+      let result;
+      try {
+        result = await this.dispatchController.dispatch(job, target, options);
+      } catch (error) {
+        if (error?.safeBeforeSideEffect === true) {
+          this.writeActive(target.bindingId, { ...inFlight, transportState: 'quiesced', outcome: 'failed-before-side-effect' });
+        }
+        throw error;
+      }
+      if (result?.status === 'dispatch-submitted' || result?.submitted === true) {
+        this.writeActive(target.bindingId, { ...inFlight, transportState: 'submitted' });
+      } else if (result?.safeBeforeSideEffect === true || result?.outcome === 'failed-before-side-effect') {
+        this.writeActive(target.bindingId, { ...inFlight, transportState: 'quiesced', outcome: 'failed-before-side-effect' });
+      }
+      return result;
     }
+    this.writeActive(target.bindingId, { ...inFlight, transportState: 'submitted' });
     return { status: 'dispatch-submitted', submitted: true, attemptId: attempt.attemptId };
   }
 
   async cancel(attempt, target) {
-    const active = this.activeAttempts.get(target.bindingId);
+    const active = this.readActive(target.bindingId);
     if (!active || active.jobId !== attempt.jobId || active.attemptId !== attempt.attemptId ||
         active.leaseToken !== attempt.leaseToken) {
       return { status: 'stale-attempt', interrupted: false };
     }
-    this.activeAttempts.delete(target.bindingId);
+    this.writeActive(target.bindingId, { ...active, transportState: 'quiesced', outcome: 'aborted-before-side-effect' });
     return { status: 'cancelled', interrupted: true, attemptId: attempt.attemptId };
   }
 
   getActiveAttempt(bindingId) {
-    const attempt = this.activeAttempts.get(bindingId);
-    return attempt ? { ...attempt } : null;
+    const attempt = this.readActive(bindingId);
+    return attempt && attempt.transportState !== 'quiesced' ? { ...attempt } : null;
   }
 
   async settleDispatch(attempt, target, options = {}) {
     if (this.dispatchController?.settle) {
       return this.dispatchController.settle(attempt, target, options);
     }
-    const active = this.activeAttempts.get(target.bindingId);
-    if (!active || active.attemptId !== attempt.attemptId || active.leaseToken !== attempt.leaseToken) {
-      return { settled: true, outcome: 'aborted-before-side-effect' };
+    const active = this.readActive(target.bindingId);
+    if (!active) return { settled: false, outcome: 'unknown' };
+    if (active.attemptId !== attempt.attemptId || active.leaseToken !== attempt.leaseToken) {
+      return { settled: false, outcome: 'fenced-transport-record' };
     }
-    return { settled: true, outcome: 'submitted' };
+    if (active.transportState === 'quiesced') return { settled: true, outcome: active.outcome };
+    if (active.transportState === 'submitted') return { settled: true, outcome: 'submitted' };
+    return { settled: false, outcome: 'unknown' };
   }
 }

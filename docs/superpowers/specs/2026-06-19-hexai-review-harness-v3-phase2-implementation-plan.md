@@ -1,7 +1,7 @@
 # HEXAI Review Harness V3 Phase 2 Supervisor 实施计划
 
-日期：2026-06-19  
-状态：Fix 后待 Review  
+日期：2026-06-19
+状态：Fix 后待 Review
 前置版本：V3 Phase 1，commit `3e212c2`
 
 ## 1. 目标与边界

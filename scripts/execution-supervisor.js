@@ -21,34 +21,46 @@ const attemptRef = attempt => ({
   leaseToken: attempt.leaseToken,
 });
 
-const validateReceipt = receipt => {
-  if (receipt?.protocolVersion !== 1) throw new Error('receipt-invalid: protocolVersion');
+const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
+  if (receipt?.protocolVersion !== 1) throw new Error('receipt-rejected:invalid-protocol-version');
   for (const field of ['eventId', 'jobId', 'attemptId', 'leaseToken', 'kind', 'occurredAt', 'source']) {
-    required(receipt?.[field], `receipt.${field}`);
+    if (typeof receipt?.[field] !== 'string' || receipt[field].length === 0) {
+      throw new Error(`receipt-rejected:missing-${field}`);
+    }
   }
   if (!['job.running', 'job.completed', 'job.failed'].includes(receipt.kind)) {
-    throw new Error('receipt-invalid: kind');
+    throw new Error('receipt-rejected:invalid-kind');
   }
   if (!Number.isInteger(receipt.sequence) || receipt.sequence <= 0) {
-    throw new Error('receipt-invalid: sequence');
+    throw new Error('receipt-rejected:invalid-sequence');
   }
-  if (!Number.isFinite(Date.parse(receipt.occurredAt))) throw new Error('receipt-invalid: occurredAt');
+  const occurredAtMs = Date.parse(receipt.occurredAt);
+  if (!Number.isFinite(occurredAtMs)) throw new Error('receipt-rejected:invalid-occurred-at');
+  if (occurredAtMs > nowMs + maxClockSkewMs) throw new Error('receipt-rejected:occurred-at-in-future');
   return receipt;
 };
 
 export class ExecutionSupervisor {
-  constructor({ taskId, store, statusStore, adapter, workflow, clock = isoNow }) {
+  constructor({ taskId, store, statusStore, adapter, workflow, clock = isoNow, faultInjector = null, maxClockSkewMs = 60_000, transaction = callback => callback() }) {
     this.taskId = required(taskId, 'taskId');
     this.store = store;
     this.statusStore = statusStore;
     this.adapter = adapter;
     this.workflow = workflow;
     this.clock = clock;
+    this.faultInjector = faultInjector;
+    this.maxClockSkewMs = maxClockSkewMs;
+    this.transaction = transaction;
+  }
+
+  inject(point, details = {}) {
+    this.faultInjector?.(point, details);
   }
 
   async resolveTarget(jobInput) {
     const capabilities = await this.adapter.capabilities();
     if (!capabilities.dispatch || !capabilities.abortableDispatch || !capabilities.settleBarrier) {
+      if (capabilities.mode === 'manual') throw new Error('manual-required');
       throw new Error('adapter-capability-unavailable: abortableDispatch + settleBarrier required');
     }
     const targets = await this.adapter.discoverTargets();
@@ -63,7 +75,9 @@ export class ExecutionSupervisor {
 
   async prepare(jobInput) {
     const target = await this.resolveTarget(jobInput);
-    const status = this.statusStore.load();
+    return this.transaction(() => {
+      this.recoverOperations();
+      const status = this.statusStore.load();
     if (status.execution?.activeJobId || status.execution?.activeAttemptId) {
       throw new Error('active-job-conflict');
     }
@@ -71,23 +85,9 @@ export class ExecutionSupervisor {
       throw new Error('stage-cas-conflict: stageRevision');
     }
 
+    const operationId = randomUUID();
     const jobBase = createJob(jobInput);
     const attemptBase = createAttempt({ jobId: jobBase.jobId, lockEpoch: status.execution.lockEpoch });
-    const operationId = randomUUID();
-    const payloadHash = canonicalPayloadHash({ job: jobBase, attempt: attemptBase, target });
-    let operation = {
-      operationId,
-      kind: 'dispatch-prepare',
-      phase: 'intent',
-      payloadHash,
-      expectedStateRevision: status.stateRevision,
-      expectedStageRevision: status.stageRevision,
-      attemptRef: attemptRef(attemptBase),
-      bindingId: target.bindingId,
-      createdAt: this.clock(),
-    };
-    this.store.writeOperation(operation);
-
     let job = {
       ...jobBase,
       operationId,
@@ -108,16 +108,36 @@ export class ExecutionSupervisor {
       lastSequence: 0,
       appliedEventIds: [],
     };
-    this.store.writeJob(job);
-    this.store.writeAttempt(attempt);
     const lease = {
       ...createLease({ bindingId: target.bindingId, attempt }),
       operationId,
       state: 'pending',
     };
+    const payloads = { job, attempt, lease };
+    const payloadHash = canonicalPayloadHash(payloads);
+    let operation = {
+      operationId,
+      kind: 'dispatch-prepare',
+      phase: 'intent',
+      payloadHash,
+      expectedStateRevision: status.stateRevision,
+      expectedStageRevision: status.stageRevision,
+      attemptRef: attemptRef(attemptBase),
+      bindingId: target.bindingId,
+      payloads,
+      createdAt: this.clock(),
+    };
+    this.store.writeOperation(operation);
+    this.inject('after-operation-intent', { operationId });
+    this.store.writeJob(job);
+    this.inject('after-job-write', { operationId });
+    this.store.writeAttempt(attempt);
+    this.inject('after-attempt-write', { operationId });
     this.store.writeLease(lease);
+    this.inject('after-lease-write', { operationId });
 
     const nextStatus = structuredClone(status);
+    nextStatus.execution.mode = 'worker';
     nextStatus.execution.activeJobId = job.jobId;
     nextStatus.execution.activeAttemptId = attempt.attemptId;
     nextStatus.execution.activeLeaseToken = attempt.leaseToken;
@@ -128,6 +148,7 @@ export class ExecutionSupervisor {
       details: { operationId, ...attemptRef(attempt) },
     });
     this.statusStore.saveCas(status.stateRevision, nextStatus);
+    this.inject('after-status-commit', { operationId });
 
     operation = { ...operation, phase: 'committed', committedAt: this.clock() };
     job = { ...job, executionState: 'prepared' };
@@ -136,36 +157,145 @@ export class ExecutionSupervisor {
     this.store.writeJob(job);
     this.store.writeAttempt(attempt);
     this.store.writeLease({ ...lease, state: 'active' });
-    return { operationId, job, attempt, target };
+      return { operationId, job, attempt, target };
+    });
+  }
+
+  recoverOperations() {
+    const status = this.statusStore.load();
+    let rolledBack = 0;
+    let rolledForward = 0;
+    for (const operation of this.store.listOperations()) {
+      if (operation.phase === 'terminal-committing') {
+        const commit = operation.terminalCommit;
+        const marker = (status.history || []).find(entry =>
+          entry.action === commit?.action &&
+          entry.details?.operationId === operation.operationId &&
+          entry.details?.attemptId === operation.attemptRef.attemptId
+        );
+        if (!marker) continue;
+        if (status.execution.activeJobId || status.execution.activeAttemptId || status.execution.activeLeaseToken) {
+          throw new Error(`execution-corrupt: terminal commit ${operation.operationId} retained active refs`);
+        }
+        this.store.writeJob(commit.job);
+        this.store.writeAttempt(commit.attempt);
+        this.store.releaseLease(operation.bindingId, { operationId: operation.operationId, ...operation.attemptRef });
+        this.store.writeOperation({ ...operation, phase: commit.jobState, recoveredAt: this.clock() });
+        rolledForward += 1;
+        continue;
+      }
+      if (operation.phase === 'workflow-committing') {
+        const marker = (status.history || []).find(entry =>
+          entry.action === 'worker-workflow-committed' &&
+          entry.details?.operationId === operation.operationId &&
+          entry.details?.completionEventId === operation.workflowCommit?.completionEventId
+        );
+        if (!marker) continue;
+        const commit = operation.workflowCommit;
+        if (status.execution.activeJobId || status.execution.activeAttemptId || status.execution.activeLeaseToken) {
+          throw new Error(`execution-corrupt: workflow commit ${operation.operationId} retained active refs`);
+        }
+        this.store.writeJob(commit.job);
+        this.store.writeAttempt(commit.attempt);
+        this.store.releaseLease(operation.bindingId, { operationId: operation.operationId, ...operation.attemptRef });
+        this.store.writeOperation({ ...operation, phase: 'workflow-completed', recoveredAt: this.clock() });
+        rolledForward += 1;
+        continue;
+      }
+      if (!['dispatch-prepare', 'dispatch-retry'].includes(operation.kind) ||
+          !['intent', 'committed'].includes(operation.phase)) continue;
+      if (!operation.payloads || canonicalPayloadHash(operation.payloads) !== operation.payloadHash) {
+        throw new Error(`operation-payload-conflict: ${operation.operationId}`);
+      }
+      const marker = (status.history || []).find(entry =>
+        ['worker-dispatch-committed', 'worker-retry-committed'].includes(entry.action) &&
+        entry.details?.operationId === operation.operationId
+      );
+      const refsMatch = marker &&
+        status.execution.activeJobId === operation.attemptRef.jobId &&
+        status.execution.activeAttemptId === operation.attemptRef.attemptId &&
+        status.execution.activeLeaseToken === operation.attemptRef.leaseToken;
+      if (refsMatch) {
+        const { job, attempt, lease } = operation.payloads;
+        this.store.writeJob({ ...job, executionState: 'prepared' });
+        this.store.writeAttempt({ ...attempt, state: 'prepared' });
+        this.store.writeLease({ ...lease, state: 'active' });
+        this.store.writeOperation({ ...operation, phase: 'committed', recoveredAt: this.clock() });
+        rolledForward += 1;
+        continue;
+      }
+      if (marker || operation.phase === 'committed') {
+        throw new Error(`execution-corrupt: committed operation ${operation.operationId} does not match status refs`);
+      }
+      const existingJob = this.store.readJob(operation.attemptRef.jobId);
+      if (existingJob?.operationId === operation.operationId) {
+        if (operation.kind === 'dispatch-retry' && operation.previousJob) {
+          this.store.writeJob(operation.previousJob);
+        } else {
+          this.store.writeJob({ ...existingJob, executionState: 'rolled-back' });
+        }
+      }
+      const existingAttempt = this.store.readAttempt(operation.attemptRef.attemptId);
+      if (existingAttempt?.operationId === operation.operationId) {
+        this.store.writeAttempt({ ...existingAttempt, state: 'rolled-back' });
+      }
+      this.store.releaseLease(operation.bindingId, { operationId: operation.operationId, ...operation.attemptRef });
+      this.store.writeOperation({ ...operation, phase: 'rolled-back', rolledBackAt: this.clock() });
+      rolledBack += 1;
+    }
+    return { rolledBack, rolledForward };
   }
 
   async dispatch(operationId, { timeoutMs = 30_000 } = {}) {
     if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be a positive integer');
-    const operation = this.store.readOperation(operationId);
-    if (!operation || operation.phase !== 'committed') throw new Error('dispatch-operation-not-ready');
-    const attempt = this.store.readAttempt(operation.attemptRef.attemptId);
-    const job = this.store.readJob(operation.attemptRef.jobId);
-    assertAttemptRef(operation.attemptRef, attemptRef(attempt));
-    const lease = this.store.readLease(operation.bindingId);
-    assertAttemptRef(operation.attemptRef, lease);
-    const target = job.target;
-
-    const dispatching = {
-      ...attempt,
-      state: 'dispatching',
-      transportState: 'transport-in-flight',
-      dispatchingPersisted: true,
-      dispatchingAt: this.clock(),
-    };
-    this.store.writeAttempt(dispatching);
-    this.store.writeOperation({ ...operation, phase: 'dispatching', dispatchingAt: this.clock() });
+    const claim = await this.transaction(() => {
+      const operation = this.store.readOperation(operationId);
+      if (!operation) throw new Error('dispatch-operation-not-ready');
+      if (operation.phase !== 'committed') {
+        if (['dispatching', 'dispatch-submitted', 'dispatch-uncertain'].includes(operation.phase)) {
+          return { claimed: false, status: operation.phase === 'dispatching' ? 'already-dispatching' : operation.phase };
+        }
+        throw new Error('dispatch-operation-not-ready');
+      }
+      const attempt = this.store.readAttempt(operation.attemptRef.attemptId);
+      const job = this.store.readJob(operation.attemptRef.jobId);
+      assertAttemptRef(operation.attemptRef, attemptRef(attempt));
+      const lease = this.store.readLease(operation.bindingId);
+      assertAttemptRef(operation.attemptRef, lease);
+      const status = this.statusStore.load();
+      assertAttemptRef(operation.attemptRef, {
+        jobId: status.execution.activeJobId,
+        attemptId: status.execution.activeAttemptId,
+        leaseToken: status.execution.activeLeaseToken,
+      });
+      if (lease.lockEpoch !== status.execution.lockEpoch || attempt.lockEpoch !== status.execution.lockEpoch) {
+        throw new Error('attempt-fence-conflict: lockEpoch');
+      }
+      const dispatching = {
+        ...attempt,
+        state: 'dispatching',
+        transportState: 'transport-in-flight',
+        dispatchingPersisted: true,
+        dispatchingAt: this.clock(),
+      };
+      this.store.writeAttempt(dispatching);
+      this.store.writeOperation({ ...operation, phase: 'dispatching', dispatchingAt: this.clock() });
+      return { claimed: true, operation, attempt, job, target: job.target, dispatching };
+    });
+    if (!claim.claimed) return { status: claim.status };
+    const { operation, attempt, job, target, dispatching } = claim;
 
     const controller = new AbortController();
-    const dispatchPromise = Promise.resolve(this.adapter.dispatch(
-      { ...job, attempt: attemptRef(dispatching) },
-      target,
-      { operationId, signal: controller.signal }
-    ));
+    let dispatchPromise;
+    try {
+      dispatchPromise = Promise.resolve(this.adapter.dispatch(
+        { ...job, attempt: attemptRef(dispatching) },
+        target,
+        { operationId, signal: controller.signal }
+      ));
+    } catch (error) {
+      dispatchPromise = Promise.reject(error);
+    }
     let timer;
     const timeoutMarker = Symbol('dispatch-timeout');
     const timeoutPromise = new Promise(resolve => {
@@ -175,25 +305,33 @@ export class ExecutionSupervisor {
     try {
       result = await Promise.race([dispatchPromise, timeoutPromise]);
     } catch (error) {
-      result = { status: 'dispatch-error', error: error.message, ambiguous: true };
+      result = {
+        status: 'dispatch-error',
+        error: error.message,
+        safeBeforeSideEffect: error?.safeBeforeSideEffect === true,
+        ambiguous: error?.safeBeforeSideEffect !== true,
+      };
     } finally {
       clearTimeout(timer);
     }
 
     if (result === timeoutMarker) {
       controller.abort(new Error('dispatch-timeout'));
-      const uncertain = {
-        ...this.store.readAttempt(attempt.attemptId),
-        state: 'dispatch-uncertain',
-        transportState: 'transport-in-flight',
-        abortRequested: true,
-        dispatchUncertainReason: 'dispatch-timeout-before-settle',
-      };
-      this.store.writeAttempt(uncertain);
-      this.store.writeOperation({
-        ...this.store.readOperation(operationId),
-        phase: 'dispatch-uncertain',
-        transportState: 'transport-in-flight',
+      await this.transaction(() => {
+        const currentOperation = this.assertCurrentTransport(operationId, attemptRef(attempt), ['dispatching']);
+        const uncertain = {
+          ...this.store.readAttempt(attempt.attemptId),
+          state: 'dispatch-uncertain',
+          transportState: 'transport-in-flight',
+          abortRequested: true,
+          dispatchUncertainReason: 'dispatch-timeout-before-settle',
+        };
+        this.store.writeAttempt(uncertain);
+        this.store.writeOperation({
+          ...currentOperation,
+          phase: 'dispatch-uncertain',
+          transportState: 'transport-in-flight',
+        });
       });
       dispatchPromise.then(
         lateResult => this.recordLateTransportResult(operationId, attemptRef(attempt), lateResult),
@@ -202,35 +340,91 @@ export class ExecutionSupervisor {
       return { status: 'dispatch-uncertain', attemptId: attempt.attemptId };
     }
 
-    if (result?.status === 'dispatch-submitted' || result?.submitted === true) {
-      this.store.writeAttempt({
-        ...this.store.readAttempt(attempt.attemptId),
-        state: 'dispatch-submitted',
-        transportState: 'submitted',
-        dispatchSubmittedAt: this.clock(),
+    if (result?.safeBeforeSideEffect === true || result?.outcome === 'failed-before-side-effect') {
+      return this.transaction(() => {
+        const currentOperation = this.assertCurrentTransport(operationId, attemptRef(attempt), ['dispatching']);
+        const currentAttempt = this.store.readAttempt(attempt.attemptId);
+        return this.commitTerminalAttempt(
+          {
+            status: this.statusStore.load(),
+            attempt: {
+              ...currentAttempt,
+              dispatchingPersisted: false,
+              transportState: 'quiesced',
+              transportOutcome: 'failed-before-side-effect',
+            },
+            job: this.store.readJob(attempt.jobId),
+            operation: currentOperation,
+          },
+          {
+            attemptState: 'failed-before-dispatch',
+            jobState: 'failed-before-dispatch',
+            action: 'worker-dispatch-failed-before-side-effect',
+            reason: result.error || result.status || 'failed-before-side-effect',
+          }
+        );
       });
-      this.store.writeOperation({ ...this.store.readOperation(operationId), phase: 'dispatch-submitted' });
+    }
+
+    if (result?.status === 'dispatch-submitted' || result?.submitted === true) {
+      await this.transaction(() => {
+        const currentOperation = this.assertCurrentTransport(operationId, attemptRef(attempt), ['dispatching']);
+        this.store.writeAttempt({
+          ...this.store.readAttempt(attempt.attemptId),
+          state: 'dispatch-submitted',
+          transportState: 'submitted',
+          dispatchSubmittedAt: this.clock(),
+        });
+        this.store.writeOperation({ ...currentOperation, phase: 'dispatch-submitted' });
+      });
       return { ...result, status: 'dispatch-submitted' };
     }
 
-    this.store.writeAttempt({
-      ...this.store.readAttempt(attempt.attemptId),
-      state: 'dispatch-uncertain',
-      transportState: 'ambiguous-settled',
-      dispatchUncertainReason: result?.error || result?.status || 'ambiguous-result',
+    await this.transaction(() => {
+      const currentOperation = this.assertCurrentTransport(operationId, attemptRef(attempt), ['dispatching']);
+      this.store.writeAttempt({
+        ...this.store.readAttempt(attempt.attemptId),
+        state: 'dispatch-uncertain',
+        transportState: 'ambiguous-settled',
+        dispatchUncertainReason: result?.error || result?.status || 'ambiguous-result',
+      });
+      this.store.writeOperation({ ...currentOperation, phase: 'dispatch-uncertain', transportState: 'ambiguous-settled' });
     });
     return { status: 'dispatch-uncertain', attemptId: attempt.attemptId };
   }
 
-  recordLateTransportResult(operationId, expectedAttempt, result) {
+  assertCurrentTransport(operationId, expectedAttempt, allowedPhases) {
     const operation = this.store.readOperation(operationId);
-    if (!operation) return { applied: false, reason: 'missing-operation' };
+    if (!operation || !allowedPhases.includes(operation.phase)) throw new Error('stale-transport-result');
+    assertAttemptRef(expectedAttempt, operation.attemptRef);
+    const attempt = this.store.readAttempt(expectedAttempt.attemptId);
+    const lease = this.store.readLease(operation.bindingId);
+    const status = this.statusStore.load();
+    assertAttemptRef(expectedAttempt, attemptRef(attempt));
+    assertAttemptRef(expectedAttempt, lease);
+    assertAttemptRef(expectedAttempt, {
+      jobId: status.execution.activeJobId,
+      attemptId: status.execution.activeAttemptId,
+      leaseToken: status.execution.activeLeaseToken,
+    });
+    if (attempt.lockEpoch !== status.execution.lockEpoch || lease.lockEpoch !== status.execution.lockEpoch) {
+      throw new Error('attempt-fence-conflict: lockEpoch');
+    }
+    return operation;
+  }
+
+  async recordLateTransportResult(operationId, expectedAttempt, result) {
     try {
-      assertAttemptRef(expectedAttempt, operation.attemptRef);
-      const attempt = this.store.readAttempt(expectedAttempt.attemptId);
-      assertAttemptRef(expectedAttempt, attemptRef(attempt));
-      this.store.writeAttempt({ ...attempt, lateTransportResult: result, lateTransportAt: this.clock() });
-      this.store.writeOperation({ ...operation, lateTransportResult: result, lateTransportAt: this.clock() });
+      await this.transaction(() => {
+        const operation = this.assertCurrentTransport(
+          operationId,
+          expectedAttempt,
+          ['dispatching', 'dispatch-uncertain', 'dispatch-submitted']
+        );
+        const attempt = this.store.readAttempt(expectedAttempt.attemptId);
+        this.store.writeAttempt({ ...attempt, lateTransportResult: result, lateTransportAt: this.clock() });
+        this.store.writeOperation({ ...operation, lateTransportResult: result, lateTransportAt: this.clock() });
+      });
       return { applied: true };
     } catch {
       return { applied: false, reason: 'stale-attempt' };
@@ -243,13 +437,25 @@ export class ExecutionSupervisor {
     const job = this.store.readJob(attempt.jobId);
     const result = await this.adapter.settleDispatch(attemptRef(attempt), job.target, { operationId: attempt.operationId });
     if (!result?.settled) return { status: 'transport-in-flight' };
-    const current = this.store.readAttempt(attemptId);
-    assertAttemptRef(attemptRef(attempt), attemptRef(current));
-    this.store.writeAttempt({
-      ...current,
-      transportState: result.outcome === 'submitted' ? 'submitted' : 'quiesced',
-      transportOutcome: result.outcome,
-      settledAt: this.clock(),
+    await this.transaction(() => {
+      const operation = this.assertCurrentTransport(
+        attempt.operationId,
+        attemptRef(attempt),
+        ['dispatching', 'dispatch-uncertain', 'dispatch-submitted']
+      );
+      const current = this.store.readAttempt(attemptId);
+      this.store.writeAttempt({
+        ...current,
+        transportState: result.outcome === 'submitted' ? 'submitted' : 'quiesced',
+        transportOutcome: result.outcome,
+        settledAt: this.clock(),
+      });
+      this.store.writeOperation({
+        ...operation,
+        transportState: result.outcome === 'submitted' ? 'submitted' : 'quiesced',
+        transportOutcome: result.outcome,
+        settledAt: this.clock(),
+      });
     });
     return { status: 'transport-settled', outcome: result.outcome };
   }
@@ -274,86 +480,429 @@ export class ExecutionSupervisor {
     return { status: 'reconciled-not-sent', attemptId };
   }
 
+  assertActiveAttempt(expected) {
+    const status = this.statusStore.load();
+    const attempt = this.store.readAttempt(expected.attemptId);
+    if (!attempt) throw new Error('attempt-not-found');
+    assertAttemptRef(expected, attemptRef(attempt));
+    assertAttemptRef(expected, {
+      jobId: status.execution.activeJobId,
+      attemptId: status.execution.activeAttemptId,
+      leaseToken: status.execution.activeLeaseToken,
+    });
+    const job = this.store.readJob(expected.jobId);
+    const operation = this.store.readOperation(attempt.operationId);
+    const lease = this.store.readLease(attempt.bindingId);
+    assertAttemptRef(expected, lease);
+    if (attempt.lockEpoch !== status.execution.lockEpoch || lease.lockEpoch !== status.execution.lockEpoch) {
+      throw new Error('attempt-fence-conflict: lockEpoch');
+    }
+    return { status, attempt, job, operation, lease };
+  }
+
+  commitTerminalAttempt(context, { attemptState, jobState, action, reason, fence = true }) {
+    const { status, attempt, job, operation } = context;
+    const nextStatus = structuredClone(status);
+    nextStatus.execution.activeJobId = null;
+    nextStatus.execution.activeAttemptId = null;
+    nextStatus.execution.activeLeaseToken = null;
+    nextStatus.execution.lastJobId = job.jobId;
+    if (fence) nextStatus.execution.lockEpoch += 1;
+    nextStatus.history = nextStatus.history || [];
+    nextStatus.history.push({
+      timestamp: this.clock(),
+      action,
+      details: { ...attemptRef(attempt), operationId: attempt.operationId, reason },
+    });
+    const terminalAttempt = { ...attempt, state: attemptState, executionState: attemptState, terminalAt: this.clock(), terminalReason: reason };
+    const terminalJob = { ...job, executionState: jobState, workflowState: jobState, terminalAt: this.clock(), terminalReason: reason };
+    this.store.writeOperation({
+      ...operation,
+      phase: 'terminal-committing',
+      terminalCommit: { action, jobState, job: terminalJob, attempt: terminalAttempt },
+    });
+    this.statusStore.saveCas(status.stateRevision, nextStatus);
+    this.inject('after-terminal-status-cas', { operationId: attempt.operationId, action });
+    this.store.writeAttempt(terminalAttempt);
+    this.store.writeJob(terminalJob);
+    this.store.releaseLease(attempt.bindingId, { operationId: attempt.operationId, ...attemptRef(attempt) });
+    this.store.writeOperation({ ...this.store.readOperation(attempt.operationId), phase: jobState, terminalAt: this.clock(), terminalReason: reason });
+    return { status: jobState, attemptId: attempt.attemptId };
+  }
+
+  async cancel(expected) {
+    assertAttemptRef(expected, expected);
+    const ref = { jobId: expected.jobId, attemptId: expected.attemptId, leaseToken: expected.leaseToken };
+    const claim = await this.transaction(() => {
+      let context;
+      try {
+        context = this.assertActiveAttempt(ref);
+      } catch (error) {
+        const attempt = this.store.readAttempt(ref.attemptId);
+        if (attempt && ['cancelled', 'abandoned', 'workflow-completed'].includes(attempt.state || attempt.workflowState)) {
+          return { terminal: true, result: { status: 'already-terminal', attemptId: ref.attemptId } };
+        }
+        throw error;
+      }
+      const pending = {
+        ...context.attempt,
+        state: 'cancel-pending-settle',
+        abortRequested: true,
+        cancelRequestedAt: this.clock(),
+      };
+      this.store.writeAttempt(pending);
+      this.store.writeOperation({ ...context.operation, cancelRequestedAt: this.clock() });
+      return { terminal: false, context: { ...context, attempt: pending } };
+    });
+    if (claim.terminal) return claim.result;
+    const { attempt, job } = claim.context;
+    await this.adapter.cancel(attemptRef(attempt), job.target);
+    const settled = await this.settleTransport(attempt.attemptId);
+    if (settled.status === 'transport-in-flight') return { status: 'cancel-pending-settle', attemptId: attempt.attemptId };
+    if (settled.outcome === 'submitted') return { status: 'cancel-pending-settle', attemptId: attempt.attemptId };
+    return this.transaction(() => this.commitTerminalAttempt(
+      this.assertActiveAttempt(ref),
+      { attemptState: 'cancelled', jobState: 'cancelled', action: 'worker-cancelled', reason: 'operator-cancel' }
+    ));
+  }
+
+  async reconcile(attemptId, decision, evidence = {}) {
+    if (!['sent', 'not-sent', 'abandon'].includes(decision)) throw new Error('invalid-reconcile-decision');
+    return this.transaction(() => {
+      const attempt = this.store.readAttempt(attemptId);
+      if (!attempt) throw new Error('attempt-not-found');
+      const context = this.assertActiveAttempt(attemptRef(attempt));
+      if (!['dispatch-uncertain', 'abandon-pending-settle'].includes(attempt.state)) {
+        throw new Error('reconcile-not-uncertain');
+      }
+      if (decision === 'sent') {
+        const reason = required(evidence.reason, 'reason');
+        this.store.writeAttempt({
+          ...attempt,
+          state: 'reconciled-sent',
+          transportState: 'submitted',
+          reconciliation: { decision, reason, operator: evidence.operator || 'cli', decidedAt: this.clock() },
+        });
+        this.store.writeOperation({ ...context.operation, phase: 'dispatch-submitted', reconciliationDecision: decision });
+        return { status: 'reconciled-sent', attemptId };
+      }
+      if (decision === 'not-sent') {
+        this.reconcileNotSent(attemptId, evidence);
+        const refreshed = this.assertActiveAttempt(attemptRef(attempt));
+        return this.commitTerminalAttempt(refreshed, {
+          attemptState: 'reconciled-not-sent',
+          jobState: 'reconciled-not-sent',
+          action: 'worker-reconciled-not-sent',
+          reason: evidence.reason,
+        });
+      }
+      const reason = required(evidence.reason, 'reason');
+      if (attempt.transportState === 'transport-in-flight') {
+        this.store.writeAttempt({
+          ...attempt,
+          state: 'abandon-pending-settle',
+          reconciliation: { decision, reason, operator: evidence.operator || 'cli', decidedAt: this.clock() },
+        });
+        return { status: 'abandon-pending-settle', attemptId };
+      }
+      return this.commitTerminalAttempt(context, {
+        attemptState: 'abandoned', jobState: 'abandoned', action: 'worker-abandoned', reason,
+      });
+    });
+  }
+
+  async takeover(reason) {
+    required(reason, 'reason');
+    return this.transaction(() => {
+      const status = this.statusStore.load();
+      if (!status.execution.activeAttemptId) return { status: 'no-active-attempt' };
+      const attempt = this.store.readAttempt(status.execution.activeAttemptId);
+      if (attempt.state === 'dispatch-uncertain' || attempt.state === 'abandon-pending-settle') {
+        throw new Error('reconcile-required');
+      }
+      if (attempt.transportState === 'transport-in-flight') throw new Error('transport-not-quiesced');
+      return this.commitTerminalAttempt(this.assertActiveAttempt(attemptRef(attempt)), {
+        attemptState: 'taken-over', jobState: 'taken-over', action: 'worker-takeover', reason,
+      });
+    });
+  }
+
+  async retry(jobId) {
+    return this.transaction(() => {
+      this.recoverOperations();
+      const status = this.statusStore.load();
+      if (status.execution.activeJobId || status.execution.activeAttemptId) throw new Error('active-job-conflict');
+      const previousJob = this.store.readJob(jobId);
+      if (!previousJob) throw new Error('job-not-found');
+      const previousAttempt = this.store.readAttempt(previousJob.attemptId);
+      if (!previousAttempt) throw new Error('attempt-not-found');
+      const safePreDispatchFailure = previousAttempt.state === 'failed-before-dispatch' && previousAttempt.dispatchingPersisted === false;
+      const safeNotSent = previousAttempt.state === 'reconciled-not-sent' && previousAttempt.transportState === 'quiesced';
+      if (previousAttempt.transportState === 'transport-in-flight' ||
+          (previousAttempt.abortRequested && previousAttempt.transportState !== 'quiesced')) {
+        throw new Error('transport-not-quiesced');
+      }
+      if (!safePreDispatchFailure && !safeNotSent) throw new Error('retry-not-allowed');
+
+      const operationId = randomUUID();
+      const attemptBase = createAttempt({ jobId, lockEpoch: status.execution.lockEpoch });
+      const attempt = {
+        ...attemptBase,
+        operationId,
+        bindingId: previousAttempt.bindingId,
+        state: 'prepared',
+        transportState: 'prepared',
+        dispatchingPersisted: false,
+        executionState: 'prepared',
+        workflowState: 'pending',
+        lastSequence: 0,
+        appliedEventIds: [],
+        retryOfAttemptId: previousAttempt.attemptId,
+      };
+      const job = {
+        ...previousJob,
+        operationId,
+        attemptId: attempt.attemptId,
+        attemptIds: [...new Set([...(previousJob.attemptIds || [previousAttempt.attemptId]), attempt.attemptId])],
+        executionState: 'prepared',
+        workflowState: 'pending',
+      };
+      const lease = { ...createLease({ bindingId: attempt.bindingId, attempt }), operationId, state: 'pending' };
+      const payloads = { job, attempt, lease };
+      const operation = {
+        operationId,
+        kind: 'dispatch-retry',
+        phase: 'intent',
+        payloadHash: canonicalPayloadHash(payloads),
+        expectedStateRevision: status.stateRevision,
+        expectedStageRevision: status.stageRevision,
+        attemptRef: attemptRef(attempt),
+        bindingId: attempt.bindingId,
+        payloads,
+        previousJob,
+        createdAt: this.clock(),
+      };
+      this.store.writeOperation(operation);
+      this.inject('after-retry-operation-intent', { operationId });
+      this.store.writeJob(job);
+      this.inject('after-retry-job-write', { operationId });
+      this.store.writeAttempt(attempt);
+      this.inject('after-retry-attempt-write', { operationId });
+      this.store.writeLease(lease);
+      this.inject('after-retry-lease-write', { operationId });
+      const nextStatus = structuredClone(status);
+      nextStatus.execution.mode = 'worker';
+      nextStatus.execution.activeJobId = jobId;
+      nextStatus.execution.activeAttemptId = attempt.attemptId;
+      nextStatus.execution.activeLeaseToken = attempt.leaseToken;
+      nextStatus.history = nextStatus.history || [];
+      nextStatus.history.push({ timestamp: this.clock(), action: 'worker-retry-committed', details: { operationId, ...attemptRef(attempt) } });
+      this.statusStore.saveCas(status.stateRevision, nextStatus);
+      this.inject('after-retry-status-commit', { operationId });
+      this.store.writeLease({ ...lease, state: 'active' });
+      this.store.writeOperation({ ...operation, phase: 'committed' });
+      return { status: 'retry-prepared', operationId, job, attempt };
+    });
+  }
+
   async pumpOnce() {
+    await this.transaction(() => this.recoverOperations());
+    const status = this.statusStore.load();
+    const activeAttemptId = status.execution?.activeAttemptId;
+    if (activeAttemptId) {
+      const attempt = this.store.readAttempt(activeAttemptId);
+      if (attempt?.transportState === 'transport-in-flight') {
+        const settle = await this.settleTransport(activeAttemptId);
+        if (settle.status === 'transport-in-flight') return settle;
+      }
+    }
+    return this.transaction(() => this.pumpOnceLocked());
+  }
+
+  async pumpOnceLocked() {
+    const inbox = this.store.listReceipts('inbox')
+      .sort((a, b) => a.attemptId.localeCompare(b.attemptId) ||
+        (Number.isInteger(a.receipt?.sequence) ? a.receipt.sequence : Number.MAX_SAFE_INTEGER) -
+        (Number.isInteger(b.receipt?.sequence) ? b.receipt.sequence : Number.MAX_SAFE_INTEGER));
+    let sequenceGap = false;
+    for (const envelope of inbox) {
+      if (envelope.error) {
+        this.rejectMalformedReceipt(envelope);
+        continue;
+      }
+      const receipt = envelope.receipt;
+      try {
+        await this.applyReceipt(receipt);
+      } catch (error) {
+        if (error.message === 'receipt-sequence-gap') {
+          sequenceGap = true;
+          continue;
+        }
+        if (error.message.startsWith('receipt-rejected:')) {
+          this.rejectReceipt(receipt, error.message.slice('receipt-rejected:'.length));
+          continue;
+        }
+        throw error;
+      }
+    }
+
     const status = this.statusStore.load();
     const activeAttemptId = status.execution?.activeAttemptId;
     if (!activeAttemptId) return { status: 'idle' };
     const attempt = this.store.readAttempt(activeAttemptId);
     if (!attempt) throw new Error('execution-corrupt: active attempt missing');
 
-    const inbox = this.store.listReceipts('inbox')
-      .map(item => item.receipt)
-      .filter(receipt => receipt.attemptId === activeAttemptId)
-      .sort((a, b) => a.sequence - b.sequence);
-    if (inbox.length > 0) await this.applyReceipt(inbox[0]);
-
     const currentAttempt = this.store.readAttempt(activeAttemptId);
     const job = this.store.readJob(currentAttempt.jobId);
+    if (job.executionState === 'failed' || currentAttempt.executionState === 'failed') {
+      return this.commitTerminalAttempt(
+        this.assertActiveAttempt(attemptRef(currentAttempt)),
+        {
+          attemptState: 'failed',
+          jobState: 'failed',
+          action: 'worker-failed',
+          reason: currentAttempt.failureEvidence?.eventId || 'worker-failed-receipt',
+        }
+      );
+    }
     if (job.workflowState === 'worker-completed-awaiting-check' || job.workflowState === 'check-blocked') {
       return this.evaluateAndCommitWorkflow(job, currentAttempt);
     }
+    if (sequenceGap) return { status: 'sequence-gap' };
     return { status: currentAttempt.state };
   }
 
+  rejectMalformedReceipt(envelope) {
+    this.store.writeReceiptApplication(envelope.attemptId, envelope.eventId, {
+      eventId: envelope.eventId,
+      attemptId: envelope.attemptId,
+      payloadHash: envelope.payloadHash,
+      classification: 'rejected',
+      phase: 'committed',
+      reason: 'malformed-json',
+      rejectedAt: this.clock(),
+    });
+    this.store.finalizeReceipt(envelope.attemptId, envelope.eventId, 'rejected');
+  }
+
+  rejectReceipt(receipt, reason) {
+    const payloadHash = canonicalPayloadHash(receipt);
+    const existing = this.store.readReceiptApplication(receipt.attemptId, receipt.eventId);
+    const collision = existing && existing.payloadHash !== payloadHash;
+    const applicationId = collision ? `${receipt.eventId}.collision-${payloadHash.slice(0, 12)}` : receipt.eventId;
+    this.store.writeReceiptApplication(receipt.attemptId, applicationId, {
+      eventId: receipt.eventId,
+      attemptId: receipt.attemptId,
+      payloadHash,
+      classification: 'rejected',
+      phase: 'committed',
+      reason: collision ? 'event-id-collision' : reason,
+      collisionOf: collision ? receipt.eventId : undefined,
+      rejectedAt: this.clock(),
+    });
+    this.store.finalizeReceipt(receipt.attemptId, receipt.eventId, 'rejected');
+    return { status: 'receipt-rejected', reason };
+  }
+
   async applyReceipt(receiptInput) {
-    const receipt = validateReceipt(receiptInput);
-    const attempt = this.store.readAttempt(receipt.attemptId);
-    if (!attempt) throw new Error('receipt-stale-attempt');
-    assertAttemptRef(attemptRef(attempt), receipt);
-    if (receipt.sequence !== attempt.lastSequence + 1) throw new Error('receipt-sequence-gap');
+    const receipt = validateReceipt(receiptInput, Date.parse(this.clock()), this.maxClockSkewMs);
     const payloadHash = canonicalPayloadHash(receipt);
     let application = this.store.readReceiptApplication(receipt.attemptId, receipt.eventId);
+    if (application && application.payloadHash !== payloadHash) throw new Error('receipt-rejected:event-id-collision');
     if (application?.phase === 'committed') {
       this.store.finalizeReceipt(receipt.attemptId, receipt.eventId, 'processed');
       return { status: 'receipt-already-applied' };
     }
-    application = {
-      eventId: receipt.eventId,
-      attemptId: receipt.attemptId,
-      payloadHash,
-      classification: 'accepted',
-      phase: 'validated',
-      sequence: receipt.sequence,
-    };
-    this.store.writeReceiptApplication(receipt.attemptId, receipt.eventId, application);
-    this.store.appendEvent(receipt);
-    this.store.writeReceiptApplication(receipt.attemptId, receipt.eventId, { ...application, phase: 'journaled' });
-
-    const nextAttempt = {
-      ...attempt,
-      lastSequence: receipt.sequence,
-      appliedEventIds: [...(attempt.appliedEventIds || []), receipt.eventId],
-    };
-    const job = this.store.readJob(receipt.jobId);
-    let nextJob = { ...job };
-    if (receipt.kind === 'job.completed') {
-      nextAttempt.executionState = 'worker-completed';
-      nextAttempt.workflowState = 'worker-completed-awaiting-check';
-      nextAttempt.completionEvidence = { eventId: receipt.eventId, payloadHash, occurredAt: receipt.occurredAt };
-      nextJob.executionState = 'worker-completed';
-      nextJob.workflowState = 'worker-completed-awaiting-check';
-      nextJob.completionEvidence = nextAttempt.completionEvidence;
-    } else if (receipt.kind === 'job.failed') {
-      nextAttempt.executionState = 'failed';
-      nextJob.executionState = 'failed';
-    } else {
-      nextAttempt.executionState = 'running';
-      nextJob.executionState = 'running';
+    let attempt = this.store.readAttempt(receipt.attemptId);
+    if (!attempt) throw new Error('receipt-rejected:superseded-attempt');
+    if (attempt.jobId !== receipt.jobId || attempt.leaseToken !== receipt.leaseToken) {
+      throw new Error('receipt-rejected:attempt-ref-mismatch');
     }
-    this.store.writeAttempt(nextAttempt);
-    this.store.writeJob(nextJob);
+    const status = this.statusStore.load();
+    if (status.execution.activeJobId !== attempt.jobId ||
+        status.execution.activeAttemptId !== attempt.attemptId ||
+        status.execution.activeLeaseToken !== attempt.leaseToken) {
+      throw new Error('receipt-rejected:superseded-attempt');
+    }
+    const lease = this.store.readLease(attempt.bindingId);
+    if (!lease || lease.operationId !== attempt.operationId ||
+        lease.jobId !== attempt.jobId || lease.attemptId !== attempt.attemptId ||
+        lease.leaseToken !== attempt.leaseToken) {
+      throw new Error('receipt-rejected:lease-fence-conflict');
+    }
+    if (attempt.lockEpoch !== status.execution.lockEpoch || lease.lockEpoch !== status.execution.lockEpoch) {
+      throw new Error('receipt-rejected:fenced-lock-epoch');
+    }
+    const operation = this.store.readOperation(attempt.operationId);
+    if (!operation || operation.attemptRef?.attemptId !== attempt.attemptId ||
+        operation.attemptRef?.leaseToken !== attempt.leaseToken) {
+      throw new Error('receipt-rejected:operation-fence-conflict');
+    }
+    if (!application) {
+      if (receipt.sequence > attempt.lastSequence + 1) throw new Error('receipt-sequence-gap');
+      if (receipt.sequence === attempt.lastSequence) throw new Error('receipt-rejected:duplicate-sequence');
+      if (receipt.sequence < attempt.lastSequence) throw new Error('receipt-rejected:stale-sequence');
+      application = {
+        eventId: receipt.eventId,
+        attemptId: receipt.attemptId,
+        payloadHash,
+        classification: 'accepted',
+        phase: 'validated',
+        sequence: receipt.sequence,
+      };
+      this.store.writeReceiptApplication(receipt.attemptId, receipt.eventId, application);
+    }
+    if (application.phase === 'validated') {
+      this.store.appendEvent(receipt);
+      application = { ...application, phase: 'journaled' };
+      this.store.writeReceiptApplication(receipt.attemptId, receipt.eventId, application);
+    }
+
+    const completionEvidence = { eventId: receipt.eventId, payloadHash, occurredAt: receipt.occurredAt };
+    attempt = this.store.readAttempt(receipt.attemptId);
+    if (!(attempt.appliedEventIds || []).includes(receipt.eventId)) {
+      const nextAttempt = {
+        ...attempt,
+        lastSequence: receipt.sequence,
+        appliedEventIds: [...(attempt.appliedEventIds || []), receipt.eventId],
+      };
+      if (receipt.kind === 'job.completed') {
+        nextAttempt.executionState = 'worker-completed';
+        nextAttempt.workflowState = 'worker-completed-awaiting-check';
+        nextAttempt.completionEvidence = completionEvidence;
+      } else if (receipt.kind === 'job.failed') {
+        nextAttempt.executionState = 'failed';
+        nextAttempt.failureEvidence = completionEvidence;
+      } else {
+        nextAttempt.executionState = 'running';
+      }
+      this.store.writeAttempt(nextAttempt);
+      this.inject('after-receipt-attempt-write', { eventId: receipt.eventId });
+    }
+
+    const job = this.store.readJob(receipt.jobId);
+    if (!(job.appliedEventIds || []).includes(receipt.eventId)) {
+      const nextJob = { ...job, appliedEventIds: [...(job.appliedEventIds || []), receipt.eventId] };
+      if (receipt.kind === 'job.completed') {
+        nextJob.executionState = 'worker-completed';
+        nextJob.workflowState = 'worker-completed-awaiting-check';
+        nextJob.completionEvidence = completionEvidence;
+      } else if (receipt.kind === 'job.failed') {
+        nextJob.executionState = 'failed';
+        nextJob.failureEvidence = completionEvidence;
+      } else {
+        nextJob.executionState = 'running';
+      }
+      this.store.writeJob(nextJob);
+    }
     this.store.writeReceiptApplication(receipt.attemptId, receipt.eventId, { ...application, phase: 'committed' });
     this.store.finalizeReceipt(receipt.attemptId, receipt.eventId, 'processed');
     return { status: 'receipt-applied', kind: receipt.kind };
   }
 
   async evaluateAndCommitWorkflow(job, attempt) {
-    const status = this.statusStore.load();
-    assertAttemptRef(attemptRef(attempt), {
-      jobId: status.execution.activeJobId,
-      attemptId: status.execution.activeAttemptId,
-      leaseToken: status.execution.activeLeaseToken,
-    });
+    const initialContext = this.assertActiveAttempt(attemptRef(attempt));
+    const status = initialContext.status;
     const evaluation = await this.workflow.evaluate(structuredClone(status), structuredClone(attempt), structuredClone(job));
     if (!evaluation?.pass) {
       this.store.writeJob({
@@ -366,6 +915,7 @@ export class ExecutionSupervisor {
     }
 
     const transition = await this.workflow.derive(structuredClone(status), evaluation, structuredClone(attempt), structuredClone(job));
+    this.assertActiveAttempt(attemptRef(attempt));
     const nextStatus = structuredClone(transition.nextStatus);
     nextStatus.execution.activeJobId = null;
     nextStatus.execution.activeAttemptId = null;
@@ -382,10 +932,24 @@ export class ExecutionSupervisor {
         postCursor: transition.postCursor,
       },
     });
+    const completedJob = { ...job, workflowState: 'workflow-completed', workflowCompletedAt: this.clock() };
+    const completedAttempt = { ...attempt, workflowState: 'workflow-completed' };
+    const operation = this.store.readOperation(attempt.operationId);
+    this.store.writeOperation({
+      ...operation,
+      phase: 'workflow-committing',
+      workflowCommit: {
+        completionEventId: attempt.completionEvidence.eventId,
+        job: completedJob,
+        attempt: completedAttempt,
+      },
+    });
     this.statusStore.saveCas(status.stateRevision, nextStatus);
-    this.store.writeJob({ ...job, workflowState: 'workflow-completed', workflowCompletedAt: this.clock() });
-    this.store.writeAttempt({ ...attempt, workflowState: 'workflow-completed' });
+    this.inject('after-workflow-status-cas', { operationId: attempt.operationId });
+    this.store.writeJob(completedJob);
+    this.store.writeAttempt(completedAttempt);
     this.store.releaseLease(attempt.bindingId, { operationId: attempt.operationId, ...attemptRef(attempt) });
+    this.store.writeOperation({ ...this.store.readOperation(attempt.operationId), phase: 'workflow-completed' });
     return { status: 'workflow-completed', postCursor: transition.postCursor };
   }
 }

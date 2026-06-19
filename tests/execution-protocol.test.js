@@ -270,14 +270,36 @@ describe('V3 Phase 1 execution protocol', () => {
       kind: 'job.queued',
       source: 'supervisor',
       attempt,
+      sequence: 1,
     });
     assert.equal(lease.attemptId, attempt.attemptId);
     assert.equal(lease.leaseToken, attempt.leaseToken);
     assert.ok(lease.expiresAt);
-    assert.equal(event.workerProtocolVersion, WORKER_PROTOCOL_VERSION);
+    assert.equal(event.protocolVersion, WORKER_PROTOCOL_VERSION);
     assert.equal(event.attemptId, attempt.attemptId);
     assert.equal(event.leaseToken, attempt.leaseToken);
-    assert.ok(event.timestamp);
+    assert.equal(event.sequence, 1);
+    assert.ok(event.occurredAt);
+  });
+
+  it('creates receipts that satisfy the supervisor profile', () => {
+    const attempt = createAttempt({ jobId: 'job-1', lockEpoch: 0 });
+    const event = createEvent({
+      kind: 'job.completed',
+      source: 'fake-adapter',
+      attempt,
+      sequence: 2,
+      occurredAt: '2026-06-19T00:00:00.000Z',
+    });
+
+    assert.deepEqual(Object.keys(event).sort(), [
+      'attemptId', 'details', 'eventId', 'jobId', 'kind', 'leaseToken',
+      'occurredAt', 'protocolVersion', 'sequence', 'source',
+    ]);
+    assert.throws(
+      () => createEvent({ kind: 'job.completed', source: 'fake', attempt, sequence: 0 }),
+      /sequence must be a positive integer/
+    );
   });
 
   it('manual adapter reports manual-required without dispatch side effects', async () => {

@@ -90,6 +90,7 @@ export class ExecutionStore {
       eventsFile: path.join(runRoot, 'events', 'worker.jsonl'),
       eventIndex: path.join(runRoot, 'events', 'index'),
       leases: path.join(runRoot, 'leases'),
+      transports: path.join(runRoot, 'transports'),
       applications: path.join(runRoot, 'receipt-applications'),
       receipts: path.join(runRoot, 'receipts'),
     };
@@ -167,6 +168,15 @@ export class ExecutionStore {
     return true;
   }
 
+  writeTransport(bindingId, record) {
+    if (!bindingId) throw new Error('bindingId is required');
+    return this.writeRecord('transports', bindingId, { ...record, bindingId });
+  }
+
+  readTransport(bindingId) {
+    return this.readRecord('transports', bindingId);
+  }
+
   receiptPath(bucket, attemptId, eventId) {
     if (!['inbox', 'processed', 'rejected'].includes(bucket)) {
       throw new Error(`invalid-receipt-bucket: ${bucket}`);
@@ -191,7 +201,23 @@ export class ExecutionStore {
 
   listReceipts(bucket) {
     const directory = path.join(this.paths.receipts, bucket);
-    return listJsonFiles(directory).map(filePath => ({ filePath, receipt: readJson(filePath) }));
+    return listJsonFiles(directory).map(filePath => {
+      const relative = path.relative(directory, filePath).split(path.sep);
+      const attemptId = relative.at(-2);
+      const eventId = path.basename(filePath, '.json');
+      try {
+        return { filePath, attemptId, eventId, receipt: readJson(filePath), error: null };
+      } catch (error) {
+        return {
+          filePath,
+          attemptId,
+          eventId,
+          receipt: null,
+          error: error.message,
+          payloadHash: createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'),
+        };
+      }
+    });
   }
 
   readReceiptApplication(attemptId, eventId) {

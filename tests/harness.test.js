@@ -5,7 +5,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import os from 'node:os';
 
 // Create temp directories for isolated testing
@@ -57,6 +57,32 @@ function harnessEnv(envOverrides, args = '') {
   }
 }
 
+function startHarness(args) {
+  const child = spawn(process.execPath, [HARNESS_SCRIPT, ...args], {
+    cwd: HARNESS_DIR,
+    env: { ...process.env, REVIEW_ROOT, CODE_REPO, HARNESS_ROOT: HARNESS_DIR },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  return {
+    child,
+    completed: new Promise(resolve => child.on('close', exitCode => resolve({ success: exitCode === 0, exitCode, stdout, stderr }))),
+  };
+}
+
+async function waitFor(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value) return value;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error('waitFor timeout');
+}
+
 function saveStatus(taskId, status) {
   const p = path.join(HARNESS_DIR, 'runs', taskId, 'status.json');
   fs.writeFileSync(p, JSON.stringify(status, null, 2) + '\n', 'utf-8');
@@ -66,6 +92,17 @@ function readStatus(taskId) {
   const p = path.join(HARNESS_DIR, 'runs', taskId, 'status.json');
   if (!fs.existsSync(p)) return null;
   return JSON.parse(fs.readFileSync(p, 'utf-8'));
+}
+
+function activeSubmittedStatus(taskId, bindingId) {
+  const status = readStatus(taskId);
+  if (!status?.execution?.activeAttemptId) return null;
+  const transportPath = path.join(HARNESS_DIR, 'runs', taskId, 'transports', `${bindingId}.json`);
+  if (!fs.existsSync(transportPath)) return null;
+  const transport = JSON.parse(fs.readFileSync(transportPath, 'utf8'));
+  return transport.attemptId === status.execution.activeAttemptId && transport.transportState === 'submitted'
+    ? status
+    : null;
 }
 
 // Helper: create a report file
@@ -2437,6 +2474,140 @@ Expected: Should be fixed
       // outputs should NOT have grown just from next being called
       assert.equal(outputsAfter.length, outputsBefore.length,
         'outputs[] should not grow just from next being called');
+    });
+  });
+
+  describe('V3 Phase 2: real CLI fake-adapter loop', () => {
+    before(() => {
+      const status = readStatus('W6-A');
+      if (!status?.execution) return;
+      status.execution.activeJobId = null;
+      status.execution.activeAttemptId = null;
+      status.execution.activeLeaseToken = null;
+      saveStatus('W6-A', status);
+    });
+
+    it('keeps doctor/jobs read-only and completes foreground run through real gates', async () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const statusFile = path.join(HARNESS_DIR, 'runs', 'W6-A', 'status.json');
+      const beforeDoctor = fs.readFileSync(statusFile, 'utf8');
+      const doctor = harness('doctor W6-A --adapter fake');
+      assert.equal(doctor.success, true, doctor.stderr);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), beforeDoctor);
+      const manual = harness('run W6-A --adapter manual');
+      assert.equal(manual.success, false);
+      assert.match(manual.stdout, /manual-required/);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), beforeDoctor);
+      const beforeJobsReadOnly = fs.readFileSync(statusFile, 'utf8');
+      assert.equal(harness('jobs W6-A --json').success, true);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), beforeJobsReadOnly);
+
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      let status = await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+      assert.ok(status.execution.activeJobId);
+      assert.ok(status.execution.activeAttemptId);
+      assert.ok(status.execution.activeLeaseToken);
+      assert.equal(harness('jobs W6-A --json').success, true);
+
+      const attemptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'attempts', `${status.execution.activeAttemptId}.json`);
+      const attempt = JSON.parse(fs.readFileSync(attemptPath, 'utf8'));
+      const jobPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'jobs', `${status.execution.activeJobId}.json`);
+      const job = JSON.parse(fs.readFileSync(jobPath, 'utf8'));
+      createReportAt(job.primaryReportPath, `# Plan ${attempt.attemptId}\n\n## Fabric 官方能力核查\nOK\n`);
+      const receiptDir = path.join(HARNESS_DIR, 'runs', 'W6-A', 'receipts', 'inbox', attempt.attemptId);
+      fs.mkdirSync(receiptDir, { recursive: true });
+      fs.writeFileSync(path.join(receiptDir, 'event-complete.json'), JSON.stringify({
+        protocolVersion: 1,
+        eventId: 'event-complete',
+        jobId: attempt.jobId,
+        attemptId: attempt.attemptId,
+        leaseToken: attempt.leaseToken,
+        kind: 'job.completed',
+        sequence: 1,
+        occurredAt: new Date().toISOString(),
+        source: 'fake-adapter',
+        details: {},
+      }, null, 2));
+
+      const run = await running.completed;
+      assert.equal(run.success, true, `${run.stderr}\n${run.stdout}`);
+      assert.match(run.stdout, /workflow-completed/, run.stdout);
+      status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'plan-review');
+      assert.equal(status.execution.activeJobId, null);
+      assert.equal(status.execution.activeAttemptId, null);
+      assert.equal(status.execution.activeLeaseToken, null);
+      assert.ok(status.history.some(entry => entry.action === 'worker-workflow-committed'));
+    });
+
+    it('allows full AttemptRef cancellation while foreground run waits', async () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      let status = await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+      const stale = harness(`cancel W6-A --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token stale`);
+      assert.equal(stale.success, false);
+      assert.match(stale.stderr, /attempt-fence-conflict/);
+      status = readStatus('W6-A');
+      const cancelled = harness(`cancel W6-A --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token ${status.execution.activeLeaseToken}`);
+      assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
+      status = readStatus('W6-A');
+      assert.equal(status.execution.activeJobId, null, cancelled.stdout);
+      assert.equal(status.execution.activeAttemptId, null);
+      assert.ok(status.history.some(entry => entry.action === 'worker-cancelled'));
+      const run = await running.completed;
+      assert.equal(run.success, true, `${run.stderr}\n${run.stdout}`);
+      assert.match(run.stdout, /"status": "idle"/);
+    });
+
+    it('allows manual takeover while foreground run waits without bypassing gates', async () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+      const takeover = harness('advance W6-A --takeover --reason "operator takeover"');
+      assert.equal(takeover.success, false, takeover.stdout);
+      assert.match(takeover.stdout, /Cannot advance: check failed|check failed/i);
+      const status = readStatus('W6-A');
+      assert.equal(status.execution.activeJobId, null);
+      assert.equal(status.execution.activeAttemptId, null);
+      assert.equal(status.execution.activeLeaseToken, null);
+      assert.equal(status.currentStage, 'implementation-plan');
+      assert.ok(status.history.some(entry => entry.action === 'worker-takeover'));
+      const run = await running.completed;
+      assert.equal(run.success, true, `${run.stderr}\n${run.stdout}`);
+      assert.match(run.stdout, /"status": "idle"/);
+    });
+
+    it('records delivery acceptance while foreground run waits and stops at the commit checkpoint', async () => {
+      assert.equal(harness('init W6-A --from W6-A-02 --stage delivery --force').success, true);
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      let status = await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+      const attempt = JSON.parse(fs.readFileSync(path.join(
+        HARNESS_DIR, 'runs', 'W6-A', 'attempts', `${status.execution.activeAttemptId}.json`
+      ), 'utf8'));
+      const job = JSON.parse(fs.readFileSync(path.join(
+        HARNESS_DIR, 'runs', 'W6-A', 'jobs', `${status.execution.activeJobId}.json`
+      ), 'utf8'));
+      createReportAt(job.primaryReportPath, `# 交付摘要 ${attempt.attemptId}\n\n## 验证\n全部通过。\n\n## 残留风险\n无。\n`);
+      const stageRevisionBeforeAccept = status.stageRevision;
+      const accepted = harness('accept W6-A --note "人工验收通过"');
+      assert.equal(accepted.success, true, accepted.stderr);
+      status = readStatus('W6-A');
+      assert.equal(status.stageRevision, stageRevisionBeforeAccept);
+
+      const receiptDir = path.join(HARNESS_DIR, 'runs', 'W6-A', 'receipts', 'inbox', attempt.attemptId);
+      fs.mkdirSync(receiptDir, { recursive: true });
+      fs.writeFileSync(path.join(receiptDir, 'delivery-complete.json'), JSON.stringify({
+        protocolVersion: 1, eventId: 'delivery-complete', jobId: attempt.jobId,
+        attemptId: attempt.attemptId, leaseToken: attempt.leaseToken, kind: 'job.completed',
+        sequence: 1, occurredAt: new Date().toISOString(), source: 'fake-adapter', details: {},
+      }, null, 2));
+      const run = await running.completed;
+      assert.equal(run.success, true, `${run.stderr}\n${run.stdout}`);
+      assert.match(run.stdout, /workflow-completed/);
+      status = readStatus('W6-A');
+      assert.equal(status.currentStage, 'delivery');
+      assert.equal(status.awaitingCommit, true);
+      assert.equal(status.execution.activeAttemptId, null);
     });
   });
 });

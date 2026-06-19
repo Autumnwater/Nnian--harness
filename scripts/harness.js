@@ -10,12 +10,17 @@ import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   STATUS_SCHEMA_VERSION,
+  FakeWorkerAdapter,
+  ManualWorkerAdapter,
   assertAttemptRef,
   assertStageCursor,
   createExecutionDefaults,
   createStageCursor,
   migrateExecutionState,
 } from './execution-protocol.js';
+import { ExecutionStore } from './execution-store.js';
+import { ExecutionSupervisor } from './execution-supervisor.js';
+import { deriveAdvanceTransition, evaluateStageCheck } from './workflow-core.js';
 import {
   acquireExecutionLock,
   finalizeRecoveredExecutionLock,
@@ -290,7 +295,7 @@ function executionLockPath(taskId) {
   return path.join(HARNESS_ROOT, 'runs', taskId, 'execution.lock');
 }
 
-function withTaskExecutionLock(taskId, command, callback) {
+async function withTaskExecutionLock(taskId, command, callback) {
   const lockPath = executionLockPath(taskId);
   const lock = acquireExecutionLock({
     lockPath,
@@ -329,9 +334,21 @@ function withTaskExecutionLock(taskId, command, callback) {
         lockEpoch: status.execution.lockEpoch,
       });
     }
-    return callback();
+    return await callback();
   } finally {
     releaseExecutionLock(lock);
+  }
+}
+
+async function withTaskExecutionLockRetry(taskId, command, callback, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      return await withTaskExecutionLock(taskId, command, callback);
+    } catch (error) {
+      if (!error.message.startsWith('task-locked:') || Date.now() >= deadline) throw error;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
   }
 }
 
@@ -428,6 +445,10 @@ const MANUAL_PROGRESS_COMMANDS = new Set([
 function assertNoActiveExecution(taskId, command) {
   if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
   const status = readJSON(statusPath(taskId));
+  // Delivery acceptance is gate evidence for the active attempt, not workflow
+  // progression. It is serialized by the task lock and may be recorded while
+  // the Supervisor waits for completion.
+  if (command === 'accept' && status?.currentStage === 'delivery') return;
   if (status?.execution?.activeJobId || status?.execution?.activeAttemptId) {
     throw new Error(
       `active-job-conflict: ${command} cannot change workflow state while ` +
@@ -925,7 +946,7 @@ function cmdInit(taskId, opts = {}) {
     } else if (!force) {
       throw new Error(`Run already exists for ${taskId}. Use --force to overwrite or --archive-existing to archive first.`);
     }
-    // If force (without archive), we just overwrite below
+    fs.rmSync(path.dirname(existingStatusPath), { recursive: true, force: true });
   }
 
   const fromSubtask = from || 'W6-A-02';
@@ -1430,8 +1451,9 @@ function generateContinuationPrompt(taskId, status, subtaskId, stage, subtask) {
 // ---------------------------------------------------------------------------
 // Gate check (P0-1: stage-specific gates)
 // ---------------------------------------------------------------------------
-function cmdCheck(taskId) {
-  const status = loadStatus(taskId);
+function cmdCheck(taskId, opts = {}) {
+  const status = opts.status ? structuredClone(opts.status) : loadStatus(taskId);
+  if (opts.statusRef) opts.statusRef.current = status;
   const { currentSubtask, currentStage } = status;
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
 
@@ -1693,13 +1715,15 @@ function cmdCheck(taskId) {
 
   // Output results
   if (issues.length === 0) {
-    if (mirrorPath && primaryPath && fs.existsSync(primaryPath)) {
+    if (opts.persist !== false && mirrorPath && primaryPath && fs.existsSync(primaryPath)) {
       ensureDir(path.dirname(mirrorPath));
       fs.copyFileSync(primaryPath, mirrorPath);
       stageData.mirrorSyncedAt = now();
     }
-    bumpStageRevision(status);
-    saveStatus(taskId, status);
+    if (opts.persist !== false) {
+      bumpStageRevision(status);
+      saveStatus(taskId, status);
+    }
     console.log('✅ CHECK PASSED');
     if (warnings.length > 0) {
       console.log(`   Warnings: ${warnings.length}`);
@@ -1716,7 +1740,7 @@ function cmdCheck(taskId) {
       primarySnapshot: getFileSnapshot(primaryPath),
     };
   } else {
-    if (primaryPath && fs.existsSync(primaryPath)) {
+    if (opts.persist !== false && primaryPath && fs.existsSync(primaryPath)) {
       bumpStageRevision(status);
       saveStatus(taskId, status);
     }
@@ -1750,7 +1774,8 @@ function getPreviousStage(stage) {
 // Advance (P0-1, P1-2, P1-3, V2: delivery commit checkpoint)
 // ---------------------------------------------------------------------------
 function cmdAdvance(taskId, opts = {}) {
-  let status = loadStatus(taskId);
+  let status = opts.status ? structuredClone(opts.status) : loadStatus(taskId);
+  if (opts.statusRef) opts.statusRef.current = status;
 
   // V2: Handle --confirm-committed when awaitingCommit
   if (opts.confirmCommitted) {
@@ -1804,7 +1829,7 @@ function cmdAdvance(taskId, opts = {}) {
       status.taskStatus = 'completed';
       addHistory(status, 'task-completed', { subtask: commitSubtask });
       bumpStageRevision(status);
-      saveStatus(taskId, status);
+      if (opts.persist !== false) saveStatus(taskId, status);
       console.log(`✅ Commit confirmed. All subtasks completed! Task ${taskId} is done.`);
       console.log(`   currentStage: done`);
       console.log(`   nextRecommendedAction: 等待 Codex 总体验收`);
@@ -1836,7 +1861,7 @@ function cmdAdvance(taskId, opts = {}) {
 
     addHistory(status, 'subtask-advanced', { subtask: nextSubtask.id, stage: 'implementation-plan' });
     bumpStageRevision(status);
-    saveStatus(taskId, status);
+    if (opts.persist !== false) saveStatus(taskId, status);
 
     console.log(`✅ Commit confirmed. Delivery completed for ${commitSubtask}, advancing to ${nextSubtask.id} / implementation-plan`);
     return { success: true, advanced: true, subtask: nextSubtask.id, stage: 'implementation-plan' };
@@ -1849,6 +1874,7 @@ function cmdAdvance(taskId, opts = {}) {
     return { success: false };
   }
   if (!opts.checkResult) status = loadStatus(taskId);
+  if (opts.statusRef) opts.statusRef.current = status;
   assertCheckEvidence(status, checkResult);
 
   const { currentSubtask, currentStage } = status;
@@ -1894,7 +1920,7 @@ function cmdAdvance(taskId, opts = {}) {
       round: nextRound,
     });
     bumpStageRevision(status);
-    saveStatus(taskId, status);
+    if (opts.persist !== false) saveStatus(taskId, status);
 
     console.log(`🔁 ${currentStage} requires changes; returning to ${fixStage}.`);
     console.log(`   Round: ${nextRound}`);
@@ -1920,7 +1946,7 @@ function cmdAdvance(taskId, opts = {}) {
 
     addHistory(status, 'delivery-passed-awaiting-commit', { subtask: currentSubtask });
     bumpStageRevision(status);
-    saveStatus(taskId, status);
+    if (opts.persist !== false) saveStatus(taskId, status);
 
     console.log('═══════════════════════════════════════════════');
     console.log(`✅ Delivery passed for ${currentSubtask}.`);
@@ -1967,7 +1993,7 @@ function cmdAdvance(taskId, opts = {}) {
     console.log(`✅ All stages completed for ${currentSubtask}.`);
     console.log(`   Task ${taskId} completed.`);
     bumpStageRevision(status);
-    saveStatus(taskId, status);
+    if (opts.persist !== false) saveStatus(taskId, status);
     return { success: true, advanced: true, taskDone: true };
   }
 
@@ -2003,12 +2029,14 @@ function cmdAdvance(taskId, opts = {}) {
   // Ensure reportDir and output dir exist
   const cfg = getWorkflowConfig();
   const week = taskId.split('-')[0];
-  ensureDir(path.join(getEffectiveReviewRoot(), week, currentSubtask));
-  ensureDir(outputsDir(taskId, currentSubtask));
+  if (opts.persist !== false) {
+    ensureDir(path.join(getEffectiveReviewRoot(), week, currentSubtask));
+    ensureDir(outputsDir(taskId, currentSubtask));
+  }
 
   addHistory(status, 'stage-advanced', { subtask: currentSubtask, stage: nextStage });
   bumpStageRevision(status);
-  saveStatus(taskId, status);
+  if (opts.persist !== false) saveStatus(taskId, status);
 
   console.log(`✅ Advanced to ${currentSubtask} / ${nextStage}`);
   if (getStageConfig(nextStage)?.roundGroup) {
@@ -2223,7 +2251,7 @@ function cmdAccept(taskId, opts = {}) {
     subtask: status.currentSubtask,
     note,
   });
-  bumpStageRevision(status);
+  if (!status.execution?.activeAttemptId) bumpStageRevision(status);
   saveStatus(taskId, status);
   console.log(`✅ Manual acceptance recorded for ${status.currentSubtask}`);
   console.log(`   note: ${note}`);
@@ -2694,26 +2722,262 @@ Examples:
   harness status W6-A
   harness brief W6-A
   harness accept W6-A --note "人工验收通过"
+  harness doctor W6-A [--adapter fake|manual]
+  harness run W6-A [--adapter fake|manual]
+  harness pump W6-A [--adapter fake|manual]
+  harness jobs W6-A [--json]
+  harness retry W6-A --job <jobId> [--adapter fake]
+  harness cancel W6-A --job <jobId> --attempt <attemptId> --lease-token <token>
+  harness reconcile W6-A --attempt <attemptId> --decision sent|not-sent|abandon [evidence]
+  harness <manual-command> W6-A --takeover --reason "<reason>"
 `);
+}
+
+function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = false } = {}) {
+  const store = new ExecutionStore({ harnessRoot: HARNESS_ROOT, taskId });
+  const targets = [
+    { bindingId: 'fake.work', role: 'work' },
+    { bindingId: 'fake.review', role: 'review' },
+  ];
+  const adapter = adapterName === 'manual'
+    ? new ManualWorkerAdapter()
+    : new FakeWorkerAdapter({ targets, transportStore: store });
+  const statusStore = {
+    load: () => loadStatus(taskId, { persistMigration: false }),
+    saveCas(expectedRevision, nextStatus) {
+      const current = loadStatus(taskId, { persistMigration: false });
+      if (current.stateRevision !== expectedRevision) {
+        throw new Error(`state-cas-conflict: expected=${expectedRevision} actual=${current.stateRevision}`);
+      }
+      const candidate = structuredClone(nextStatus);
+      candidate.stateRevision = expectedRevision;
+      saveStatus(taskId, candidate);
+      return loadStatus(taskId, { persistMigration: false });
+    },
+  };
+  const workflow = {
+    evaluate(status, attempt, job) {
+      return evaluateStageCheck({
+        status, attempt, job,
+        evaluate(snapshot) {
+          return cmdCheck(taskId, { status: snapshot, persist: false });
+        },
+      });
+    },
+    derive(status, evaluation, attempt, job) {
+      return deriveAdvanceTransition({
+        status, attempt, job, evaluation,
+        derive(snapshot, checkResult) {
+          const currentStageData = snapshot.subtasks[snapshot.currentSubtask]?.stages?.[snapshot.currentStage];
+          if (currentStageData) {
+            currentStageData.workerCheckEvidence = {
+              attemptId: attempt.attemptId,
+              leaseToken: attempt.leaseToken,
+              completionEventId: attempt.completionEvidence?.eventId,
+              primarySha256: checkResult.primarySnapshot.sha256,
+              primarySize: checkResult.primarySnapshot.size,
+              passed: true,
+            };
+          }
+          const statusRef = {};
+          const result = cmdAdvance(taskId, {
+            status: snapshot,
+            statusRef,
+            persist: false,
+            checkResult,
+          });
+          if (!result.success) throw new Error('workflow-transition-failed');
+          return { nextStatus: statusRef.current, postCursor: getCurrentStageCursor(statusRef.current), result };
+        },
+      });
+    },
+  };
+  const supervisor = new ExecutionSupervisor({
+    taskId,
+    store,
+    statusStore,
+    adapter,
+    workflow,
+    transaction: alreadyLocked ? callback => callback() : callback => withTaskExecutionLockRetry(taskId, 'worker-transaction', callback),
+  });
+  return { store, adapter, statusStore, supervisor };
+}
+
+function workerRoleForStage(stage) {
+  return getReviewStages().includes(stage) ? 'review' : 'work';
+}
+
+async function cmdWorkerDoctor(taskId, opts = {}) {
+  const { store, adapter } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const status = loadStatus(taskId, { persistMigration: false });
+  const result = {
+    schemaVersion: status.schemaVersion,
+    executionMode: status.execution.mode,
+    capabilities: await adapter.capabilities(),
+    activeJobId: status.execution.activeJobId,
+    activeAttemptId: status.execution.activeAttemptId,
+    pendingOperations: store.listOperations().filter(operation => !['rolled-back', 'workflow-completed'].includes(operation.phase)).length,
+    pendingReceipts: store.listReceipts('inbox').length,
+    phase3Capabilities: 'unavailable',
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWorkerRun(taskId, opts = {}) {
+  const runtime = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const capabilities = await runtime.adapter.capabilities();
+  if (!capabilities.dispatch || !capabilities.abortableDispatch || !capabilities.settleBarrier) {
+    const result = { success: false, status: capabilities.mode === 'manual' ? 'manual-required' : 'capability-unavailable' };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  const nextResult = await withTaskExecutionLock(taskId, 'worker-next', () => cmdNext(taskId, { copy: false }));
+  if (nextResult.error) return { success: false, error: nextResult.error };
+  const status = loadStatus(taskId);
+  const stageData = status.subtasks[status.currentSubtask].stages[status.currentStage];
+  const role = workerRoleForStage(status.currentStage);
+  const promptSnapshot = getFileSnapshot(nextResult.promptPath);
+  const { supervisor } = runtime;
+  const prepared = await supervisor.prepare({
+    taskId,
+    subtaskId: status.currentSubtask,
+    stage: status.currentStage,
+    round: getRoundForStage(status, status.currentSubtask, status.currentStage),
+    expectedStageRevision: status.stageRevision,
+    role,
+    targetBinding: `${opts.adapter === 'manual' ? 'manual' : 'fake'}.${role}`,
+    promptPath: nextResult.promptPath,
+    promptSha256: promptSnapshot.sha256,
+    primaryReportPath: stageData.primaryReportPath,
+    outputBaseline: stageData.outputBaseline,
+  });
+  const dispatched = await supervisor.dispatch(prepared.operationId, {
+    timeoutMs: Number(opts['dispatch-timeout-ms'] || 30_000),
+  });
+  if (dispatched.status !== 'dispatch-submitted') {
+    const result = { success: false, prepared, dispatched };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  const runTimeoutMs = Number(opts['run-timeout-ms'] || 300_000);
+  const pollMs = Number(opts['poll-ms'] || 100);
+  if (!Number.isInteger(runTimeoutMs) || runTimeoutMs <= 0) throw new Error('--run-timeout-ms must be a positive integer');
+  if (!Number.isInteger(pollMs) || pollMs <= 0) throw new Error('--poll-ms must be a positive integer');
+  const deadline = Date.now() + runTimeoutMs;
+  let pumped = { status: 'dispatch-submitted' };
+  const terminal = new Set(['workflow-completed', 'failed', 'cancelled', 'abandoned', 'idle']);
+  const stops = new Set(['check-blocked', 'sequence-gap', 'dispatch-uncertain']);
+  while (Date.now() < deadline) {
+    pumped = await supervisor.pumpOnce();
+    if (terminal.has(pumped.status) || stops.has(pumped.status)) break;
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+  if (Date.now() >= deadline && !terminal.has(pumped.status) && !stops.has(pumped.status)) {
+    pumped = { status: 'run-timeout' };
+  }
+  const success = terminal.has(pumped.status);
+  const result = {
+    success,
+    operationId: prepared.operationId,
+    jobId: prepared.job.jobId,
+    attemptId: prepared.attempt.attemptId,
+    dispatched,
+    final: pumped,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWorkerPump(taskId, opts = {}) {
+  const { supervisor } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const result = await supervisor.pumpOnce();
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerJobs(taskId, opts = {}) {
+  const { store } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const status = loadStatus(taskId, { persistMigration: false });
+  const result = {
+    activeJob: status.execution.activeJobId ? store.readJob(status.execution.activeJobId) : null,
+    activeAttempt: status.execution.activeAttemptId ? store.readAttempt(status.execution.activeAttemptId) : null,
+    operations: store.listOperations(),
+  };
+  console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWorkerRetry(taskId, opts = {}) {
+  if (!opts.job) throw new Error('--job required');
+  const { supervisor } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const prepared = await supervisor.retry(opts.job);
+  const dispatched = await supervisor.dispatch(prepared.operationId, {
+    timeoutMs: Number(opts['dispatch-timeout-ms'] || 30_000),
+  });
+  const result = { ...prepared, dispatched, success: dispatched.status === 'dispatch-submitted' };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWorkerCancel(taskId, opts = {}) {
+  for (const field of ['job', 'attempt', 'lease-token']) {
+    if (!opts[field]) throw new Error(`--${field} required`);
+  }
+  const { supervisor } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const result = await supervisor.cancel({
+    jobId: opts.job,
+    attemptId: opts.attempt,
+    leaseToken: opts['lease-token'],
+  });
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWorkerReconcile(taskId, opts = {}) {
+  if (!opts.attempt) throw new Error('--attempt required');
+  if (!opts.decision) throw new Error('--decision required');
+  const { supervisor } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  const result = await supervisor.reconcile(opts.attempt, opts.decision, {
+    confirmTargetQuiescent: opts['confirm-target-quiescent'] === true || opts['confirm-target-quiescent'] === 'true',
+    confirmPromptNotVisible: opts['confirm-prompt-not-visible'] === true || opts['confirm-prompt-not-visible'] === 'true',
+    confirmPromptNotRunning: opts['confirm-prompt-not-running'] === true || opts['confirm-prompt-not-running'] === 'true',
+    reason: opts.reason,
+    residualRisk: opts['residual-risk'],
+    operator: opts.operator || process.env.USER || 'cli',
+  });
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWorkerTakeover(taskId, reason) {
+  const { supervisor } = createWorkerRuntime(taskId, { alreadyLocked: true });
+  return supervisor.takeover(reason);
 }
 
 // ---------------------------------------------------------------------------
 // Main dispatcher
 // ---------------------------------------------------------------------------
-function main() {
+async function main() {
   const { command, positional, opts } = parseArgs(process.argv);
   const taskId = positional[0];
 
   try {
     // Load workflow config for any command that needs it
     const commandsNeedingConfig = ['init', 'next', 'step', 'current', 'check', 'advance', 'status', 'summary',
-      'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief'];
+      'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief',
+      'doctor', 'run', 'pump', 'jobs', 'retry', 'cancel', 'reconcile'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
     }
 
     let commandResult;
-    const dispatch = () => {
+    const dispatch = async () => {
+      if (opts.takeover === true || opts.takeover === 'true') {
+        if (!MANUAL_PROGRESS_COMMANDS.has(command)) throw new Error('--takeover only applies to manual progress commands');
+        await cmdWorkerTakeover(taskId, opts.reason);
+      }
       assertNoActiveExecution(taskId, command);
       switch (command) {
       case 'init': {
@@ -2797,6 +3061,41 @@ function main() {
         cmdBrief(taskId);
         break;
       }
+      case 'doctor': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWorkerDoctor(taskId, { adapter: opts.adapter || 'fake' });
+        break;
+      }
+      case 'run': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWorkerRun(taskId, { ...opts, adapter: opts.adapter || 'fake' });
+        break;
+      }
+      case 'pump': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWorkerPump(taskId, { adapter: opts.adapter || 'fake' });
+        break;
+      }
+      case 'jobs': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerJobs(taskId, { ...opts, adapter: opts.adapter || 'fake' });
+        break;
+      }
+      case 'retry': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWorkerRetry(taskId, { ...opts, adapter: opts.adapter || 'fake' });
+        break;
+      }
+      case 'cancel': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWorkerCancel(taskId, { ...opts, adapter: opts.adapter || 'fake' });
+        break;
+      }
+      case 'reconcile': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWorkerReconcile(taskId, { ...opts, adapter: opts.adapter || 'fake' });
+        break;
+      }
       default:
         console.error(`Unknown command: ${command}`);
         printUsage();
@@ -2805,9 +3104,9 @@ function main() {
     };
 
     if (taskId && MANUAL_PROGRESS_COMMANDS.has(command)) {
-      withTaskExecutionLock(taskId, command, dispatch);
+      await withTaskExecutionLockRetry(taskId, command, dispatch);
     } else {
-      dispatch();
+      await dispatch();
     }
     if (commandResult?.success === false || commandResult?.pass === false || commandResult?.error) {
       process.exitCode = 1;
@@ -2818,4 +3117,7 @@ function main() {
   }
 }
 
-main();
+main().catch(err => {
+  console.error(`❌ Error: ${err.message}`);
+  process.exitCode = 1;
+});
