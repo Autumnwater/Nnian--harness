@@ -1,0 +1,287 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+
+const stableValue = value => {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => [key, stableValue(value[key])])
+    );
+  }
+  return value;
+};
+
+export const canonicalPayloadHash = value => createHash('sha256')
+  .update(JSON.stringify(stableValue(value)))
+  .digest('hex');
+
+const ensureDir = directory => fs.mkdirSync(directory, { recursive: true });
+
+const fsyncDirectory = directory => {
+  const fd = fs.openSync(directory, 'r');
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+
+const atomicWriteJson = (filePath, value, faultInjector) => {
+  const directory = path.dirname(filePath);
+  ensureDir(directory);
+  const tempPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.${randomUUID()}.tmp`);
+  let fd;
+  try {
+    fd = fs.openSync(tempPath, 'wx', 0o600);
+    fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    faultInjector?.('before-json-rename', { filePath, tempPath });
+    fs.renameSync(tempPath, filePath);
+    fsyncDirectory(directory);
+    faultInjector?.('after-json-rename', { filePath });
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // A stale temp file is never authoritative and can be ignored by recovery.
+    }
+  }
+};
+
+const readJson = filePath => {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`corrupt-json-record: ${filePath}: ${error.message}`);
+  }
+};
+
+const listJsonFiles = directory => {
+  if (!fs.existsSync(directory)) return [];
+  const output = [];
+  const visit = current => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(entryPath);
+      else if (entry.isFile() && entry.name.endsWith('.json')) output.push(entryPath);
+    }
+  };
+  visit(directory);
+  return output.sort();
+};
+
+export class ExecutionStore {
+  constructor({ harnessRoot, taskId, faultInjector = null }) {
+    if (!harnessRoot || !taskId) throw new Error('harnessRoot and taskId are required');
+    this.taskId = taskId;
+    this.faultInjector = faultInjector;
+    const runRoot = path.join(harnessRoot, 'runs', taskId);
+    this.paths = {
+      runRoot,
+      operations: path.join(runRoot, 'operations'),
+      jobs: path.join(runRoot, 'jobs'),
+      attempts: path.join(runRoot, 'attempts'),
+      eventsDir: path.join(runRoot, 'events'),
+      eventsFile: path.join(runRoot, 'events', 'worker.jsonl'),
+      eventIndex: path.join(runRoot, 'events', 'index'),
+      leases: path.join(runRoot, 'leases'),
+      applications: path.join(runRoot, 'receipt-applications'),
+      receipts: path.join(runRoot, 'receipts'),
+    };
+  }
+
+  recordPath(kind, id) {
+    const directory = this.paths[kind];
+    if (!directory) throw new Error(`unknown-record-kind: ${kind}`);
+    return path.join(directory, `${id}.json`);
+  }
+
+  writeRecord(kind, id, value) {
+    atomicWriteJson(this.recordPath(kind, id), value, this.faultInjector);
+    return value;
+  }
+
+  readRecord(kind, id) {
+    return readJson(this.recordPath(kind, id));
+  }
+
+  writeJob(job) {
+    if (!job?.jobId) throw new Error('jobId is required');
+    return this.writeRecord('jobs', job.jobId, job);
+  }
+
+  readJob(jobId) {
+    return this.readRecord('jobs', jobId);
+  }
+
+  writeAttempt(attempt) {
+    if (!attempt?.attemptId) throw new Error('attemptId is required');
+    return this.writeRecord('attempts', attempt.attemptId, attempt);
+  }
+
+  readAttempt(attemptId) {
+    return this.readRecord('attempts', attemptId);
+  }
+
+  writeOperation(operation) {
+    if (!operation?.operationId || !operation?.payloadHash) {
+      throw new Error('operationId and payloadHash are required');
+    }
+    const existing = this.readOperation(operation.operationId);
+    if (existing && existing.payloadHash !== operation.payloadHash) {
+      throw new Error(`operation-payload-conflict: ${operation.operationId}`);
+    }
+    return this.writeRecord('operations', operation.operationId, operation);
+  }
+
+  readOperation(operationId) {
+    return this.readRecord('operations', operationId);
+  }
+
+  listOperations() {
+    return listJsonFiles(this.paths.operations).map(readJson);
+  }
+
+  writeLease(lease) {
+    if (!lease?.bindingId) throw new Error('bindingId is required');
+    return this.writeRecord('leases', lease.bindingId, lease);
+  }
+
+  readLease(bindingId) {
+    return this.readRecord('leases', bindingId);
+  }
+
+  releaseLease(bindingId, expected) {
+    const filePath = this.recordPath('leases', bindingId);
+    const lease = readJson(filePath);
+    if (!lease) return false;
+    const fields = ['operationId', 'jobId', 'attemptId', 'leaseToken'];
+    if (fields.some(field => lease[field] !== expected?.[field])) return false;
+    fs.unlinkSync(filePath);
+    fsyncDirectory(path.dirname(filePath));
+    return true;
+  }
+
+  receiptPath(bucket, attemptId, eventId) {
+    if (!['inbox', 'processed', 'rejected'].includes(bucket)) {
+      throw new Error(`invalid-receipt-bucket: ${bucket}`);
+    }
+    return path.join(this.paths.receipts, bucket, attemptId, `${eventId}.json`);
+  }
+
+  publishReceipt(receipt) {
+    if (!receipt?.attemptId || !receipt?.eventId) throw new Error('attemptId and eventId are required');
+    const filePath = this.receiptPath('inbox', receipt.attemptId, receipt.eventId);
+    const payloadHash = canonicalPayloadHash(receipt);
+    const existing = readJson(filePath);
+    if (existing) {
+      if (canonicalPayloadHash(existing) !== payloadHash) {
+        throw new Error(`event-id-collision: ${receipt.eventId}`);
+      }
+      return { status: 'duplicate', payloadHash };
+    }
+    atomicWriteJson(filePath, receipt, this.faultInjector);
+    return { status: 'published', payloadHash };
+  }
+
+  listReceipts(bucket) {
+    const directory = path.join(this.paths.receipts, bucket);
+    return listJsonFiles(directory).map(filePath => ({ filePath, receipt: readJson(filePath) }));
+  }
+
+  readReceiptApplication(attemptId, eventId) {
+    return readJson(path.join(this.paths.applications, attemptId, `${eventId}.json`));
+  }
+
+  writeReceiptApplication(attemptId, eventId, application) {
+    const filePath = path.join(this.paths.applications, attemptId, `${eventId}.json`);
+    const existing = readJson(filePath);
+    if (existing && existing.payloadHash !== application.payloadHash) {
+      throw new Error(`receipt-application-conflict: ${eventId}`);
+    }
+    atomicWriteJson(filePath, application, this.faultInjector);
+    return application;
+  }
+
+  finalizeReceipt(attemptId, eventId, destination) {
+    if (!['processed', 'rejected'].includes(destination)) {
+      throw new Error(`invalid-final-receipt-bucket: ${destination}`);
+    }
+    const source = this.receiptPath('inbox', attemptId, eventId);
+    const target = this.receiptPath(destination, attemptId, eventId);
+    if (!fs.existsSync(source)) {
+      if (fs.existsSync(target)) return { finalized: false, alreadyFinalized: true };
+      throw new Error(`receipt-not-found: ${attemptId}/${eventId}`);
+    }
+    ensureDir(path.dirname(target));
+    if (fs.existsSync(target)) {
+      if (canonicalPayloadHash(readJson(source)) !== canonicalPayloadHash(readJson(target))) {
+        throw new Error(`receipt-finalize-conflict: ${eventId}`);
+      }
+      fs.unlinkSync(source);
+    } else {
+      fs.renameSync(source, target);
+    }
+    fsyncDirectory(path.dirname(source));
+    fsyncDirectory(path.dirname(target));
+    return { finalized: true, destination };
+  }
+
+  recoverEventJournal() {
+    const filePath = this.paths.eventsFile;
+    if (!fs.existsSync(filePath)) return { truncated: false };
+    const contents = fs.readFileSync(filePath);
+    if (contents.length === 0 || contents.at(-1) === 0x0a) return { truncated: false };
+    const lastNewline = contents.lastIndexOf(0x0a);
+    const validLength = lastNewline < 0 ? 0 : lastNewline + 1;
+    const fd = fs.openSync(filePath, 'r+');
+    try {
+      fs.ftruncateSync(fd, validLength);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return { truncated: true, removedBytes: contents.length - validLength };
+  }
+
+  readEvents() {
+    this.recoverEventJournal();
+    if (!fs.existsSync(this.paths.eventsFile)) return [];
+    const content = fs.readFileSync(this.paths.eventsFile, 'utf8').trim();
+    if (!content) return [];
+    return content.split('\n').map(line => JSON.parse(line));
+  }
+
+  appendEvent(event) {
+    if (!event?.eventId) throw new Error('eventId is required');
+    this.recoverEventJournal();
+    const existing = this.readEvents().find(item => item.eventId === event.eventId);
+    const indexPath = path.join(this.paths.eventIndex, `${event.eventId}.json`);
+    if (existing) {
+      if (canonicalPayloadHash(existing) !== canonicalPayloadHash(event)) {
+        throw new Error(`event-id-collision: ${event.eventId}`);
+      }
+      if (!fs.existsSync(indexPath)) {
+        atomicWriteJson(indexPath, { eventId: event.eventId, payloadHash: canonicalPayloadHash(event) }, this.faultInjector);
+      }
+      return { appended: false, eventId: event.eventId };
+    }
+
+    ensureDir(this.paths.eventsDir);
+    const fd = fs.openSync(this.paths.eventsFile, 'a', 0o600);
+    try {
+      fs.writeSync(fd, `${JSON.stringify(event)}\n`, undefined, 'utf8');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    this.faultInjector?.('after-event-append', { eventId: event.eventId });
+    atomicWriteJson(indexPath, { eventId: event.eventId, payloadHash: canonicalPayloadHash(event) }, this.faultInjector);
+    return { appended: true, eventId: event.eventId };
+  }
+}

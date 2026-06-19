@@ -218,7 +218,7 @@ export const createEvent = ({ kind, source, attempt, eventId, timestamp, occurre
 
 export class ManualWorkerAdapter {
   async capabilities() {
-    return { dispatch: false, cancel: false, mode: 'manual' };
+    return { dispatch: false, cancel: false, abortableDispatch: false, settleBarrier: false, mode: 'manual' };
   }
 
   async discoverTargets() {
@@ -241,16 +241,21 @@ export class ManualWorkerAdapter {
   async cancel(attempt) {
     return { status: 'manual-required', attemptId: attempt.attemptId, interrupted: false };
   }
+
+  async settleDispatch(attempt) {
+    return { settled: true, outcome: 'failed-before-side-effect', attemptId: attempt.attemptId };
+  }
 }
 
 export class FakeWorkerAdapter {
-  constructor({ targets = [] } = {}) {
+  constructor({ targets = [], dispatchController = null } = {}) {
     this.targets = targets.map(target => ({ ...target }));
     this.activeAttempts = new Map();
+    this.dispatchController = dispatchController;
   }
 
   async capabilities() {
-    return { dispatch: true, cancel: true, mode: 'fake' };
+    return { dispatch: true, cancel: true, abortableDispatch: true, settleBarrier: true, mode: 'fake' };
   }
 
   async discoverTargets() {
@@ -261,7 +266,7 @@ export class FakeWorkerAdapter {
     return { healthy: this.targets.some(item => item.bindingId === target.bindingId) };
   }
 
-  async dispatch(job, target) {
+  async dispatch(job, target, options = {}) {
     requiredString(target?.bindingId, 'target.bindingId');
     const attempt = job.attempt;
     requiredString(attempt?.jobId, 'job.attempt.jobId');
@@ -279,7 +284,10 @@ export class FakeWorkerAdapter {
       };
     }
 
-    this.activeAttempts.set(target.bindingId, { ...attempt });
+    this.activeAttempts.set(target.bindingId, { ...attempt, operationId: options.operationId || null });
+    if (this.dispatchController?.dispatch) {
+      return this.dispatchController.dispatch(job, target, options);
+    }
     return { status: 'dispatch-submitted', submitted: true, attemptId: attempt.attemptId };
   }
 
@@ -296,5 +304,16 @@ export class FakeWorkerAdapter {
   getActiveAttempt(bindingId) {
     const attempt = this.activeAttempts.get(bindingId);
     return attempt ? { ...attempt } : null;
+  }
+
+  async settleDispatch(attempt, target, options = {}) {
+    if (this.dispatchController?.settle) {
+      return this.dispatchController.settle(attempt, target, options);
+    }
+    const active = this.activeAttempts.get(target.bindingId);
+    if (!active || active.attemptId !== attempt.attemptId || active.leaseToken !== attempt.leaseToken) {
+      return { settled: true, outcome: 'aborted-before-side-effect' };
+    }
+    return { settled: true, outcome: 'submitted' };
   }
 }
