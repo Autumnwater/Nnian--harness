@@ -90,7 +90,7 @@ const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
 };
 
 export class ExecutionSupervisor {
-  constructor({ taskId, store, statusStore, adapter, workflow, clock = isoNow, faultInjector = null, maxClockSkewMs = 60_000, transaction = callback => callback() }) {
+  constructor({ taskId, store, statusStore, adapter, workflow, clock = isoNow, faultInjector = null, maxClockSkewMs = 60_000, transaction = callback => callback(), validatePilotAuthorization = null, onPilotEvent = null, onWorkflowCommitted = null }) {
     this.taskId = required(taskId, 'taskId');
     this.store = store;
     this.statusStore = statusStore;
@@ -100,6 +100,37 @@ export class ExecutionSupervisor {
     this.faultInjector = faultInjector;
     this.maxClockSkewMs = maxClockSkewMs;
     this.transaction = transaction;
+    this.validatePilotAuthorization = validatePilotAuthorization;
+    this.onPilotEvent = onPilotEvent;
+    this.onWorkflowCommitted = onWorkflowCommitted;
+  }
+
+  validatePilot(context, phase, { failClosed = true } = {}) {
+    const authorization = context?.attempt?.pilotAuthorization || context?.job?.pilotAuthorization || context?.operation?.pilotAuthorization || null;
+    if (!authorization || !this.validatePilotAuthorization) return { status: 'not-applicable' };
+    try {
+      this.validatePilotAuthorization(authorization, { ...context, phase });
+      return { status: 'current' };
+    } catch (error) {
+      const result = { status: 'stale-or-drifted', reason: error.message };
+      if (context.operation) {
+        this.store.writeOperation({
+          ...context.operation,
+          pilotAuthorizationAudit: [
+            ...(context.operation.pilotAuthorizationAudit || []),
+            { phase, ...result, checkedAt: this.clock() },
+          ],
+        });
+      }
+      if (failClosed) throw error;
+      return result;
+    }
+  }
+
+  emitPilotEvent(type, context = {}) {
+    const authorization = context?.attempt?.pilotAuthorization || context?.job?.pilotAuthorization || context?.operation?.pilotAuthorization || null;
+    if (!authorization || !this.onPilotEvent) return null;
+    return this.onPilotEvent({ type, authorization, ...context });
   }
 
   inject(point, details = {}) {
@@ -137,6 +168,7 @@ export class ExecutionSupervisor {
     const operationId = randomUUID();
     const capturedBindingIdentity = targetBindingIdentity(target);
     const capturedAdapterIdentity = targetAdapterIdentity(target);
+    const pilotAuthorization = jobInput.pilotAuthorization || null;
     const jobBase = createJob(jobInput);
     const attemptBase = createAttempt({ jobId: jobBase.jobId, lockEpoch: status.execution.lockEpoch });
     let job = {
@@ -148,6 +180,7 @@ export class ExecutionSupervisor {
       target,
       bindingIdentity: capturedBindingIdentity,
       adapterIdentity: capturedAdapterIdentity,
+      ...(pilotAuthorization ? { pilotAuthorization } : {}),
     };
     let attempt = {
       ...attemptBase,
@@ -155,6 +188,7 @@ export class ExecutionSupervisor {
       bindingId: target.bindingId,
       bindingIdentity: capturedBindingIdentity,
       adapterIdentity: capturedAdapterIdentity,
+      ...(pilotAuthorization ? { pilotAuthorization } : {}),
       state: 'prepared',
       transportState: 'prepared',
       dispatchingPersisted: false,
@@ -169,6 +203,7 @@ export class ExecutionSupervisor {
       state: 'pending',
       bindingIdentity: capturedBindingIdentity,
       adapterIdentity: capturedAdapterIdentity,
+      ...(pilotAuthorization ? { pilotAuthorization } : {}),
     };
     const payloads = { job, attempt, lease };
     const payloadHash = canonicalPayloadHash(payloads);
@@ -182,6 +217,7 @@ export class ExecutionSupervisor {
       attemptRef: attemptRef(attemptBase),
       bindingId: target.bindingId,
       payloads,
+      ...(pilotAuthorization ? { pilotAuthorization } : {}),
       createdAt: this.clock(),
     };
     this.store.writeOperation(operation);
@@ -214,6 +250,13 @@ export class ExecutionSupervisor {
     this.store.writeJob(job);
     this.store.writeAttempt(attempt);
     this.store.writeLease({ ...lease, state: 'active' });
+    this.emitPilotEvent('prepared', {
+      status: nextStatus,
+      operation,
+      job,
+      attempt,
+      lease: { ...lease, state: 'active' },
+    });
       return { operationId, job, attempt, target };
     });
   }
@@ -256,6 +299,13 @@ export class ExecutionSupervisor {
         this.store.writeAttempt(commit.attempt);
         this.store.releaseLease(operation.bindingId, { operationId: operation.operationId, ...operation.attemptRef });
         this.store.writeOperation({ ...operation, phase: 'workflow-completed', recoveredAt: this.clock() });
+        this.onWorkflowCommitted?.({
+          job: commit.job,
+          attempt: commit.attempt,
+          postCursor: commit.pilotRoleProgress?.postCursor || marker.details?.postCursor || null,
+          pilotRoleProgress: commit.pilotRoleProgress || null,
+          recovered: true,
+        });
         rolledForward += 1;
         continue;
       }
@@ -274,6 +324,16 @@ export class ExecutionSupervisor {
         status.execution.activeLeaseToken === operation.attemptRef.leaseToken;
       if (refsMatch) {
         const { job, attempt, lease } = operation.payloads;
+        try {
+          this.validatePilot({ status, operation, job, attempt, lease }, 'restart-recovery');
+        } catch (error) {
+          this.store.writeJob({ ...job, executionState: 'operator-required', terminalReason: error.message });
+          this.store.writeAttempt({ ...attempt, state: 'operator-required', terminalReason: error.message });
+          this.store.writeLease({ ...lease, state: 'active' });
+          this.store.writeOperation({ ...this.store.readOperation(operation.operationId), phase: 'pilot-authorization-stale', terminalReason: error.message, recoveredAt: this.clock() });
+          rolledForward += 1;
+          continue;
+        }
         this.store.writeJob({ ...job, executionState: 'prepared' });
         this.store.writeAttempt({ ...attempt, state: 'prepared' });
         this.store.writeLease({ ...lease, state: 'active' });
@@ -330,6 +390,15 @@ export class ExecutionSupervisor {
       if (lease.lockEpoch !== status.execution.lockEpoch || attempt.lockEpoch !== status.execution.lockEpoch) {
         throw new Error('attempt-fence-conflict: lockEpoch');
       }
+      this.validatePilotAuthorization?.(job.pilotAuthorization, {
+        phase: 'dispatch',
+        status,
+        operation,
+        job,
+        attempt,
+        lease,
+      });
+      this.emitPilotEvent('dispatch-started', { status, operation, job, attempt, lease });
       const dispatching = {
         ...attempt,
         state: 'dispatching',
@@ -435,6 +504,13 @@ export class ExecutionSupervisor {
           dispatchSubmittedAt: this.clock(),
         });
         this.store.writeOperation({ ...currentOperation, phase: 'dispatch-submitted' });
+        this.emitPilotEvent('submitted', {
+          status: this.statusStore.load(),
+          operation: currentOperation,
+          job: this.store.readJob(attempt.jobId),
+          attempt: this.store.readAttempt(attempt.attemptId),
+          lease: this.store.readLease(operation.bindingId),
+        });
       });
       return { ...result, status: 'dispatch-submitted' };
     }
@@ -611,8 +687,9 @@ export class ExecutionSupervisor {
         abortRequested: true,
         cancelRequestedAt: this.clock(),
       };
+      const authorization = this.validatePilot(context, 'cancel', { failClosed: false });
       this.store.writeAttempt(pending);
-      this.store.writeOperation({ ...context.operation, cancelRequestedAt: this.clock() });
+      this.store.writeOperation({ ...this.store.readOperation(context.operation.operationId), cancelRequestedAt: this.clock(), pilotAuthorizationAtCancel: authorization });
       return { terminal: false, context: { ...context, attempt: pending } };
     });
     if (claim.terminal) return claim.result;
@@ -633,6 +710,7 @@ export class ExecutionSupervisor {
       const attempt = this.store.readAttempt(attemptId);
       if (!attempt) throw new Error('attempt-not-found');
       const context = this.assertActiveAttempt(attemptRef(attempt));
+      const authorization = this.validatePilot(context, 'reconcile', { failClosed: false });
       if (!['dispatch-uncertain', 'abandon-pending-settle'].includes(attempt.state)) {
         throw new Error('reconcile-not-uncertain');
       }
@@ -645,11 +723,13 @@ export class ExecutionSupervisor {
           reconciliation: { decision, reason, operator: evidence.operator || 'cli', decidedAt: this.clock() },
         });
         this.store.writeOperation({ ...context.operation, phase: 'dispatch-submitted', reconciliationDecision: decision });
+        this.emitPilotEvent('reconciled-sent', { ...context, authorizationStatus: authorization });
         return { status: 'reconciled-sent', attemptId };
       }
       if (decision === 'not-sent') {
         this.reconcileNotSent(attemptId, evidence);
         const refreshed = this.assertActiveAttempt(attemptRef(attempt));
+        this.emitPilotEvent('reconciled-not-sent', { ...refreshed, authorizationStatus: authorization });
         return this.commitTerminalAttempt(refreshed, {
           attemptState: 'reconciled-not-sent',
           jobState: 'reconciled-not-sent',
@@ -682,7 +762,10 @@ export class ExecutionSupervisor {
         throw new Error('reconcile-required');
       }
       if (attempt.transportState === 'transport-in-flight') throw new Error('transport-not-quiesced');
-      return this.commitTerminalAttempt(this.assertActiveAttempt(attemptRef(attempt)), {
+      const context = this.assertActiveAttempt(attemptRef(attempt));
+      const authorization = this.validatePilot(context, 'takeover', { failClosed: false });
+      this.emitPilotEvent('takeover', { ...context, authorizationStatus: authorization });
+      return this.commitTerminalAttempt(context, {
         attemptState: 'taken-over', jobState: 'taken-over', action: 'worker-takeover', reason,
       });
     });
@@ -705,6 +788,17 @@ export class ExecutionSupervisor {
       }
       if (!safePreDispatchFailure && !safeNotSent) throw new Error('retry-not-allowed');
 
+      const previousOperation = this.store.readOperation(previousAttempt.operationId);
+      const previousLease = this.store.readLease(previousAttempt.bindingId);
+      this.validatePilot({ status, operation: previousOperation, job: previousJob, attempt: previousAttempt, lease: previousLease }, 'retry');
+      this.emitPilotEvent(safePreDispatchFailure ? 'safe-retry-check' : 'not-sent-retry-check', {
+        status,
+        operation: previousOperation,
+        job: previousJob,
+        attempt: previousAttempt,
+        lease: previousLease,
+      });
+
       const operationId = randomUUID();
       const attemptBase = createAttempt({ jobId, lockEpoch: status.execution.lockEpoch });
       const attempt = {
@@ -721,6 +815,9 @@ export class ExecutionSupervisor {
         lastSequence: 0,
         appliedEventIds: [],
         retryOfAttemptId: previousAttempt.attemptId,
+        ...(previousAttempt.pilotAuthorization || previousJob.pilotAuthorization
+          ? { pilotAuthorization: previousAttempt.pilotAuthorization || previousJob.pilotAuthorization }
+          : {}),
       };
       const job = {
         ...previousJob,
@@ -729,6 +826,7 @@ export class ExecutionSupervisor {
         attemptIds: [...new Set([...(previousJob.attemptIds || [previousAttempt.attemptId]), attempt.attemptId])],
         executionState: 'prepared',
         workflowState: 'pending',
+        ...(previousJob.pilotAuthorization ? { pilotAuthorization: previousJob.pilotAuthorization } : {}),
       };
       const lease = {
         ...createLease({ bindingId: attempt.bindingId, attempt }),
@@ -736,6 +834,7 @@ export class ExecutionSupervisor {
         state: 'pending',
         bindingIdentity: attempt.bindingIdentity || null,
         adapterIdentity: attempt.adapterIdentity || null,
+        ...(attempt.pilotAuthorization ? { pilotAuthorization: attempt.pilotAuthorization } : {}),
       };
       const payloads = { job, attempt, lease };
       const operation = {
@@ -749,6 +848,7 @@ export class ExecutionSupervisor {
         bindingId: attempt.bindingId,
         payloads,
         previousJob,
+        ...(attempt.pilotAuthorization ? { pilotAuthorization: attempt.pilotAuthorization } : {}),
         createdAt: this.clock(),
       };
       this.store.writeOperation(operation);
@@ -770,6 +870,13 @@ export class ExecutionSupervisor {
       this.inject('after-retry-status-commit', { operationId });
       this.store.writeLease({ ...lease, state: 'active' });
       this.store.writeOperation({ ...operation, phase: 'committed' });
+      this.emitPilotEvent(safePreDispatchFailure ? 'safe-retry-prepared' : 'not-sent-retry-prepared', {
+        status: nextStatus,
+        operation,
+        job,
+        attempt,
+        lease,
+      });
       return { status: 'retry-prepared', operationId, job, attempt };
     });
   }
@@ -1068,6 +1175,18 @@ export class ExecutionSupervisor {
     const completedJob = { ...job, workflowState: 'workflow-completed', workflowCompletedAt: this.clock() };
     const completedAttempt = { ...attempt, workflowState: 'workflow-completed' };
     const operation = this.store.readOperation(attempt.operationId);
+    const pilotAuthorization = attempt.pilotAuthorization || job.pilotAuthorization || null;
+    const pilotRoleProgress = pilotAuthorization ? {
+      role: pilotAuthorization.role,
+      operationId: attempt.operationId,
+      jobId: job.jobId,
+      attemptId: attempt.attemptId,
+      leaseToken: attempt.leaseToken,
+      completionEventId: attempt.completionEvidence.eventId,
+      outputHash: evaluation?.primarySnapshot?.sha256 || '',
+      postCursor: transition.postCursor,
+      expectedStageRevision: pilotAuthorization.expectedStageRevision,
+    } : null;
     this.store.writeOperation({
       ...operation,
       phase: 'workflow-committing',
@@ -1075,10 +1194,20 @@ export class ExecutionSupervisor {
         completionEventId: attempt.completionEvidence.eventId,
         job: completedJob,
         attempt: completedAttempt,
+        ...(pilotRoleProgress ? { pilotRoleProgress } : {}),
       },
     });
     this.statusStore.saveCas(status.stateRevision, nextStatus);
     this.inject('after-workflow-status-cas', { operationId: attempt.operationId });
+    this.onWorkflowCommitted?.({
+      job: completedJob,
+      attempt: completedAttempt,
+      evaluation,
+      preStatus: status,
+      nextStatus,
+      postCursor: transition.postCursor,
+      pilotRoleProgress,
+    });
     this.store.writeJob(completedJob);
     this.store.writeAttempt(completedAttempt);
     this.store.releaseLease(attempt.bindingId, { operationId: attempt.operationId, ...attemptRef(attempt) });

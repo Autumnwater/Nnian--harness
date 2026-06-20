@@ -464,7 +464,7 @@ const MANUAL_PROGRESS_COMMANDS = new Set([
   'init', 'next', 'step', 'check', 'advance', 'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current',
 ]);
 
-const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set(['worker-attach', 'warp-bind-target']);
+const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set(['worker-attach', 'warp-bind-target', 'pilot-allow']);
 
 function assertNoActiveExecution(taskId, command) {
   if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
@@ -2763,6 +2763,8 @@ Examples:
   harness warp-targets W6-A --role work|review [--json]
   harness warp-bind-target W6-A --role work|review --binding <bindingId> --candidate <candidateId> [--respond-fixture]
   harness warp-shadow-send W6-A --role work|review --binding <bindingId> [--message <text>]
+  harness pilot-doctor W6-A [--json]
+  harness pilot-allow W6-A --subtask <subtaskId> --work-stage <stageId> --review-stage <stageId> --roles work,review --reason <text> --expires-at <iso>
 `);
 }
 
@@ -2842,6 +2844,30 @@ function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = fal
     adapter,
     workflow,
     transaction: alreadyLocked ? callback => callback() : callback => withTaskExecutionLockRetry(taskId, 'worker-transaction', callback),
+    validatePilotAuthorization: (authorization, context) => validatePilotAuthorization(taskId, authorization, context),
+    onPilotEvent: event => applyPilotCounterEvent(taskId, event),
+    onWorkflowCommitted: ({ job, attempt, evaluation, postCursor, pilotRoleProgress }) => {
+      const authorization = job.pilotAuthorization || attempt.pilotAuthorization || null;
+      if (!authorization) return;
+      updatePilotRoleCounter(taskId, authorization, authorization.role, progress => {
+        progress.roles[authorization.role] = {
+          state: 'completed',
+          jobId: job.jobId,
+          attemptId: attempt.attemptId,
+          leaseToken: attempt.leaseToken,
+          completedAt: new Date().toISOString(),
+          operationId: attempt.operationId,
+          completionEventId: attempt.completionEvidence?.eventId || pilotRoleProgress?.completionEventId || null,
+          outputHash: evaluation?.primarySnapshot?.sha256 || pilotRoleProgress?.outputHash || '',
+          advancedToStage: postCursor?.stage || null,
+        };
+        if (authorization.role === 'work') {
+          progress.workStageRevision = authorization.expectedStageRevision;
+        } else if (authorization.role === 'review') {
+          progress.reviewStageRevision = authorization.expectedStageRevision;
+        }
+      });
+    },
   });
   return { store, adapter, statusStore, supervisor };
 }
@@ -2888,6 +2914,399 @@ function isWarpProductionTestTask(taskId, opts = {}) {
 
 function workerRoleForStage(stage) {
   return getReviewStages().includes(stage) ? 'review' : 'work';
+}
+
+const stableValue = value => {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map(key => {
+        if (value[key] === undefined) return null;
+        return [key, stableValue(value[key])];
+      }).filter(([, value]) => value !== undefined)
+    );
+  }
+  return value;
+};
+
+const stableHash = value => `sha256:${createHash('sha256').update(JSON.stringify(stableValue(value))).digest('hex')}`;
+
+function pilotAllowlistPath(taskId) {
+  return path.join(HARNESS_ROOT, 'runs', taskId, 'pilot', 'allowlist.json');
+}
+
+function pilotRoleProgressPath(taskId, pilotUnitId) {
+  return path.join(HARNESS_ROOT, 'runs', taskId, 'pilot', pilotUnitId, 'roles.json');
+}
+
+function readPilotAllowlist(taskId) {
+  return readJSON(pilotAllowlistPath(taskId));
+}
+
+function hashPilotAllowlist(allowlist) {
+  if (!allowlist) return null;
+  const { allowlistHash, ...rest } = allowlist;
+  return stableHash(rest);
+}
+
+function writePilotAllowlist(taskId, allowlist) {
+  const candidate = { ...allowlist, allowlistHash: null };
+  const withHash = { ...candidate, allowlistHash: hashPilotAllowlist(candidate) };
+  writeJSON(pilotAllowlistPath(taskId), withHash);
+  return withHash;
+}
+
+function readPilotRoleProgress(taskId, pilotUnitId) {
+  return readJSON(pilotRoleProgressPath(taskId, pilotUnitId));
+}
+
+function writePilotRoleProgress(taskId, pilotUnitId, progress) {
+  writeJSON(pilotRoleProgressPath(taskId, pilotUnitId), progress);
+  return progress;
+}
+
+function classifyPilotStage(stageId) {
+  const stageConfig = getStageConfig(stageId);
+  if (!stageConfig) throw new Error(`unknown-pilot-stage: ${stageId}`);
+  const normalized = String(stageId).toLowerCase();
+  const requiredSkill = String(stageConfig.requiredSkill || '').toLowerCase();
+  const label = String(stageConfig.label || '').toLowerCase();
+  const delivery = normalized === 'delivery' || requiredSkill.includes('delivery') || label.includes('交付');
+  const acceptance = normalized.includes('accept') || label.includes('验收');
+  const commitCheckpoint = normalized.includes('commit') || label.includes('commit');
+  const push = normalized.includes('push');
+  const tag = normalized.includes('tag');
+  const done = normalized === 'done';
+  const irreversible = delivery || acceptance || commitCheckpoint || push || tag || done;
+  return {
+    stageId,
+    source: 'canonical-workflow-metadata',
+    delivery,
+    acceptance,
+    commitCheckpoint,
+    push,
+    tag,
+    done,
+    irreversible,
+  };
+}
+
+function assertPilotStagePair({ workStageId, reviewStageId }) {
+  const workClassification = classifyPilotStage(workStageId);
+  const reviewClassification = classifyPilotStage(reviewStageId);
+  const blocked = [workClassification, reviewClassification].find(item => item.irreversible);
+  if (blocked) throw new Error(`pilot-stage-not-allowed: ${blocked.stageId}`);
+  if (!getImplementerStages().includes(workStageId)) throw new Error(`pilot-work-stage-not-implementer: ${workStageId}`);
+  if (!getReviewStages().includes(reviewStageId)) throw new Error(`pilot-review-stage-not-review: ${reviewStageId}`);
+  if (getStageConfig(workStageId)?.nextStage !== reviewStageId) {
+    throw new Error('pilot-stage-pair-not-canonical');
+  }
+  const derivedClassification = {
+    source: 'canonical-workflow-metadata',
+    workStage: workClassification,
+    reviewStage: reviewClassification,
+  };
+  return {
+    ...derivedClassification,
+    classificationHash: stableHash(derivedClassification),
+  };
+}
+
+function findPilotUnit(allowlist, pilotUnitId) {
+  return (allowlist?.allowedPilotUnits || []).find(unit => unit.pilotUnitId === pilotUnitId) || null;
+}
+
+function assertCurrentAllowlistHash(taskId, allowlist) {
+  const actual = hashPilotAllowlist(allowlist);
+  if (!allowlist || allowlist.allowlistHash !== actual) {
+    throw new Error('pilot-allowlist-hash-drift');
+  }
+  return actual;
+}
+
+function assertPilotAllowlistFresh(allowlist, nowMs = Date.now()) {
+  const expiresAtMs = Date.parse(allowlist?.expiresAt);
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) {
+    throw new Error('pilot-allowlist-expired');
+  }
+}
+
+function assertPilotUnitCurrent(taskId, { allowlist, unit, role, status, store = null, persistRoleRecovery = true }) {
+  assertCurrentAllowlistHash(taskId, allowlist);
+  assertPilotAllowlistFresh(allowlist);
+  const classification = assertPilotStagePair(unit);
+  if (classification.classificationHash !== unit.derivedClassification?.classificationHash) {
+    throw new Error('pilot-classification-drift');
+  }
+  if (!['work', 'review'].includes(role) || !(unit.roles || []).includes(role)) {
+    throw new Error('pilot-role-not-allowed');
+  }
+  if (status.currentSubtask !== unit.subtaskId) throw new Error('pilot-subtask-cursor-conflict');
+  const expectedStage = role === 'work' ? unit.workStageId : unit.reviewStageId;
+  if (status.currentStage !== expectedStage) throw new Error('pilot-stage-cursor-conflict');
+  if (role === 'review') {
+    const progress = store
+      ? recoverPilotRoleProgress(taskId, unit, status, store, { persist: persistRoleRecovery })
+      : readPilotRoleProgress(taskId, unit.pilotUnitId);
+    const work = progress?.roles?.work;
+    if (work?.state !== 'completed') throw new Error('pilot-review-work-not-completed');
+    if (work.advancedToStage !== unit.reviewStageId) throw new Error('pilot-review-work-evidence-mismatch');
+    const workJob = store?.readJob(work.jobId);
+    const workAttempt = store?.readAttempt(work.attemptId);
+    const marker = (status.history || []).find(entry =>
+      entry.action === 'worker-workflow-committed' &&
+      entry.details?.operationId === work.operationId &&
+      entry.details?.completionEventId === work.completionEventId
+    );
+    if (!workJob || !workAttempt || !marker ||
+        workJob.workflowState !== 'workflow-completed' ||
+        workAttempt.workflowState !== 'workflow-completed' ||
+        workAttempt.leaseToken !== work.leaseToken ||
+        workAttempt.pilotAuthorization?.pilotUnitId !== unit.pilotUnitId ||
+        workAttempt.pilotAuthorization?.role !== 'work' ||
+        !work.outputHash) {
+      throw new Error('pilot-review-work-authority-mismatch');
+    }
+  }
+  const counters = readPilotRoleProgress(taskId, unit.pilotUnitId)?.attemptCounters?.[role];
+  for (const [counter, limitField] of [
+    ['prepared', 'maxPreparedAttemptsPerRole'],
+    ['dispatchStarted', 'maxDispatchAttemptsPerRole'],
+    ['submitted', 'maxSubmittedAttemptsPerRole'],
+  ]) {
+    const observed = Number(counters?.[counter] || 0);
+    const limit = Number(unit.attemptBudget?.[limitField]);
+    if (!Number.isInteger(limit) || limit < 0) throw new Error(`invalid-pilot-attempt-budget: ${limitField}`);
+    if (observed >= limit) throw new Error(`pilot-${counter}-attempt-budget-exhausted`);
+  }
+  return classification;
+}
+
+function createPilotAuthorizationSnapshot(taskId, { allowlist, unit, role, status, store = null }) {
+  const allowlistHash = assertCurrentAllowlistHash(taskId, allowlist);
+  const classification = assertPilotUnitCurrent(taskId, { allowlist, unit, role, status, store });
+  const expectedStageId = role === 'work' ? unit.workStageId : unit.reviewStageId;
+  return {
+    allowlistId: allowlist.allowlistId,
+    allowlistHash,
+    pilotUnitId: unit.pilotUnitId,
+    taskId,
+    subtaskId: unit.subtaskId,
+    role,
+    workStageId: unit.workStageId,
+    reviewStageId: unit.reviewStageId,
+    expectedStageId,
+    expectedStageRevision: status.stageRevision,
+    expiresAt: allowlist.expiresAt,
+    attemptBudget: unit.attemptBudget,
+    derivedClassificationHash: classification.classificationHash,
+    reasonHash: stableHash(allowlist.reason || ''),
+  };
+}
+
+function validatePilotAuthorization(taskId, authorization, { status }) {
+  if (!authorization) return true;
+  const allowlist = readPilotAllowlist(taskId);
+  assertCurrentAllowlistHash(taskId, allowlist);
+  if (allowlist.allowlistId !== authorization.allowlistId ||
+      allowlist.allowlistHash !== authorization.allowlistHash) {
+    throw new Error('pilot-allowlist-hash-drift');
+  }
+  assertPilotAllowlistFresh(allowlist);
+  const unit = findPilotUnit(allowlist, authorization.pilotUnitId);
+  if (!unit) throw new Error('pilot-unit-not-allowed');
+  const classification = assertPilotStagePair(unit);
+  if (classification.classificationHash !== authorization.derivedClassificationHash) {
+    throw new Error('pilot-classification-drift');
+  }
+  if (status.currentSubtask !== authorization.subtaskId ||
+      status.currentStage !== authorization.expectedStageId ||
+      status.stageRevision !== authorization.expectedStageRevision) {
+    throw new Error('pilot-stage-cursor-conflict');
+  }
+  return true;
+}
+
+function updatePilotRoleCounter(taskId, authorization, role, updater) {
+  if (!authorization) return null;
+  const progressPath = pilotRoleProgressPath(taskId, authorization.pilotUnitId);
+  const existing = readJSON(progressPath) || {
+    protocolVersion: 1,
+    kind: 'phase5.role-progress',
+    taskId,
+    pilotUnitId: authorization.pilotUnitId,
+    subtaskId: authorization.subtaskId,
+    workStageId: authorization.workStageId,
+    reviewStageId: authorization.reviewStageId,
+    roles: {
+      work: { state: 'not-started' },
+      review: { state: 'not-started' },
+    },
+    attemptCounters: {
+      work: { prepared: 0, dispatchStarted: 0, submitted: 0, safeRetries: 0, notSentRetries: 0 },
+      review: { prepared: 0, dispatchStarted: 0, submitted: 0, safeRetries: 0, notSentRetries: 0 },
+    },
+  };
+  const next = structuredClone(existing);
+  next.attemptCounters[role] = next.attemptCounters[role] || { prepared: 0, dispatchStarted: 0, submitted: 0, safeRetries: 0, notSentRetries: 0 };
+  updater(next);
+  writePilotRoleProgress(taskId, authorization.pilotUnitId, next);
+  return next;
+}
+
+function pilotCounterLimit(authorization, field) {
+  const value = Number(authorization?.attemptBudget?.[field]);
+  if (!Number.isInteger(value) || value < 0) throw new Error(`invalid-pilot-attempt-budget: ${field}`);
+  return value;
+}
+
+function applyPilotCounterEvent(taskId, event) {
+  const { authorization, type } = event;
+  if (!authorization) return null;
+  const role = authorization.role;
+  const attemptId = event.attempt?.attemptId || 'unknown-attempt';
+  const operationId = event.operation?.operationId || event.attempt?.operationId || 'unknown-operation';
+  const limits = {
+    prepared: pilotCounterLimit(authorization, 'maxPreparedAttemptsPerRole'),
+    dispatchStarted: pilotCounterLimit(authorization, 'maxDispatchAttemptsPerRole'),
+    submitted: pilotCounterLimit(authorization, 'maxSubmittedAttemptsPerRole'),
+    safeRetries: pilotCounterLimit(authorization, 'maxSafeRetryAttemptsPerRole'),
+    notSentRetries: pilotCounterLimit(authorization, 'maxNotSentRetryAttemptsPerRole'),
+  };
+  const check = (...fields) => {
+    const progress = readPilotRoleProgress(taskId, authorization.pilotUnitId);
+    const counters = progress?.attemptCounters?.[role] || {};
+    for (const field of fields) {
+      if (Number(counters[field] || 0) >= limits[field]) {
+        throw new Error(`pilot-${field}-attempt-budget-exhausted`);
+      }
+    }
+  };
+  if (type === 'safe-retry-check') check('safeRetries', 'prepared');
+  if (type === 'not-sent-retry-check') check('notSentRetries', 'prepared');
+  if (type === 'dispatch-started') check('dispatchStarted', 'submitted');
+
+  const eventKey = `${operationId}:${attemptId}:${type}`;
+  return updatePilotRoleCounter(taskId, authorization, role, progress => {
+    progress.counterEvents = progress.counterEvents || {};
+    if (progress.counterEvents[eventKey]) return;
+    const counters = progress.attemptCounters[role];
+    if (type === 'prepared') counters.prepared += 1;
+    if (type === 'dispatch-started') counters.dispatchStarted += 1;
+    if (type === 'submitted' || type === 'reconciled-sent') {
+      counters.submitted += 1;
+      if (counters.submitted > limits.submitted) {
+        progress.budgetViolation = {
+          type: 'submitted-attempt-budget-exceeded-by-reconciliation',
+          role,
+          attemptId,
+          observed: counters.submitted,
+          limit: limits.submitted,
+        };
+      }
+    }
+    if (type === 'safe-retry-prepared') {
+      counters.safeRetries += 1;
+      counters.prepared += 1;
+    }
+    if (type === 'not-sent-retry-prepared') {
+      counters.notSentRetries += 1;
+      counters.prepared += 1;
+    }
+    if (type === 'prepared' || type === 'safe-retry-prepared' || type === 'not-sent-retry-prepared') {
+      progress.roles[role] = {
+        ...(progress.roles[role] || {}),
+        state: 'prepared',
+        jobId: event.job?.jobId || null,
+        attemptId,
+        leaseToken: event.attempt?.leaseToken || null,
+      };
+    }
+    if (type === 'submitted' || type === 'reconciled-sent') {
+      progress.roles[role] = {
+        ...(progress.roles[role] || {}),
+        state: 'submitted',
+        jobId: event.job?.jobId || null,
+        attemptId,
+        leaseToken: event.attempt?.leaseToken || null,
+      };
+    }
+    progress.counterEvents[eventKey] = { type, attemptId, operationId, recordedAt: new Date().toISOString() };
+  });
+}
+
+function emptyPilotRoleProgress(taskId, unit) {
+  return {
+    protocolVersion: 1,
+    kind: 'phase5.role-progress',
+    taskId,
+    pilotUnitId: unit.pilotUnitId,
+    subtaskId: unit.subtaskId,
+    workStageId: unit.workStageId,
+    reviewStageId: unit.reviewStageId,
+    roles: { work: { state: 'not-started' }, review: { state: 'not-started' } },
+    attemptCounters: {
+      work: { prepared: 0, dispatchStarted: 0, submitted: 0, safeRetries: 0, notSentRetries: 0 },
+      review: { prepared: 0, dispatchStarted: 0, submitted: 0, safeRetries: 0, notSentRetries: 0 },
+    },
+    counterEvents: {},
+  };
+}
+
+function recoverPilotRoleProgress(taskId, unit, status, store, { persist = false } = {}) {
+  const existing = readPilotRoleProgress(taskId, unit.pilotUnitId);
+  const progress = existing ? structuredClone(existing) : emptyPilotRoleProgress(taskId, unit);
+  let changed = !existing;
+  const authoritativeCompletions = new Map();
+  for (const operation of store.listOperations()) {
+    const authorization = operation.pilotAuthorization || operation.payloads?.attempt?.pilotAuthorization || operation.workflowCommit?.attempt?.pilotAuthorization;
+    if (authorization?.pilotUnitId !== unit.pilotUnitId) continue;
+    const commit = operation.workflowCommit;
+    const roleEvidence = commit?.pilotRoleProgress;
+    if (!commit || !roleEvidence || !['work', 'review'].includes(roleEvidence.role)) continue;
+    const marker = (status.history || []).find(entry =>
+      entry.action === 'worker-workflow-committed' &&
+      entry.details?.operationId === operation.operationId &&
+      entry.details?.completionEventId === commit.completionEventId
+    );
+    if (!marker || commit.job?.workflowState !== 'workflow-completed' || commit.attempt?.workflowState !== 'workflow-completed') continue;
+    authoritativeCompletions.set(roleEvidence.role, {
+      state: 'completed',
+      jobId: roleEvidence.jobId,
+      attemptId: roleEvidence.attemptId,
+      leaseToken: roleEvidence.leaseToken,
+      operationId: roleEvidence.operationId,
+      completionEventId: roleEvidence.completionEventId,
+      completedAt: commit.job.workflowCompletedAt || marker.timestamp,
+      outputHash: roleEvidence.outputHash,
+      advancedToStage: roleEvidence.postCursor?.stage || marker.details?.postCursor?.stage || null,
+    });
+  }
+  for (const role of ['work', 'review']) {
+    const authority = authoritativeCompletions.get(role);
+    if (authority && JSON.stringify(progress.roles?.[role]) !== JSON.stringify(authority)) {
+      progress.roles[role] = authority;
+      changed = true;
+    } else if (!authority && progress.roles?.[role]?.state === 'completed') {
+      progress.roles[role] = {
+        ...progress.roles[role],
+        state: 'inconsistent-needs-operator',
+        reason: 'completion-without-authoritative-history-marker',
+      };
+      changed = true;
+    }
+  }
+  if (status.currentStage !== unit.workStageId && status.currentStage !== unit.reviewStageId &&
+      progress.roles.review.state !== 'completed') {
+    progress.roles.review = {
+      ...progress.roles.review,
+      state: 'inconsistent-needs-operator',
+      reason: 'status-beyond-review-without-review-completion',
+    };
+    changed = true;
+  }
+  if (persist && changed) writePilotRoleProgress(taskId, unit.pilotUnitId, progress);
+  return progress;
 }
 
 function bindingDiagnostics(store) {
@@ -2986,16 +3405,171 @@ async function cmdWorkerDoctor(taskId, opts = {}) {
   return result;
 }
 
+function cmdPilotDoctor(taskId, opts = {}) {
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const status = loadStatus(taskId, { persistMigration: false });
+  const allowlist = readPilotAllowlist(taskId);
+  let allowlistStatus = 'missing';
+  let allowlistReason = null;
+  try {
+    if (allowlist) {
+      assertCurrentAllowlistHash(taskId, allowlist);
+      assertPilotAllowlistFresh(allowlist);
+      allowlistStatus = 'available';
+    }
+  } catch (error) {
+    allowlistStatus = 'unavailable';
+    allowlistReason = error.message;
+  }
+  const hookCapabilities = deriveHookCapabilities(store.readCapability('claude-hook'));
+  const warpCapabilities = deriveWarpCapabilities(store.readCapability(WARP_CAPABILITY_NAME), { requireProductionTest: true });
+  const pilotReasons = [];
+  let selectedPilotUnit = null;
+  let selectedRole = null;
+  try {
+    if (status.schemaVersion !== STATUS_SCHEMA_VERSION) throw new Error('schema-version-not-current');
+    if (status.execution.activeJobId || status.execution.activeAttemptId) throw new Error('active-job-conflict');
+    if (!allowlist) throw new Error('pilot-allowlist-missing');
+    assertCurrentAllowlistHash(taskId, allowlist);
+    assertPilotAllowlistFresh(allowlist);
+    selectedPilotUnit = (allowlist.allowedPilotUnits || []).find(unit =>
+      unit.subtaskId === status.currentSubtask && [unit.workStageId, unit.reviewStageId].includes(status.currentStage)
+    );
+    if (!selectedPilotUnit) throw new Error('pilot-unit-not-current');
+    selectedRole = status.currentStage === selectedPilotUnit.workStageId ? 'work' : 'review';
+    assertPilotUnitCurrent(taskId, {
+      allowlist,
+      unit: selectedPilotUnit,
+      role: selectedRole,
+      status,
+      store,
+      persistRoleRecovery: false,
+    });
+    if (hookCapabilities.completionReceiptCapability !== 'available' || hookCapabilities.needsInputCapability !== 'available') {
+      throw new Error('hook-completion-and-needs-input-required');
+    }
+    if (warpCapabilities.phase5ProductionCandidate !== true) throw new Error('phase5-production-candidate-required');
+    const binding = assertFreshBinding(store.listBindings().find(item => item.role === selectedRole));
+    if (!binding.targetBinding?.targetFingerprintHash || !binding.targetBinding?.verifiedAt) throw new Error('warp-target-not-bound');
+  } catch (error) {
+    pilotReasons.push(error.message);
+  }
+  const result = {
+    taskId,
+    schemaVersion: status.schemaVersion,
+    activeJobId: status.execution.activeJobId,
+    activeAttemptId: status.execution.activeAttemptId,
+    currentSubtask: status.currentSubtask,
+    currentStage: status.currentStage,
+    stageRevision: status.stageRevision,
+    allowlistStatus,
+    allowlistReason,
+    allowlist: allowlist ? {
+      allowlistId: allowlist.allowlistId,
+      allowlistHash: allowlist.allowlistHash,
+      expiresAt: allowlist.expiresAt,
+      pilotUnits: (allowlist.allowedPilotUnits || []).map(unit => unit.pilotUnitId),
+    } : null,
+    hookCapabilities,
+    warpCapabilities,
+    bindings: bindingDiagnostics(store),
+    pilotRun: {
+      allowed: pilotReasons.length === 0,
+      reasons: pilotReasons,
+      pilotUnitId: selectedPilotUnit?.pilotUnitId || null,
+      role: selectedRole,
+    },
+  };
+  console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdPilotAllow(taskId, opts = {}) {
+  const subtaskId = opts.subtask;
+  const workStageId = opts['work-stage'];
+  const reviewStageId = opts['review-stage'];
+  const roles = String(opts.roles || '').split(',').map(role => role.trim()).filter(Boolean);
+  const reason = opts.reason;
+  const expiresAt = opts['expires-at'];
+  if (!subtaskId) throw new Error('--subtask required');
+  if (!workStageId) throw new Error('--work-stage required');
+  if (!reviewStageId) throw new Error('--review-stage required');
+  if (roles.join(',') !== 'work,review') throw new Error('--roles must be work,review');
+  if (!reason) throw new Error('--reason required');
+  const expiresAtMs = Date.parse(expiresAt);
+  if (!Number.isFinite(expiresAtMs)) throw new Error('--expires-at must be ISO timestamp');
+  const nowMs = Date.now();
+  if (expiresAtMs <= nowMs) throw new Error('pilot-allowlist-expired');
+  if (expiresAtMs - nowMs > 24 * 60 * 60 * 1000) throw new Error('pilot-allowlist-expiration-too-long');
+
+  const status = loadStatus(taskId, { persistMigration: false });
+  if (status.execution.activeAttemptId || status.execution.activeJobId) throw new Error('active-job-conflict');
+  if (!status.subtasks?.[subtaskId]) throw new Error(`unknown-pilot-subtask: ${subtaskId}`);
+  const classification = assertPilotStagePair({ workStageId, reviewStageId });
+  const pilotUnitId = opts['pilot-unit'] || `${taskId}-${subtaskId}-code-pilot`;
+  const unit = {
+    pilotUnitId,
+    subtaskId,
+    workStageId,
+    reviewStageId,
+    expectedWorkStageRevision: status.currentSubtask === subtaskId && status.currentStage === workStageId ? status.stageRevision : null,
+    expectedReviewStageRevision: status.currentSubtask === subtaskId && status.currentStage === reviewStageId ? status.stageRevision : null,
+    roles,
+    requiresSequentialRoles: true,
+    manualFallbackRequired: true,
+    attemptBudget: {
+      maxPreparedAttemptsPerRole: Number(opts['max-prepared-attempts-per-role'] || 3),
+      maxDispatchAttemptsPerRole: Number(opts['max-dispatch-attempts-per-role'] || 2),
+      maxSubmittedAttemptsPerRole: Number(opts['max-submitted-attempts-per-role'] || 1),
+      maxSafeRetryAttemptsPerRole: Number(opts['max-safe-retry-attempts-per-role'] || 1),
+      maxNotSentRetryAttemptsPerRole: Number(opts['max-not-sent-retry-attempts-per-role'] || 1),
+    },
+    derivedClassification: classification,
+  };
+  const allowlist = writePilotAllowlist(taskId, {
+    protocolVersion: 1,
+    kind: 'phase5.pilot-allowlist',
+    allowlistId: opts['allowlist-id'] || randomUUID(),
+    allowlistHash: null,
+    taskId,
+    createdAt: now(),
+    createdBy: opts.operator || process.env.USER || 'operator',
+    allowedPilotUnits: [unit],
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    reason,
+  });
+  const nextStatus = loadStatus(taskId, { persistMigration: false });
+  addHistory(nextStatus, 'phase5-pilot-allowlist-updated', {
+    allowlistId: allowlist.allowlistId,
+    allowlistHash: allowlist.allowlistHash,
+    pilotUnitId,
+    subtaskId,
+    workStageId,
+    reviewStageId,
+  });
+  saveStatus(taskId, nextStatus);
+  const result = {
+    status: 'allowed',
+    allowlistId: allowlist.allowlistId,
+    allowlistHash: allowlist.allowlistHash,
+    pilotUnitId,
+    expiresAt: allowlist.expiresAt,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 async function cmdWorkerRun(taskId, opts = {}) {
-  if (opts.adapter === 'warp-macos' && !isWarpProductionTestTask(taskId, opts)) {
+  const phase5Pilot = opts['phase5-pilot'] === true || opts['phase5-pilot'] === 'true';
+  if (opts.adapter === 'warp-macos' && !isWarpProductionTestTask(taskId, opts) && !phase5Pilot) {
     const result = { success: false, status: 'warp-macos-production-disabled' };
     console.log(JSON.stringify(result, null, 2));
     return result;
   }
   const runtime = createWorkerRuntime(taskId, {
     adapterName: opts.adapter,
-    productionTest: opts['production-test'] === true || opts['production-test'] === 'true',
-    scratchTask: isWarpProductionTestTask(taskId, opts),
+    productionTest: opts['production-test'] === true || opts['production-test'] === 'true' || phase5Pilot,
+    scratchTask: isWarpProductionTestTask(taskId, opts) || phase5Pilot,
   });
   const capabilities = await runtime.adapter.capabilities();
   if (!capabilities.dispatch || !capabilities.abortableDispatch || !capabilities.settleBarrier) {
@@ -3004,6 +3578,20 @@ async function cmdWorkerRun(taskId, opts = {}) {
     return result;
   }
   if (opts.adapter === 'warp-macos') {
+    if (phase5Pilot) {
+      if (capabilities.phase5ProductionCandidate !== true) {
+        const result = { success: false, status: 'capability-unavailable', reason: 'phase5-production-candidate-required', capabilities };
+        console.log(JSON.stringify(result, null, 2));
+        return result;
+      }
+      for (const flag of ['confirm-real-target', 'confirm-manual-fallback', 'confirm-no-auto-approval']) {
+        if (!(opts[flag] === true || opts[flag] === 'true')) {
+          const result = { success: false, status: 'phase5-confirmation-required', flag };
+          console.log(JSON.stringify(result, null, 2));
+          return result;
+        }
+      }
+    }
     const hookCapabilities = deriveHookCapabilities(runtime.store.readCapability('claude-hook'));
     if (hookCapabilities.completionReceiptCapability !== 'available' ||
         hookCapabilities.needsInputCapability !== 'available') {
@@ -3017,11 +3605,29 @@ async function cmdWorkerRun(taskId, opts = {}) {
       return result;
     }
   }
+  let phase5Preflight = null;
+  if (phase5Pilot) {
+    const status = loadStatus(taskId, { persistMigration: false });
+    const allowlist = readPilotAllowlist(taskId);
+    const pilotUnitId = opts['pilot-unit'];
+    if (!pilotUnitId) throw new Error('--pilot-unit required');
+    const role = opts.role;
+    const unit = findPilotUnit(allowlist, pilotUnitId);
+    if (!unit) throw new Error('pilot-unit-not-allowed');
+    assertPilotUnitCurrent(taskId, { allowlist, unit, role, status, store: runtime.store });
+    phase5Preflight = { allowlist, unit, role };
+  }
   const nextResult = await withTaskExecutionLock(taskId, 'worker-next', () => cmdNext(taskId, { copy: false }));
   if (nextResult.error) return { success: false, error: nextResult.error };
   const status = loadStatus(taskId);
   const stageData = status.subtasks[status.currentSubtask].stages[status.currentStage];
-  const role = workerRoleForStage(status.currentStage);
+  const role = phase5Pilot ? opts.role : workerRoleForStage(status.currentStage);
+  let pilotAuthorization = null;
+  if (phase5Pilot) {
+    const allowlist = readPilotAllowlist(taskId);
+    const unit = findPilotUnit(allowlist, phase5Preflight.unit.pilotUnitId);
+    pilotAuthorization = createPilotAuthorizationSnapshot(taskId, { allowlist, unit, role, status, store: runtime.store });
+  }
   const promptSnapshot = getFileSnapshot(nextResult.promptPath);
   const { supervisor } = runtime;
   const prepared = await supervisor.prepare({
@@ -3038,6 +3644,7 @@ async function cmdWorkerRun(taskId, opts = {}) {
     promptSha256: promptSnapshot.sha256,
     primaryReportPath: stageData.primaryReportPath,
     outputBaseline: stageData.outputBaseline,
+    ...(pilotAuthorization ? { pilotAuthorization } : {}),
   });
   const dispatched = await supervisor.dispatch(prepared.operationId, {
     timeoutMs: Number(opts['dispatch-timeout-ms'] || 30_000),
@@ -3290,7 +3897,7 @@ function cmdWarpDoctor(taskId, opts = {}) {
       targetIdentity: { available: true, requiresWrapperBinding: true, requiresChallenge: true },
       diagnosticEligible: true,
       phase4RunEnabled: opts['enable-production-test'] === true || opts['enable-production-test'] === 'true',
-      phase5ProductionCandidate: false,
+      phase5ProductionCandidate: opts['enable-phase5-candidate'] === true || opts['enable-phase5-candidate'] === 'true',
       reasons: [],
     };
     store.writeCapability(WARP_CAPABILITY_NAME, evidence);
@@ -3568,7 +4175,8 @@ async function main() {
       'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief',
       'doctor', 'run', 'pump', 'jobs', 'retry', 'cancel', 'reconcile',
       'worker-attach', 'worker-bindings', 'worker-challenge', 'worker-receipt',
-      'warp-doctor', 'warp-targets', 'warp-bind-target', 'warp-shadow-send'];
+      'warp-doctor', 'warp-targets', 'warp-bind-target', 'warp-shadow-send',
+      'pilot-doctor', 'pilot-allow'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
     }
@@ -3735,6 +4343,16 @@ async function main() {
       case 'warp-shadow-send': {
         if (!taskId) throw new Error('taskId required');
         commandResult = await cmdWarpShadowSend(taskId, opts);
+        break;
+      }
+      case 'pilot-doctor': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdPilotDoctor(taskId, opts);
+        break;
+      }
+      case 'pilot-allow': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdPilotAllow(taskId, opts);
         break;
       }
       default:

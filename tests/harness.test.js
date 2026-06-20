@@ -106,6 +106,41 @@ function activeSubmittedStatus(taskId, bindingId) {
     : null;
 }
 
+function writeFullHookCapabilityFixture(name = 'phase5-full-hook.json') {
+  const fixture = path.join(TEST_ROOT, name);
+  fs.writeFileSync(fixture, JSON.stringify({
+    hookSource: 'claude-code-hook',
+    hookVersion: 'test-1',
+    completionPhase: 'claude-completed',
+    attemptRefSource: 'wrapper-injected',
+    bindingSessionSource: 'wrapper-injected',
+    needsInputCategorySource: 'hook-payload',
+    needsInputCategory: 'agent-question',
+    kind: 'job.completed',
+    occurredAt: new Date().toISOString(),
+    observedFields: ['kind', 'occurredAt', 'needsInputCategory'],
+  }), 'utf8');
+  return fixture;
+}
+
+function setupVerifiedWarpPilotRole(taskId, role) {
+  const bindingId = `wrapper.${role}`;
+  assert.equal(harness(`worker-attach ${taskId} --role ${role} --binding ${bindingId}`).success, true);
+  const bind = harness(`warp-bind-target ${taskId} --role ${role} --binding ${bindingId} --candidate candidate-${role} --respond-fixture`);
+  assert.equal(bind.success, true, bind.stderr);
+  return JSON.parse(bind.stdout);
+}
+
+function setupPhase5PilotCapabilities(taskId) {
+  assert.equal(harness(`warp-doctor ${taskId} --probe-fixture --enable-production-test --enable-phase5-candidate`).success, true);
+  const fixture = writeFullHookCapabilityFixture(`${taskId}-phase5-full-hook.json`);
+  assert.equal(harness(`worker-challenge ${taskId} --probe-hook-payload ${fixture}`).success, true);
+}
+
+function futureIso(ms = 60 * 60 * 1000) {
+  return new Date(Date.now() + ms).toISOString();
+}
+
 // Helper: create a report file
 function createReport(status, stageId, content) {
   const stage = status.subtasks[status.currentSubtask].stages[stageId];
@@ -2906,6 +2941,152 @@ Expected: Should be fixed
       assert.equal(clipboard.success, false);
       assert.match(clipboard.stderr, /clipboard-dispatch-forbidden/);
       assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
+    });
+  });
+
+  describe('V3 Phase 5: controlled W6 pilot gate', () => {
+    it('keeps real W6 warp run disabled unless the explicit phase5 pilot gate is used', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      setupPhase5PilotCapabilities('W6-A');
+      setupVerifiedWarpPilotRole('W6-A', 'work');
+
+      const run = harness('run W6-A --adapter warp-macos');
+
+      assert.equal(run.success, false);
+      assert.match(run.stdout, /warp-macos-production-disabled/);
+      const status = readStatus('W6-A');
+      assert.equal(status.execution.activeAttemptId, null);
+      assert.equal(status.execution.activeJobId, null);
+    });
+
+    it('derives canonical stage classification and rejects delivery even when operator flags claim it is safe', () => {
+      const taskId = 'PH5-CLASSIFY';
+      assert.equal(harness(`init ${taskId} --force`).success, true);
+
+      const delivery = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage delivery --review-stage done --roles work,review --reason pilot --expires-at ${futureIso()} --delivery false --commitCheckpoint false`);
+
+      assert.equal(delivery.success, false);
+      assert.match(delivery.stderr, /pilot-stage-not-allowed/);
+      assert.equal(fs.existsSync(path.join(HARNESS_DIR, 'runs', taskId, 'pilot', 'allowlist.json')), false);
+    });
+
+    it('captures pilotAuthorization into operation, job, attempt, and lease before phase5 dispatch', () => {
+      const taskId = 'PH5-AUTH';
+      const pilotUnitId = `${taskId}-W6-A-01-code-pilot`;
+      assert.equal(harness(`init ${taskId} --force`).success, true);
+      assert.equal(harness(`set-current ${taskId} W6-A-01 code-implementation`).success, true);
+      setupPhase5PilotCapabilities(taskId);
+      setupVerifiedWarpPilotRole(taskId, 'work');
+
+      const allow = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage code-implementation --review-stage code-review --roles work,review --reason pilot --expires-at ${futureIso()}`);
+      assert.equal(allow.success, true, allow.stderr);
+      const allowed = JSON.parse(allow.stdout);
+      assert.equal(allowed.status, 'allowed');
+      assert.ok(allowed.allowlistHash);
+
+      const run = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role work --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval --run-timeout-ms 50 --poll-ms 10`);
+
+      assert.equal(run.success, false);
+      assert.match(run.stdout, /run-timeout|dispatch-submitted/);
+      const status = readStatus(taskId);
+      assert.ok(status.execution.activeAttemptId);
+      const attemptPath = path.join(HARNESS_DIR, 'runs', taskId, 'attempts', `${status.execution.activeAttemptId}.json`);
+      const attempt = JSON.parse(fs.readFileSync(attemptPath, 'utf8'));
+      const job = JSON.parse(fs.readFileSync(path.join(HARNESS_DIR, 'runs', taskId, 'jobs', `${status.execution.activeJobId}.json`), 'utf8'));
+      const lease = JSON.parse(fs.readFileSync(path.join(HARNESS_DIR, 'runs', taskId, 'leases', 'wrapper.work.json'), 'utf8'));
+      const operation = JSON.parse(fs.readFileSync(path.join(HARNESS_DIR, 'runs', taskId, 'operations', `${attempt.operationId}.json`), 'utf8'));
+      for (const record of [attempt, job, lease, operation]) {
+        assert.equal(record.pilotAuthorization.allowlistId, allowed.allowlistId);
+        assert.equal(record.pilotAuthorization.allowlistHash, allowed.allowlistHash);
+        assert.equal(record.pilotAuthorization.role, 'work');
+        assert.equal(record.pilotAuthorization.expectedStageId, 'code-implementation');
+      }
+      const cancelled = harness(`cancel ${taskId} --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token ${status.execution.activeLeaseToken} --adapter warp-macos`);
+      assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
+    });
+
+    it('fails closed when captured allowlist authorization expires or drifts before dispatch', () => {
+      const taskId = 'PH5-DRIFT';
+      const pilotUnitId = `${taskId}-W6-A-01-code-pilot`;
+      assert.equal(harness(`init ${taskId} --force`).success, true);
+      assert.equal(harness(`set-current ${taskId} W6-A-01 code-implementation`).success, true);
+      setupPhase5PilotCapabilities(taskId);
+      setupVerifiedWarpPilotRole(taskId, 'work');
+
+      const expired = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage code-implementation --review-stage code-review --roles work,review --reason pilot --expires-at 2000-01-01T00:00:00.000Z`);
+      assert.equal(expired.success, false);
+      assert.match(expired.stderr, /pilot-allowlist-expired/);
+
+      const allow = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage code-implementation --review-stage code-review --roles work,review --reason pilot --expires-at ${futureIso()}`);
+      assert.equal(allow.success, true, allow.stderr);
+      const allowlistPath = path.join(HARNESS_DIR, 'runs', taskId, 'pilot', 'allowlist.json');
+      const allowlist = JSON.parse(fs.readFileSync(allowlistPath, 'utf8'));
+      allowlist.allowedPilotUnits[0].reason = 'tampered';
+      fs.writeFileSync(allowlistPath, JSON.stringify(allowlist, null, 2) + '\n', 'utf8');
+
+      const run = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role work --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval`);
+
+      assert.equal(run.success, false);
+      assert.match(run.stderr + run.stdout, /pilot-allowlist-hash-drift/);
+      const status = readStatus(taskId);
+      assert.equal(status.execution.activeAttemptId, null);
+    });
+
+    it('commits work completion through workflow CAS only to the review stage and records role progress', () => {
+      const taskId = 'PH5-WORKFLOW';
+      const pilotUnitId = `${taskId}-W6-A-01-code-pilot`;
+      assert.equal(harness(`init ${taskId} --force`).success, true);
+      assert.equal(harness(`set-current ${taskId} W6-A-01 code-implementation`).success, true);
+      setupPhase5PilotCapabilities(taskId);
+      setupVerifiedWarpPilotRole(taskId, 'work');
+      const allow = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage code-implementation --review-stage code-review --roles work,review --reason pilot --expires-at ${futureIso()}`);
+      assert.equal(allow.success, true, allow.stderr);
+      const run = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role work --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval --run-timeout-ms 50 --poll-ms 10`);
+      assert.equal(run.success, false);
+
+      let status = readStatus(taskId);
+      createReport(status, 'code-implementation', '# Code mapping\n\nImplemented safely.\n');
+      const receipt = harness(`worker-receipt ${taskId} --attempt ${status.execution.activeAttemptId} --kind job.completed --sequence 1 --binding wrapper.work --event-id phase5-work-completed`);
+      assert.equal(receipt.success, true, receipt.stderr);
+      const pump = harness(`pump ${taskId} --adapter warp-macos`);
+      assert.equal(pump.success, true, `${pump.stderr}\n${pump.stdout}`);
+
+      status = readStatus(taskId);
+      assert.equal(status.currentStage, 'code-review');
+      assert.equal(status.execution.activeAttemptId, null);
+      const progress = JSON.parse(fs.readFileSync(path.join(HARNESS_DIR, 'runs', taskId, 'pilot', pilotUnitId, 'roles.json'), 'utf8'));
+      assert.equal(progress.roles.work.state, 'completed');
+      assert.equal(progress.roles.work.advancedToStage, 'code-review');
+      assert.equal(progress.roles.review.state, 'not-started');
+    });
+
+    it('enforces review sequencing and submitted attempt budget', () => {
+      const taskId = 'PH5-BUDGET';
+      const pilotUnitId = `${taskId}-W6-A-01-code-pilot`;
+      assert.equal(harness(`init ${taskId} --force`).success, true);
+      assert.equal(harness(`set-current ${taskId} W6-A-01 code-implementation`).success, true);
+      setupPhase5PilotCapabilities(taskId);
+      setupVerifiedWarpPilotRole(taskId, 'work');
+      setupVerifiedWarpPilotRole(taskId, 'review');
+      const allow = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage code-implementation --review-stage code-review --roles work,review --reason pilot --expires-at ${futureIso()}`);
+      assert.equal(allow.success, true, allow.stderr);
+
+      const earlyReview = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role review --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval`);
+      assert.equal(earlyReview.success, false);
+      assert.match(earlyReview.stderr + earlyReview.stdout, /pilot-review-work-not-completed|pilot-stage-cursor-conflict/);
+
+      const workRun = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role work --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval --run-timeout-ms 50 --poll-ms 10`);
+      assert.equal(workRun.success, false);
+      assert.match(workRun.stdout, /run-timeout|dispatch-submitted/);
+      const status = readStatus(taskId);
+      const retry = harness(`retry ${taskId} --job ${status.execution.activeJobId} --adapter warp-macos`);
+      assert.equal(retry.success, false);
+      assert.match(retry.stderr + retry.stdout, /active-job-conflict|retry-not-allowed/);
+      const cancelled = harness(`cancel ${taskId} --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token ${status.execution.activeLeaseToken} --adapter warp-macos`);
+      assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
+      const secondRun = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role work --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval`);
+      assert.equal(secondRun.success, false);
+      assert.match(secondRun.stderr + secondRun.stdout, /pilot-submitted-attempt-budget-exhausted/);
     });
   });
 });
