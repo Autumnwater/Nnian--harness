@@ -42,6 +42,57 @@ const capabilityEvidence = overrides => ({
   ...overrides,
 });
 
+const makeBoundWarpTarget = () => {
+  const { store } = makeStore();
+  const { binding, rawNonce } = createBinding({
+    taskId: 'W9-A',
+    bindingId: 'wrapper.work',
+    role: 'work',
+  });
+  const targetFingerprintHashValue = targetFingerprintHash({
+    bundleId: 'dev.warp.Warp-Stable',
+    windowId: 'window-1',
+    tabId: 'work',
+  });
+  const capabilityCapturedAt = new Date().toISOString();
+  const targetBinding = {
+    adapter: 'warp-macos',
+    targetFingerprintHash: targetFingerprintHashValue,
+    verifiedAt: new Date().toISOString(),
+    challengeId: 'challenge-1',
+    capabilityEvidenceId: `${WARP_CAPABILITY_NAME}:${capabilityCapturedAt}`,
+    candidateId: 'candidate-1',
+  };
+  const bound = { ...binding, targetBinding };
+  store.writeBinding(bound);
+  store.writeBindingSecret(binding.bindingId, rawNonce);
+  store.writeCapability(WARP_CAPABILITY_NAME, capabilityEvidence({
+    capturedAt: capabilityCapturedAt,
+    phase4RunEnabled: true,
+  }));
+  const target = {
+    adapter: 'warp-macos',
+    bindingId: binding.bindingId,
+    role: 'work',
+    candidateId: 'candidate-1',
+    targetFingerprintHash: targetFingerprintHashValue,
+    fingerprint: { bundleId: 'dev.warp.Warp-Stable', windowId: 'window-1', tabId: 'work' },
+    adapterIdentity: {
+      adapter: 'warp-macos',
+      role: 'work',
+      bindingId: binding.bindingId,
+      bindingGeneration: binding.bindingGeneration,
+      sessionId: binding.sessionId,
+      sessionNonceHash: binding.sessionNonceHash,
+      targetFingerprintHash: targetFingerprintHashValue,
+      targetChallengeId: 'challenge-1',
+      targetBindingVerifiedAt: targetBinding.verifiedAt,
+      capabilityEvidenceId: `${WARP_CAPABILITY_NAME}:${capabilityCapturedAt}`,
+    },
+  };
+  return { store, target };
+};
+
 describe('V3 Phase 4 warp-macos adapter contract', () => {
   it('keeps warp-macos unavailable by default and separates diagnostic from phase4 run enablement', () => {
     assert.equal(deriveWarpCapabilities(null).diagnosticEligible, false);
@@ -288,5 +339,50 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
     const cancel = await adapter.cancel({ jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1' }, target);
     assert.equal(cancel.status, 'stale-attempt');
     assert.equal(cancel.reason, 'binding-stale');
+  });
+
+  it('rejects dispatch and cancel when either side-effect pre-scan drifts from the captured target', async () => {
+    const candidate = windowId => ({
+      bindingId: 'wrapper.work',
+      role: 'work',
+      candidateId: 'candidate-1',
+      fingerprint: { bundleId: 'dev.warp.Warp-Stable', windowId, tabId: 'work' },
+    });
+    for (const [caseName, scanSequences] of [
+      ['first-wrong-second-correct', [[candidate('window-wrong')], [candidate('window-1')]]],
+      ['first-correct-second-wrong', [[candidate('window-1')], [candidate('window-wrong')]]],
+    ]) {
+      const dispatchSetup = makeBoundWarpTarget();
+      const dispatchHelper = new FixtureWarpMacosHelper({ scanSequences, store: dispatchSetup.store });
+      const dispatchAdapter = new WarpMacosAdapter({
+        store: dispatchSetup.store,
+        helper: dispatchHelper,
+        productionTest: true,
+        scratchTask: true,
+      });
+      const dispatched = await dispatchAdapter.dispatch({
+        promptText: 'shadow',
+        attempt: { jobId: `job-${caseName}`, attemptId: `attempt-${caseName}`, leaseToken: `lease-${caseName}` },
+      }, dispatchSetup.target, { operationId: `operation-${caseName}` });
+      assert.equal(dispatched.status, 'target-unavailable');
+      assert.equal(dispatched.error, 'target-discovery-changed');
+      assert.equal(dispatchHelper.submissions.length, 0);
+
+      const cancelSetup = makeBoundWarpTarget();
+      const cancelHelper = new FixtureWarpMacosHelper({ scanSequences, store: cancelSetup.store });
+      const cancelAdapter = new WarpMacosAdapter({
+        store: cancelSetup.store,
+        helper: cancelHelper,
+        productionTest: true,
+        scratchTask: true,
+      });
+      const cancelled = await cancelAdapter.cancel(
+        { jobId: `job-${caseName}`, attemptId: `attempt-${caseName}`, leaseToken: `lease-${caseName}` },
+        cancelSetup.target
+      );
+      assert.equal(cancelled.status, 'stale-attempt');
+      assert.equal(cancelled.reason, 'target-discovery-changed');
+      assert.equal(cancelHelper.interruptions.length, 0);
+    }
   });
 });

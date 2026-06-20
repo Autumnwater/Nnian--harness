@@ -4,7 +4,7 @@ Date: 2026-06-20
 
 ## 修复结论
 
-Phase 4 Code Review 提出的 4 个 P1 finding 已按最小范围修复，可以重新提交 Fix Review。
+Phase 4 Code Review 提出的 4 个 P1 finding 已按最小范围修复；第二轮 Fix Review reopened 的 `V3-PH4-CODE-P1-02` 也已补齐 dispatch/cancel side-effect 前 two-scan 稳定性回归测试，可以重新提交 Fix Review。
 
 本轮仍严格保持 Phase 4 边界：未实现 real W6 pilot、真实项目 production `run --adapter warp-macos`、clipboard/frontmost fallback、automatic approval、screen-text/sleep/fresh-output completion inference 或 Phase 5 production enablement。
 
@@ -13,7 +13,7 @@ Phase 4 Code Review 提出的 4 个 P1 finding 已按最小范围修复，可以
 | 编号 | 严重度 | Review 问题 | 处理状态 | 修改文件 |
 |------|--------|-------------|----------|----------|
 | V3-PH4-CODE-P1-01 | P1 | target discovery/binding 未做 two-scan 稳定性和 missing/duplicate/changed/title-only fail-closed | 已修复 | `scripts/warp-macos-adapter.js`, `scripts/harness.js`, `tests/warp-macos-adapter.test.js`, `tests/harness.test.js` |
-| V3-PH4-CODE-P1-02 | P1 | active attempt 期间可改写 target binding，dispatch/cancel 未重新校验当前 binding/target/capability | 已修复 | `scripts/harness.js`, `scripts/warp-macos-adapter.js`, `tests/warp-macos-adapter.test.js`, `tests/harness.test.js` |
+| V3-PH4-CODE-P1-02 | P1 | active attempt 期间可改写 target binding，dispatch/cancel 未重新校验当前 binding/target/capability；第二轮指出 dispatch/cancel 前 scan 未要求两次 fingerprint 都匹配 captured target | 已修复 | `scripts/harness.js`, `scripts/warp-macos-adapter.js`, `tests/warp-macos-adapter.test.js`, `tests/harness.test.js` |
 | V3-PH4-CODE-P1-03 | P1 | `warp-macos --production-test` run 未强制 Phase 3 hook completion 与 needs-input capability | 已修复 | `scripts/harness.js`, `tests/harness.test.js` |
 | V3-PH4-CODE-P1-04 | P1 | SubmitResult 未验证 candidate fingerprint 与 durable helper evidence | 已修复 | `scripts/warp-macos-adapter.js`, `scripts/execution-store.js`, `tests/warp-macos-adapter.test.js` |
 
@@ -22,7 +22,7 @@ Phase 4 Code Review 提出的 4 个 P1 finding 已按最小范围修复，可以
 | Finding | Status | 修复文件 | 验证 |
 | --- | --- | --- | --- |
 | V3-PH4-CODE-P1-01 | fixed | `scripts/warp-macos-adapter.js`, `scripts/harness.js`, `tests/warp-macos-adapter.test.js`, `tests/harness.test.js` | `discoverStableTarget` 执行两次 scan 并要求唯一、稳定、非 title/frontmost-only fingerprint；CLI 覆盖 zero/duplicate/changed/title-only fail-closed。 |
-| V3-PH4-CODE-P1-02 | fixed | `scripts/harness.js`, `scripts/warp-macos-adapter.js`, `tests/warp-macos-adapter.test.js`, `tests/harness.test.js` | `warp-bind-target` 进入 execution lock 且 active related attempt 时拒绝；dispatch/cancel side effect 前重新校验当前 binding、secret hash、heartbeat、targetBinding、capability evidence 与 attempt-captured adapterIdentity。 |
+| V3-PH4-CODE-P1-02 | fixed | `scripts/harness.js`, `scripts/warp-macos-adapter.js`, `tests/warp-macos-adapter.test.js`, `tests/harness.test.js` | `warp-bind-target` 进入 execution lock 且 active related attempt 时拒绝；dispatch/cancel side effect 前重新校验当前 binding、secret hash、heartbeat、targetBinding、capability evidence 与 attempt-captured adapterIdentity；补充 first-wrong/second-correct 与 first-correct/second-wrong scan 漂移测试，均 fail-closed 且 helper submissions/interruptions 为空。 |
 | V3-PH4-CODE-P1-03 | fixed | `scripts/harness.js`, `tests/harness.test.js` | `run --adapter warp-macos --production-test` 在 prepare 前要求 Phase 3 hook completion 与 needs-input capability 均 available；缺失/ completion-only 均返回 capability unavailable 且不创建 active attempt。 |
 | V3-PH4-CODE-P1-04 | fixed | `scripts/warp-macos-adapter.js`, `scripts/execution-store.js`, `tests/warp-macos-adapter.test.js` | SubmitResult 映射验证 expected target fingerprint 与 durable transport evidence；missing/mismatch evidence 不再算 submitted 或 safe retry。 |
 
@@ -37,10 +37,10 @@ Phase 4 Code Review 提出的 4 个 P1 finding 已按最小范围修复，可以
 
 ### active attempt 与 adapterIdentity fencing
 
-- 原问题：active attempt 期间仍可改写 target binding；dispatch/cancel 只依赖 helper health scan，未重新读取当前 binding/target/capability。
-- 修复方式：`warp-bind-target` 纳入 task execution lock，并在相关 active attempt 存在时拒绝；`WarpMacosAdapter.dispatch/cancel` 在 side effect 前重新读取当前 binding、secret、heartbeat、targetBinding 和 warp capability evidence，逐字段比对 captured `adapterIdentity`。
+- 原问题：active attempt 期间仍可改写 target binding；dispatch/cancel 只依赖 helper health scan，未重新读取当前 binding/target/capability。第二轮 Fix Review 进一步指出 health 两次 scan 没要求第一次 scan fingerprint 也匹配 expected target，也没覆盖 first/second scan 漂移。
+- 修复方式：`warp-bind-target` 纳入 task execution lock，并在相关 active attempt 存在时拒绝；`WarpMacosAdapter.dispatch/cancel` 在 side effect 前重新读取当前 binding、secret、heartbeat、targetBinding 和 warp capability evidence，逐字段比对 captured `adapterIdentity`；`health()` 复用严格 `discoverStableTarget()`，要求两次 scan 解析到同一唯一 target，且 fingerprint 等于 captured `targetFingerprintHash`。
 - 为什么这样修：target binding 是 attempt fencing 的一部分，不能在 active attempt 中静默漂移，也不能让 stale helper snapshot 执行 submit/interrupt。
-- 行为影响：binding/session/target/capability 任一字段漂移或 heartbeat stale，dispatch/cancel 均 fail-closed，不产生 helper side effect。
+- 行为影响：binding/session/target/capability 任一字段漂移、heartbeat stale、first scan 错 second scan 对、first scan 对 second scan 错，dispatch/cancel 均 fail-closed，不产生 helper side effect。
 
 ### warp production-test hook capability gate
 
@@ -67,8 +67,8 @@ Phase 4 Code Review 提出的 4 个 P1 finding 已按最小范围修复，可以
 
 ## 验证结果
 
-- `node --test tests/warp-macos-adapter.test.js tests/harness.test.js`: 166/166 pass，0 fail/cancel/skip。
-- `pnpm test`: 228/228 pass，0 fail/cancel/skip。
+- `node --test tests/warp-macos-adapter.test.js tests/harness.test.js`: 167/167 pass，0 fail/cancel/skip。
+- `pnpm test`: 229/229 pass，0 fail/cancel/skip。
 - `node --check scripts/harness.js`: 通过。
 - `node --check scripts/warp-macos-adapter.js`: 通过。
 - `node --check scripts/execution-supervisor.js`: 通过。
