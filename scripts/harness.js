@@ -25,6 +25,17 @@ import { ExecutionStore } from './execution-store.js';
 import { ExecutionSupervisor } from './execution-supervisor.js';
 import { deriveAdvanceTransition, evaluateStageCheck } from './workflow-core.js';
 import {
+  FixtureWarpMacosHelper,
+  WARP_CAPABILITY_NAME,
+  WarpMacosAdapter,
+  createTargetChallengePayload,
+  createTargetChallengeResponse,
+  deriveWarpCapabilities,
+  discoverStableTarget,
+  targetFingerprintHash,
+  validateTargetChallengeResponse,
+} from './warp-macos-adapter.js';
+import {
   acquireExecutionLock,
   finalizeRecoveredExecutionLock,
   releaseExecutionLock,
@@ -453,7 +464,7 @@ const MANUAL_PROGRESS_COMMANDS = new Set([
   'init', 'next', 'step', 'check', 'advance', 'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current',
 ]);
 
-const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set(['worker-attach']);
+const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set(['worker-attach', 'warp-bind-target']);
 
 function assertNoActiveExecution(taskId, command) {
   if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
@@ -2748,18 +2759,32 @@ Examples:
   harness worker-challenge W6-A --binding <bindingId>
   harness worker-challenge W6-A --probe-hook-payload <fixture.json>
   harness worker-receipt W6-A --attempt <attemptId> --kind job.completed --sequence 1 [--binding <bindingId>]
+  harness warp-doctor W6-A [--json] [--probe-fixture]
+  harness warp-targets W6-A --role work|review [--json]
+  harness warp-bind-target W6-A --role work|review --binding <bindingId> --candidate <candidateId> [--respond-fixture]
+  harness warp-shadow-send W6-A --role work|review --binding <bindingId> [--message <text>]
 `);
 }
 
-function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = false } = {}) {
+function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = false, productionTest = false, scratchTask = false } = {}) {
   const store = new ExecutionStore({ harnessRoot: HARNESS_ROOT, taskId });
   const targets = [
     { bindingId: 'fake.work', role: 'work' },
     { bindingId: 'fake.review', role: 'review' },
   ];
-  const adapter = adapterName === 'manual'
-    ? new ManualWorkerAdapter()
-    : new FakeWorkerAdapter({ targets, transportStore: store });
+  let adapter;
+  if (adapterName === 'manual') {
+    adapter = new ManualWorkerAdapter();
+  } else if (adapterName === 'warp-macos') {
+    adapter = new WarpMacosAdapter({
+      store,
+      helper: new FixtureWarpMacosHelper({ candidates: warpTargetCandidates(store), store }),
+      productionTest,
+      scratchTask,
+    });
+  } else {
+    adapter = new FakeWorkerAdapter({ targets, transportStore: store });
+  }
   const statusStore = {
     load: () => loadStatus(taskId, { persistMigration: false }),
     saveCas(expectedRevision, nextStatus) {
@@ -2819,6 +2844,46 @@ function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = fal
     transaction: alreadyLocked ? callback => callback() : callback => withTaskExecutionLockRetry(taskId, 'worker-transaction', callback),
   });
   return { store, adapter, statusStore, supervisor };
+}
+
+function warpTargetCandidates(store) {
+  return store.listBindings()
+    .filter(binding => binding.targetBinding?.adapter === 'warp-macos')
+    .map(binding => ({
+      adapter: 'warp-macos',
+      bindingId: binding.bindingId,
+      role: binding.role,
+      bindingGeneration: binding.bindingGeneration,
+      sessionId: binding.sessionId,
+      sessionNonceHash: binding.sessionNonceHash,
+      candidateId: binding.targetBinding.candidateId || binding.targetBinding.challengeId,
+      targetFingerprintHash: binding.targetBinding.targetFingerprintHash,
+      targetChallengeId: binding.targetBinding.challengeId,
+      targetBindingVerifiedAt: binding.targetBinding.verifiedAt,
+      capabilityEvidenceId: binding.targetBinding.capabilityEvidenceId,
+      adapterIdentity: {
+        adapter: 'warp-macos',
+        role: binding.role,
+        bindingId: binding.bindingId,
+        bindingGeneration: binding.bindingGeneration,
+        sessionId: binding.sessionId,
+        sessionNonceHash: binding.sessionNonceHash,
+        targetFingerprintHash: binding.targetBinding.targetFingerprintHash,
+        targetChallengeId: binding.targetBinding.challengeId,
+        targetBindingVerifiedAt: binding.targetBinding.verifiedAt,
+        capabilityEvidenceId: binding.targetBinding.capabilityEvidenceId,
+      },
+      fingerprint: {
+        bindingId: binding.bindingId,
+        role: binding.role,
+        candidateId: binding.targetBinding.candidateId || binding.targetBinding.challengeId,
+      },
+    }));
+}
+
+function isWarpProductionTestTask(taskId, opts = {}) {
+  const enabled = opts['production-test'] === true || opts['production-test'] === 'true';
+  return enabled && /^(SCRATCH|TEST)-/.test(taskId);
 }
 
 function workerRoleForStage(stage) {
@@ -2922,12 +2987,35 @@ async function cmdWorkerDoctor(taskId, opts = {}) {
 }
 
 async function cmdWorkerRun(taskId, opts = {}) {
-  const runtime = createWorkerRuntime(taskId, { adapterName: opts.adapter });
+  if (opts.adapter === 'warp-macos' && !isWarpProductionTestTask(taskId, opts)) {
+    const result = { success: false, status: 'warp-macos-production-disabled' };
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  const runtime = createWorkerRuntime(taskId, {
+    adapterName: opts.adapter,
+    productionTest: opts['production-test'] === true || opts['production-test'] === 'true',
+    scratchTask: isWarpProductionTestTask(taskId, opts),
+  });
   const capabilities = await runtime.adapter.capabilities();
   if (!capabilities.dispatch || !capabilities.abortableDispatch || !capabilities.settleBarrier) {
     const result = { success: false, status: capabilities.mode === 'manual' ? 'manual-required' : 'capability-unavailable' };
     console.log(JSON.stringify(result, null, 2));
     return result;
+  }
+  if (opts.adapter === 'warp-macos') {
+    const hookCapabilities = deriveHookCapabilities(runtime.store.readCapability('claude-hook'));
+    if (hookCapabilities.completionReceiptCapability !== 'available' ||
+        hookCapabilities.needsInputCapability !== 'available') {
+      const result = {
+        success: false,
+        status: 'capability-unavailable',
+        reason: 'hook-completion-and-needs-input-required',
+        hookCapabilities,
+      };
+      console.log(JSON.stringify(result, null, 2));
+      return result;
+    }
   }
   const nextResult = await withTaskExecutionLock(taskId, 'worker-next', () => cmdNext(taskId, { copy: false }));
   if (nextResult.error) return { success: false, error: nextResult.error };
@@ -2943,7 +3031,9 @@ async function cmdWorkerRun(taskId, opts = {}) {
     round: getRoundForStage(status, status.currentSubtask, status.currentStage),
     expectedStageRevision: status.stageRevision,
     role,
-    targetBinding: `${opts.adapter === 'manual' ? 'manual' : 'fake'}.${role}`,
+    targetBinding: opts.adapter === 'warp-macos'
+      ? `wrapper.${role}`
+      : `${opts.adapter === 'manual' ? 'manual' : 'fake'}.${role}`,
     promptPath: nextResult.promptPath,
     promptSha256: promptSnapshot.sha256,
     primaryReportPath: stageData.primaryReportPath,
@@ -3185,6 +3275,239 @@ function cmdWorkerReceipt(taskId, opts = {}) {
   return result;
 }
 
+function cmdWarpDoctor(taskId, opts = {}) {
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  if (opts['probe-fixture'] === true || opts['probe-fixture'] === 'true') {
+    const evidence = {
+      protocolVersion: 1,
+      kind: 'warp-macos.capability',
+      capturedAt: new Date().toISOString(),
+      fixture: true,
+      warp: { detected: true, bundleId: 'fixture.warp', version: 'fixture' },
+      accessibility: { permission: 'granted', helper: 'fixture-helper', helperVersion: 1 },
+      targetDiscovery: { available: true, stableFingerprintFields: ['bindingId', 'role', 'candidateId'], requiresTwoScanStability: true },
+      inputSubmission: { available: true, method: 'fixture-submit', usesClipboard: false, settleBarrier: 'fixture-submit-result' },
+      targetIdentity: { available: true, requiresWrapperBinding: true, requiresChallenge: true },
+      diagnosticEligible: true,
+      phase4RunEnabled: opts['enable-production-test'] === true || opts['enable-production-test'] === 'true',
+      phase5ProductionCandidate: false,
+      reasons: [],
+    };
+    store.writeCapability(WARP_CAPABILITY_NAME, evidence);
+  }
+  const evidence = store.readCapability(WARP_CAPABILITY_NAME);
+  const result = {
+    adapter: 'warp-macos',
+    evidence: evidence || null,
+    capabilities: deriveWarpCapabilities(evidence, { requireProductionTest: false }),
+    hookCapabilities: deriveHookCapabilities(store.readCapability('claude-hook')),
+  };
+  console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWarpTargets(taskId, opts = {}) {
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const role = opts.role;
+  if (role && !['work', 'review'].includes(role)) throw new Error('--role must be work or review');
+  const targets = warpTargetCandidates(store)
+    .filter(target => !role || target.role === role)
+    .map(target => ({
+      adapter: target.adapter,
+      role: target.role,
+      bindingId: target.bindingId,
+      candidateId: target.candidateId,
+      targetFingerprintHash: target.targetFingerprintHash,
+      targetChallengeId: target.targetChallengeId,
+      targetBindingVerifiedAt: target.targetBindingVerifiedAt,
+      capabilityEvidenceId: target.capabilityEvidenceId,
+    }));
+  const result = { adapter: 'warp-macos', targets };
+  console.log(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  return result;
+}
+
+function warpFixtureCandidate(binding, candidateId, opts = {}) {
+  const role = binding.role;
+  if (opts['title-only'] === true || opts['title-only'] === 'true') {
+    return {
+      adapter: 'warp-macos',
+      bindingId: binding.bindingId,
+      role,
+      candidateId,
+      fingerprint: { windowTitle: opts['window-title'] || 'Warp', tabTitle: opts['tab-title'] || role },
+    };
+  }
+  if (opts['frontmost-only'] === true || opts['frontmost-only'] === 'true') {
+    return {
+      adapter: 'warp-macos',
+      bindingId: binding.bindingId,
+      role,
+      candidateId,
+      fingerprint: { frontmost: true, windowTitle: opts['window-title'] || 'Warp' },
+    };
+  }
+  return {
+    adapter: 'warp-macos',
+    bindingId: binding.bindingId,
+    role,
+    candidateId,
+    fingerprint: {
+      adapter: 'warp-macos',
+      bindingId: binding.bindingId,
+      role,
+      candidateId,
+      bundleId: 'dev.warp.Warp-Stable',
+      windowId: opts['window-id'] || `fixture-window-${candidateId}`,
+      tabId: opts['tab-id'] || `fixture-tab-${role}`,
+    },
+  };
+}
+
+function warpFixtureDiscoveryPlan(binding, candidateId, opts = {}) {
+  if (opts['fixture-targets']) {
+    const fixturePath = path.resolve(String(opts['fixture-targets']));
+    const payload = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+    if (Array.isArray(payload)) return { candidates: payload };
+    if (payload && Array.isArray(payload.first) && Array.isArray(payload.second)) {
+      return { scanSequences: [payload.first, payload.second] };
+    }
+    throw new Error('invalid-fixture-targets');
+  }
+  const candidate = warpFixtureCandidate(binding, candidateId, opts);
+  if (opts['fixture-zero'] === true || opts['fixture-zero'] === 'true') return { candidates: [] };
+  if (opts['fixture-duplicate'] === true || opts['fixture-duplicate'] === 'true') {
+    return {
+      candidates: [
+        candidate,
+        { ...candidate, fingerprint: { ...candidate.fingerprint, windowId: `${candidate.fingerprint?.windowId || 'window'}-duplicate` } },
+      ],
+    };
+  }
+  if (opts['fixture-changed'] === true || opts['fixture-changed'] === 'true') {
+    return {
+      scanSequences: [
+        [candidate],
+        [{ ...candidate, fingerprint: { ...candidate.fingerprint, windowId: `${candidate.fingerprint?.windowId || 'window'}-changed` } }],
+      ],
+    };
+  }
+  return { candidates: [candidate] };
+}
+
+async function cmdWarpBindTarget(taskId, opts = {}) {
+  const role = opts.role;
+  const bindingId = opts.binding;
+  const candidateId = opts.candidate;
+  if (!['work', 'review'].includes(role)) throw new Error('--role must be work or review');
+  if (!bindingId) throw new Error('--binding required');
+  if (!candidateId) throw new Error('--candidate required');
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const binding = assertFreshBinding(store.readBinding(bindingId));
+  if (binding.role !== role) throw new Error('target-binding-role-mismatch');
+  const status = loadStatus(taskId, { persistMigration: false });
+  if (status.execution.activeAttemptId) {
+    const activeAttempt = store.readAttempt(status.execution.activeAttemptId);
+    const activeJob = activeAttempt ? store.readJob(activeAttempt.jobId) : null;
+    if (!activeJob ||
+        activeJob.role === role ||
+        activeAttempt.bindingId === bindingId ||
+        activeAttempt.adapterIdentity?.bindingId === bindingId) {
+      throw new Error('active-attempt-target-binding-conflict');
+    }
+  }
+  const capability = store.readCapability(WARP_CAPABILITY_NAME);
+  const capabilities = deriveWarpCapabilities(capability, { requireProductionTest: false });
+  if (!capabilities.diagnosticEligible) throw new Error('warp-macos-capability-unavailable');
+  const discoveryPlan = warpFixtureDiscoveryPlan(binding, candidateId, opts);
+  const helper = new FixtureWarpMacosHelper(discoveryPlan);
+  const target = await discoverStableTarget(helper, { role, candidateId });
+  const fingerprintHash = target.targetFingerprintHash;
+  const challengeId = opts['challenge-id'] || randomUUID();
+  let challenge = store.readTargetChallenge(challengeId);
+  if (!challenge) {
+    const payload = createTargetChallengePayload({
+      taskId,
+      role,
+      binding,
+      candidateId,
+      targetFingerprintHash: fingerprintHash,
+      capabilityEvidenceId: opts['capability-evidence-id'] || `${WARP_CAPABILITY_NAME}:${capability.capturedAt}`,
+      challengeId,
+      });
+    challenge = { status: 'issued', payload, issuedAt: payload.issuedAt };
+    store.writeTargetChallenge(challenge);
+    if (!(opts['respond-fixture'] === true || opts['respond-fixture'] === 'true')) {
+      const result = { status: 'issued', challengeId, payload };
+      console.log(JSON.stringify(result, null, 2));
+      return result;
+    }
+  }
+  if (challenge.payload.targetFingerprintHash !== fingerprintHash) throw new Error('target-challenge-target-mismatch');
+  if (challenge.status === 'verified') throw new Error('target-challenge-replay');
+  const rawNonce = store.readBindingSecret(bindingId);
+  const response = createTargetChallengeResponse({ payload: challenge.payload, rawNonce });
+  store.publishTargetChallengeResponse(response);
+  const targetBinding = validateTargetChallengeResponse({
+    challenge,
+    response,
+    binding,
+    rawNonce,
+  });
+  const nextBinding = {
+    ...binding,
+    targetBinding: {
+      ...targetBinding,
+      candidateId,
+    },
+  };
+  store.writeBinding(nextBinding);
+  store.writeTargetChallenge({ ...challenge, status: 'verified', verifiedAt: targetBinding.verifiedAt });
+  store.finalizeTargetChallengeResponse(challengeId, response.eventId, 'processed');
+  const result = { status: 'verified', bindingId, role, targetBinding: nextBinding.targetBinding };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function cmdWarpShadowSend(taskId, opts = {}) {
+  const role = opts.role;
+  const bindingId = opts.binding;
+  if (!['work', 'review'].includes(role)) throw new Error('--role must be work or review');
+  if (!bindingId) throw new Error('--binding required');
+  const message = opts.message || 'HEXAI Harness Phase 4 shadow probe. Do not modify files, run commands, approve tools, commit, push, or change workflow state.';
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const target = warpTargetCandidates(store).find(item => item.role === role && item.bindingId === bindingId);
+  if (!target) throw new Error('warp-target-not-bound');
+  const operationId = opts['operation-id'] || randomUUID();
+  const helper = new FixtureWarpMacosHelper({
+    candidates: [target],
+    submitResult: opts['side-effect-state'] ? {
+      protocolVersion: 1,
+      kind: 'warp-macos.submit-result',
+      operationId,
+      jobId: null,
+      attemptId: null,
+      leaseToken: null,
+      candidateFingerprintHash: target.targetFingerprintHash,
+      transportEvidenceId: randomUUID(),
+      sideEffectState: opts['side-effect-state'],
+      settled: true,
+      usedClipboard: opts['used-clipboard'] === true || opts['used-clipboard'] === 'true',
+      evidencePath: 'fixture://warp-shadow-send',
+      submittedAt: opts['side-effect-state'] === 'submitted' ? new Date().toISOString() : null,
+    } : null,
+  });
+  const adapter = new WarpMacosAdapter({ store, helper, productionTest: true, scratchTask: true });
+  const result = await adapter.dispatch(
+    { jobId: null, promptText: message, attempt: { jobId: null, attemptId: null, leaseToken: null } },
+    target,
+    { operationId }
+  );
+  const output = { status: result.status, sideEffectState: result.sideEffectState || null, submitted: result.submitted === true };
+  console.log(JSON.stringify(output, null, 2));
+  return output;
+}
+
 async function cmdWorkerRetry(taskId, opts = {}) {
   if (!opts.job) throw new Error('--job required');
   const { supervisor } = createWorkerRuntime(taskId, { adapterName: opts.adapter });
@@ -3244,7 +3567,8 @@ async function main() {
     const commandsNeedingConfig = ['init', 'next', 'step', 'current', 'check', 'advance', 'status', 'summary',
       'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief',
       'doctor', 'run', 'pump', 'jobs', 'retry', 'cancel', 'reconcile',
-      'worker-attach', 'worker-bindings', 'worker-challenge', 'worker-receipt'];
+      'worker-attach', 'worker-bindings', 'worker-challenge', 'worker-receipt',
+      'warp-doctor', 'warp-targets', 'warp-bind-target', 'warp-shadow-send'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
     }
@@ -3391,6 +3715,26 @@ async function main() {
       case 'worker-receipt': {
         if (!taskId) throw new Error('taskId required');
         commandResult = cmdWorkerReceipt(taskId, opts);
+        break;
+      }
+      case 'warp-doctor': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWarpDoctor(taskId, opts);
+        break;
+      }
+      case 'warp-targets': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWarpTargets(taskId, opts);
+        break;
+      }
+      case 'warp-bind-target': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWarpBindTarget(taskId, opts);
+        break;
+      }
+      case 'warp-shadow-send': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = await cmdWarpShadowSend(taskId, opts);
         break;
       }
       default:

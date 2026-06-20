@@ -181,6 +181,15 @@ export class ExecutionStore {
     return this.readRecord('transports', bindingId);
   }
 
+  writeTransportEvidence(transportEvidenceId, record) {
+    if (!transportEvidenceId) throw new Error('transportEvidenceId is required');
+    return this.writeRecord('transports', transportEvidenceId, { ...record, transportEvidenceId });
+  }
+
+  readTransportEvidence(transportEvidenceId) {
+    return this.readRecord('transports', transportEvidenceId);
+  }
+
   writeBinding(binding) {
     if (!binding?.bindingId) throw new Error('bindingId is required');
     if (Object.prototype.hasOwnProperty.call(binding, 'rawNonce') ||
@@ -255,7 +264,7 @@ export class ExecutionStore {
     if (!challenge?.payload?.challengeId) throw new Error('target challengeId is required');
     const filePath = this.targetChallengePath('pending', challenge.payload.challengeId);
     const existing = readJson(filePath);
-    if (existing && canonicalPayloadHash(existing) !== canonicalPayloadHash(challenge)) {
+    if (existing && canonicalPayloadHash(existing.payload) !== canonicalPayloadHash(challenge.payload)) {
       throw new Error(`target-challenge-conflict: ${challenge.payload.challengeId}`);
     }
     atomicWriteJson(filePath, challenge, this.faultInjector);

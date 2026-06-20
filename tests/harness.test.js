@@ -2767,4 +2767,145 @@ Expected: Should be fixed
       }
     });
   });
+
+  describe('V3 Phase 4: warp-macos adapter spike CLI', () => {
+    it('reports warp-macos unavailable by default and refuses real W6 run', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const doctor = harness('doctor W6-A --adapter warp-macos');
+      assert.equal(doctor.success, true, doctor.stderr);
+      assert.match(doctor.stdout, /missing-warp-capability-evidence/);
+
+      const run = harness('run W6-A --adapter warp-macos');
+      assert.equal(run.success, false);
+      assert.match(run.stdout, /warp-macos-production-disabled/);
+      const status = readStatus('W6-A');
+      assert.equal(status.execution.activeAttemptId, null);
+      assert.equal(status.execution.activeJobId, null);
+    });
+
+    it('binds a fixture warp target through target challenge without writing workflow status', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
+      const statusFile = path.join(HARNESS_DIR, 'runs', 'W6-A', 'status.json');
+      const before = fs.readFileSync(statusFile, 'utf8');
+      const beforeStatus = JSON.parse(before);
+
+      const probe = harness('warp-doctor W6-A --probe-fixture --json');
+      assert.equal(probe.success, true, probe.stderr);
+      assert.match(probe.stdout, /"diagnosticEligible":true|"diagnosticEligible": true/);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
+
+      const issued = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work');
+      assert.equal(issued.success, true, issued.stderr);
+      const challenge = JSON.parse(issued.stdout);
+      assert.equal(challenge.status, 'issued');
+      assert.equal(challenge.payload.kind, 'target.challenge');
+
+      const verified = harness(`warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --challenge-id ${challenge.challengeId} --respond-fixture`);
+      assert.equal(verified.success, true, verified.stderr);
+      assert.match(verified.stdout, /"status": "verified"/);
+      const afterStatus = readStatus('W6-A');
+      assert.equal(afterStatus.currentSubtask, beforeStatus.currentSubtask);
+      assert.equal(afterStatus.currentStage, beforeStatus.currentStage);
+      assert.equal(afterStatus.execution.activeJobId, beforeStatus.execution.activeJobId);
+      assert.equal(afterStatus.execution.activeAttemptId, beforeStatus.execution.activeAttemptId);
+      assert.equal(afterStatus.execution.activeLeaseToken, beforeStatus.execution.activeLeaseToken);
+
+      const replay = harness(`warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --challenge-id ${challenge.challengeId} --respond-fixture`);
+      assert.equal(replay.success, false);
+      assert.match(replay.stderr, /target-challenge-replay/);
+
+      const targets = harness('warp-targets W6-A --role work --json');
+      assert.equal(targets.success, true, targets.stderr);
+      assert.match(targets.stdout, /wrapper\.work/);
+      assert.match(targets.stdout, /targetFingerprintHash/);
+      assert.doesNotMatch(targets.stdout, /rawNonce|sessionNonce[^H]/);
+    });
+
+    it('fails closed for missing, duplicate, changed, or title-only target discovery', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
+      assert.equal(harness('warp-doctor W6-A --probe-fixture').success, true);
+
+      const zero = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --fixture-zero');
+      assert.equal(zero.success, false);
+      assert.match(zero.stderr, /target-discovery-zero/);
+
+      const duplicate = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --fixture-duplicate');
+      assert.equal(duplicate.success, false);
+      assert.match(duplicate.stderr, /target-discovery-duplicate/);
+
+      const changed = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --fixture-changed');
+      assert.equal(changed.success, false);
+      assert.match(changed.stderr, /target-discovery-changed/);
+
+      const titleOnly = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --title-only');
+      assert.equal(titleOnly.success, false);
+      assert.match(titleOnly.stderr, /target-fingerprint-unstable/);
+    });
+
+    it('rejects target binding changes while a related active attempt exists', async () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
+      assert.equal(harness('warp-doctor W6-A --probe-fixture').success, true);
+      const running = startHarness(['run', 'W6-A', '--adapter', 'fake', '--run-timeout-ms', '5000', '--poll-ms', '20']);
+      const status = await waitFor(() => activeSubmittedStatus('W6-A', 'fake.work'));
+
+      const bind = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work');
+
+      assert.equal(bind.success, false);
+      assert.match(bind.stderr, /active-attempt-target-binding-conflict/);
+      const cancelled = harness(`cancel W6-A --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token ${status.execution.activeLeaseToken}`);
+      assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
+      await running.completed;
+    });
+
+    it('requires hook completion and needs-input capability before warp production-test run prepares a job', () => {
+      assert.equal(harness('init TEST-A --force').success, true);
+      assert.equal(harness('warp-doctor TEST-A --probe-fixture --enable-production-test').success, true);
+
+      const missingHook = harness('run TEST-A --adapter warp-macos --production-test');
+      assert.equal(missingHook.success, false);
+      assert.match(missingHook.stdout, /hook-completion-and-needs-input-required/);
+      let status = readStatus('TEST-A');
+      assert.equal(status.execution.activeAttemptId, null);
+
+      const completionOnlyFixture = path.join(TEST_ROOT, 'phase4-completion-only-hook.json');
+      fs.writeFileSync(completionOnlyFixture, JSON.stringify({
+        hookSource: 'claude-code-hook',
+        hookVersion: 'test-1',
+        completionPhase: 'claude-completed',
+        attemptRefSource: 'wrapper-injected',
+        bindingSessionSource: 'wrapper-injected',
+        kind: 'job.completed',
+        occurredAt: new Date().toISOString(),
+      }), 'utf8');
+      assert.equal(harness(`worker-challenge TEST-A --probe-hook-payload ${completionOnlyFixture}`).success, true);
+      const completionOnly = harness('run TEST-A --adapter warp-macos --production-test');
+      assert.equal(completionOnly.success, false);
+      assert.match(completionOnly.stdout, /missing-needs-input-category-source/);
+      status = readStatus('TEST-A');
+      assert.equal(status.execution.activeAttemptId, null);
+    });
+
+    it('shadow send is diagnostic only and maps partial input to uncertain', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
+      assert.equal(harness('warp-doctor W6-A --probe-fixture --enable-production-test').success, true);
+      const bind = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --respond-fixture');
+      assert.equal(bind.success, true, bind.stderr);
+      const statusFile = path.join(HARNESS_DIR, 'runs', 'W6-A', 'status.json');
+      const before = fs.readFileSync(statusFile, 'utf8');
+
+      const uncertain = harness('warp-shadow-send W6-A --role work --binding wrapper.work --side-effect-state input-mutated');
+      assert.equal(uncertain.success, true, uncertain.stderr);
+      assert.match(uncertain.stdout, /dispatch-uncertain/);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
+
+      const clipboard = harness('warp-shadow-send W6-A --role work --binding wrapper.work --side-effect-state submitted --used-clipboard');
+      assert.equal(clipboard.success, false);
+      assert.match(clipboard.stderr, /clipboard-dispatch-forbidden/);
+      assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
+    });
+  });
 });
