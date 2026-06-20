@@ -420,7 +420,16 @@ export class ExecutionSupervisor {
     let dispatchPromise;
     try {
       dispatchPromise = Promise.resolve(this.adapter.dispatch(
-        { ...job, attempt: attemptRef(dispatching) },
+        {
+          ...job,
+          attempt: {
+            ...attemptRef(dispatching),
+            lockEpoch: dispatching.lockEpoch,
+            bindingIdentity: dispatching.bindingIdentity || null,
+            adapterIdentity: dispatching.adapterIdentity || null,
+            pilotAuthorization: dispatching.pilotAuthorization || job.pilotAuthorization || null,
+          },
+        },
         target,
         { operationId, signal: controller.signal }
       ));
@@ -697,7 +706,14 @@ export class ExecutionSupervisor {
     });
     if (claim.terminal) return claim.result;
     const { attempt, job } = claim.context;
-    await this.adapter.cancel(attemptRef(attempt), job.target);
+    await this.adapter.cancel({
+      ...attemptRef(attempt),
+      lockEpoch: attempt.lockEpoch,
+      operationId: attempt.operationId,
+      bindingIdentity: attempt.bindingIdentity || null,
+      adapterIdentity: attempt.adapterIdentity || null,
+      pilotAuthorization: attempt.pilotAuthorization || job.pilotAuthorization || null,
+    }, job.target);
     const settled = await this.settleTransport(attempt.attemptId);
     if (settled.status === 'transport-in-flight') return { status: 'cancel-pending-settle', attemptId: attempt.attemptId };
     if (settled.outcome === 'submitted') return { status: 'cancel-pending-settle', attemptId: attempt.attemptId };

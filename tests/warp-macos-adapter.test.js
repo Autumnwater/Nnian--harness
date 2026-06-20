@@ -11,8 +11,10 @@ import {
   FixtureWarpMacosHelper,
   WarpMacosAdapter,
   assertSideEffectMapping,
+  assertWarpResultMirrorsRequest,
   createTargetChallengePayload,
   createTargetChallengeResponse,
+  createWarpSideEffectRequest,
   deriveWarpCapabilities,
   discoverStableTarget,
   targetFingerprintHash,
@@ -118,20 +120,16 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
       kind: 'warp-macos.submit-evidence',
       transportEvidenceId: 'evidence-1',
       operationId: 'operation-1',
-      jobId: 'job-1',
-      attemptId: 'attempt-1',
-      leaseToken: 'lease-1',
-      candidateFingerprintHash: expectedTargetFingerprintHash,
+      attemptRef: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1' },
+      targetFingerprintHash: expectedTargetFingerprintHash,
       sideEffectState: 'none',
       usedClipboard: false,
     };
     assert.deepEqual(
       assertSideEffectMapping({
         operationId: 'operation-1',
-        jobId: 'job-1',
-        attemptId: 'attempt-1',
-        leaseToken: 'lease-1',
-        candidateFingerprintHash: expectedTargetFingerprintHash,
+        attemptRef: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1' },
+        targetFingerprintHash: expectedTargetFingerprintHash,
         sideEffectState: 'none',
         settled: true,
         usedClipboard: false,
@@ -155,7 +153,7 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
       jobId: 'job-1',
       attemptId: 'attempt-1',
       leaseToken: 'lease-1',
-      candidateFingerprintHash: 'sha256:wrong',
+      targetFingerprintHash: 'sha256:wrong',
       sideEffectState: 'submitted',
       settled: true,
       usedClipboard: false,
@@ -167,7 +165,7 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
       jobId: 'job-1',
       attemptId: 'attempt-1',
       leaseToken: 'lease-1',
-      candidateFingerprintHash: expectedTargetFingerprintHash,
+      targetFingerprintHash: expectedTargetFingerprintHash,
       sideEffectState: 'none',
       settled: true,
       usedClipboard: false,
@@ -325,20 +323,154 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
     });
     const submitted = await adapter.dispatch({
       promptText: 'shadow',
-      attempt: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1' },
+      attempt: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1', lockEpoch: 0 },
     }, target, { operationId: 'operation-1' });
     assert.equal(submitted.status, 'dispatch-submitted');
+    assert.equal(submitted.targetFingerprintHash, target.targetFingerprintHash);
+    assert.equal(submitted.attemptRef.jobId, 'job-1');
+    assert.equal(submitted.lockEpoch, 0);
 
     store.writeBinding({ ...bound, heartbeatAt: '2000-01-01T00:00:00.000Z' });
     const stale = await adapter.dispatch({
       promptText: 'shadow',
-      attempt: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1' },
+      attempt: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1', lockEpoch: 0 },
     }, target, { operationId: 'operation-2' });
     assert.equal(stale.status, 'target-unavailable');
     assert.equal(stale.error, 'binding-stale');
     const cancel = await adapter.cancel({ jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1' }, target);
     assert.equal(cancel.status, 'stale-attempt');
     assert.equal(cancel.reason, 'binding-stale');
+  });
+
+  it('creates fenced helper side-effect requests and rejects split ambient request shapes', async () => {
+    const { store, target } = makeBoundWarpTarget();
+    const helper = new FixtureWarpMacosHelper({ candidates: [target], store });
+    const adapter = new WarpMacosAdapter({
+      store,
+      productionTest: true,
+      scratchTask: true,
+      helper,
+    });
+    const job = {
+      promptPath: '/tmp/prompt.md',
+      promptSha256: 'sha256:prompt',
+      attempt: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1', lockEpoch: 7 },
+      pilotAuthorization: {
+        allowlistId: 'allow-1',
+        allowlistHash: 'sha256:allow',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    };
+
+    const request = createWarpSideEffectRequest({
+      kind: 'submit',
+      operationId: 'operation-1',
+      job,
+      target,
+    });
+    assert.equal(request.kind, 'warp-macos.submit-request');
+    assert.equal(request.lockEpoch, 7);
+    assert.equal(request.targetFingerprintHash, target.targetFingerprintHash);
+    assert.deepEqual(request.inputSnapshot, { path: '/tmp/prompt.md', hash: 'sha256:prompt' });
+
+    const result = await adapter.dispatch(job, target, { operationId: 'operation-1' });
+    assert.equal(result.status, 'dispatch-submitted');
+    assert.equal(helper.submissions[0].request.operationId, 'operation-1');
+    assert.equal(helper.submissions[0].request.lockEpoch, 7);
+
+    await assert.rejects(
+      () => helper.submitText(target, '/tmp/prompt.md', { attempt: job.attempt, operationId: 'operation-split' }),
+      /invalid-side-effect-request-kind|request\.attemptRef is required|side-effect-request-kind-mismatch/
+    );
+  });
+
+  it('rejects submit results that rename or fail to mirror fenced request fields', async () => {
+    const setup = makeBoundWarpTarget();
+    const aliasHelper = new FixtureWarpMacosHelper({
+      candidates: [setup.target],
+      store: setup.store,
+      submitResult: {
+        protocolVersion: 1,
+        kind: 'warp-macos.submit-result',
+        candidateFingerprintHash: setup.target.targetFingerprintHash,
+        transportEvidenceId: 'evidence-alias',
+        sideEffectState: 'submitted',
+        settled: true,
+        usedClipboard: false,
+        evidencePath: 'fixture://alias',
+        submittedAt: new Date().toISOString(),
+      },
+    });
+    const aliasAdapter = new WarpMacosAdapter({
+      store: setup.store,
+      helper: aliasHelper,
+      productionTest: true,
+      scratchTask: true,
+    });
+    const aliasResult = await aliasAdapter.dispatch({
+      promptText: 'shadow',
+      attempt: { jobId: 'job-alias', attemptId: 'attempt-alias', leaseToken: 'lease-alias', lockEpoch: 0 },
+    }, setup.target, { operationId: 'operation-alias' });
+    assert.equal(aliasResult.status, 'dispatch-uncertain');
+    assert.equal(aliasResult.reason, 'target-fingerprint-alias-forbidden');
+
+    const mismatchSetup = makeBoundWarpTarget();
+    const mismatchHelper = new FixtureWarpMacosHelper({
+      candidates: [mismatchSetup.target],
+      store: mismatchSetup.store,
+      submitResult: {
+        protocolVersion: 1,
+        kind: 'warp-macos.submit-result',
+        lockEpoch: 999,
+        transportEvidenceId: 'evidence-mismatch',
+        sideEffectState: 'submitted',
+        settled: true,
+        usedClipboard: false,
+        evidencePath: 'fixture://mismatch',
+        submittedAt: new Date().toISOString(),
+      },
+    });
+    const mismatchAdapter = new WarpMacosAdapter({
+      store: mismatchSetup.store,
+      helper: mismatchHelper,
+      productionTest: true,
+      scratchTask: true,
+    });
+    const mismatchResult = await mismatchAdapter.dispatch({
+      promptText: 'shadow',
+      attempt: { jobId: 'job-mismatch', attemptId: 'attempt-mismatch', leaseToken: 'lease-mismatch', lockEpoch: 0 },
+    }, mismatchSetup.target, { operationId: 'operation-mismatch' });
+    assert.equal(mismatchResult.status, 'dispatch-uncertain');
+    assert.equal(mismatchResult.reason, 'side-effect-result-lockEpoch-mismatch');
+  });
+
+  it('requires interrupt results to mirror request fencing including input snapshot', async () => {
+    const { store, target } = makeBoundWarpTarget();
+    const helper = new FixtureWarpMacosHelper({ candidates: [target], store });
+    const request = createWarpSideEffectRequest({
+      kind: 'interrupt',
+      operationId: 'operation-cancel',
+      job: {
+        promptText: 'cancel',
+        attempt: { jobId: 'job-cancel', attemptId: 'attempt-cancel', leaseToken: 'lease-cancel', lockEpoch: 3 },
+      },
+      target,
+      reason: 'operator-cancel',
+    });
+    const result = await helper.interrupt(request);
+    assert.equal(assertWarpResultMirrorsRequest({
+      result,
+      request,
+      resultKind: 'warp-macos.interrupt-result',
+    }).ok, true);
+
+    const missingInput = structuredClone(result);
+    delete missingInput.inputSnapshot;
+    assert.deepEqual(assertWarpResultMirrorsRequest({
+      result: missingInput,
+      request,
+      resultKind: 'warp-macos.interrupt-result',
+    }), { ok: false, reason: 'side-effect-result-inputSnapshot.path-mismatch' });
   });
 
   it('rejects dispatch and cancel when either side-effect pre-scan drifts from the captured target', async () => {
@@ -362,7 +494,7 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
       });
       const dispatched = await dispatchAdapter.dispatch({
         promptText: 'shadow',
-        attempt: { jobId: `job-${caseName}`, attemptId: `attempt-${caseName}`, leaseToken: `lease-${caseName}` },
+        attempt: { jobId: `job-${caseName}`, attemptId: `attempt-${caseName}`, leaseToken: `lease-${caseName}`, lockEpoch: 0 },
       }, dispatchSetup.target, { operationId: `operation-${caseName}` });
       assert.equal(dispatched.status, 'target-unavailable');
       assert.equal(dispatched.error, 'target-discovery-changed');

@@ -17,6 +17,16 @@ const requiredString = (value, field) => {
   return value;
 };
 
+const requiredObject = (value, field) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${field} is required`);
+  return value;
+};
+
+const requiredInteger = (value, field) => {
+  if (!Number.isInteger(value)) throw new Error(`${field} is required`);
+  return value;
+};
+
 const parseTime = (value, field) => {
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) throw new Error(`${field} must be an ISO timestamp`);
@@ -146,35 +156,168 @@ export const deriveWarpCapabilities = (evidence, {
 };
 
 const assertSubmitEvidence = ({ result, evidence, expectedTargetFingerprintHash, expectedAttempt }) => {
-  if (!expectedTargetFingerprintHash || result.candidateFingerprintHash !== expectedTargetFingerprintHash) {
+  if (Object.prototype.hasOwnProperty.call(result || {}, 'candidateFingerprintHash')) {
+    return { ok: false, status: 'dispatch-uncertain', reason: 'target-fingerprint-alias-forbidden' };
+  }
+  if (!expectedTargetFingerprintHash || result.targetFingerprintHash !== expectedTargetFingerprintHash) {
     return { ok: false, status: 'dispatch-uncertain', reason: 'target-fingerprint-mismatch' };
   }
   if (!evidence) return { ok: false, status: 'dispatch-uncertain', reason: 'missing-durable-submit-evidence' };
   const checks = [
-    ['protocolVersion', 1],
-    ['kind', 'warp-macos.submit-evidence'],
-    ['transportEvidenceId', result.transportEvidenceId],
-    ['operationId', result.operationId],
-    ['jobId', expectedAttempt?.jobId || result.jobId || null],
-    ['attemptId', expectedAttempt?.attemptId || result.attemptId || null],
-    ['leaseToken', expectedAttempt?.leaseToken || result.leaseToken || null],
-    ['candidateFingerprintHash', expectedTargetFingerprintHash],
-    ['sideEffectState', result.sideEffectState],
-    ['usedClipboard', result.usedClipboard],
+    [['protocolVersion'], 1],
+    [['kind'], 'warp-macos.submit-evidence'],
+    [['transportEvidenceId'], result.transportEvidenceId],
+    [['operationId'], result.operationId],
+    [['targetFingerprintHash'], expectedTargetFingerprintHash],
+    [['sideEffectState'], result.sideEffectState],
+    [['usedClipboard'], result.usedClipboard],
   ];
-  const mismatch = checks.find(([field, expected]) => (evidence[field] ?? null) !== (expected ?? null));
+  if (expectedAttempt) {
+    checks.push(
+      [['attemptRef', 'jobId'], expectedAttempt.jobId || result.attemptRef?.jobId || null],
+      [['attemptRef', 'attemptId'], expectedAttempt.attemptId || result.attemptRef?.attemptId || null],
+      [['attemptRef', 'leaseToken'], expectedAttempt.leaseToken || result.attemptRef?.leaseToken || null]
+    );
+  }
+  if (result.attemptRef) {
+    checks.push(
+      [['attemptRef', 'jobId'], result.attemptRef.jobId],
+      [['attemptRef', 'attemptId'], result.attemptRef.attemptId],
+      [['attemptRef', 'leaseToken'], result.attemptRef.leaseToken]
+    );
+  }
+  const mismatch = checks.find(([field, expected]) => (pathValue(evidence, field) ?? null) !== (expected ?? null));
   if (mismatch) {
-    return { ok: false, status: 'dispatch-uncertain', reason: `submit-evidence-${mismatch[0]}-mismatch` };
+    return { ok: false, status: 'dispatch-uncertain', reason: `submit-evidence-${mismatch[0].join('.')}-mismatch` };
   }
   return { ok: true };
 };
 
-export const assertSideEffectMapping = (result, { expectedTargetFingerprintHash = null, evidence = null, expectedAttempt = null } = {}) => {
+const hashInlineInput = value => `sha256:${createHash('sha256').update(String(value ?? '')).digest('hex')}`;
+
+const diagnosticPilotAuthorization = () => ({
+  allowlistId: 'diagnostic-shadow',
+  allowlistHash: 'sha256:diagnostic-shadow',
+  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+});
+
+export const createWarpSideEffectRequest = ({ kind, operationId, job, target, reason = null }) => {
+  if (!['submit', 'interrupt'].includes(kind)) throw new Error('invalid-side-effect-request-kind');
+  const attempt = requiredObject(job?.attempt, 'job.attempt');
+  const adapterIdentity = requiredObject(target?.adapterIdentity, 'target.adapterIdentity');
+  const inputHash = job.promptSha256 || hashInlineInput(job.promptText || job.promptPath || '');
+  const inputPath = job.promptPath || `inline:${inputHash}`;
+  const request = {
+    protocolVersion: 1,
+    kind: kind === 'submit' ? 'warp-macos.submit-request' : 'warp-macos.interrupt-request',
+    operationId: requiredString(operationId, 'operationId'),
+    attemptRef: {
+      jobId: requiredString(attempt.jobId, 'attempt.jobId'),
+      attemptId: requiredString(attempt.attemptId, 'attempt.attemptId'),
+      leaseToken: requiredString(attempt.leaseToken, 'attempt.leaseToken'),
+    },
+    lockEpoch: requiredInteger(attempt.lockEpoch, 'attempt.lockEpoch'),
+    binding: {
+      bindingId: requiredString(adapterIdentity.bindingId, 'target.adapterIdentity.bindingId'),
+      role: requiredString(adapterIdentity.role, 'target.adapterIdentity.role'),
+      bindingGeneration: requiredInteger(adapterIdentity.bindingGeneration, 'target.adapterIdentity.bindingGeneration'),
+      sessionId: requiredString(adapterIdentity.sessionId, 'target.adapterIdentity.sessionId'),
+      sessionNonceHash: requiredString(adapterIdentity.sessionNonceHash, 'target.adapterIdentity.sessionNonceHash'),
+    },
+    targetFingerprintHash: requiredString(adapterIdentity.targetFingerprintHash || target.targetFingerprintHash, 'targetFingerprintHash'),
+    targetChallengeId: requiredString(adapterIdentity.targetChallengeId || target.targetChallengeId, 'targetChallengeId'),
+    capabilityEvidenceId: requiredString(adapterIdentity.capabilityEvidenceId || target.capabilityEvidenceId, 'capabilityEvidenceId'),
+    pilotAuthorization: job.pilotAuthorization || attempt.pilotAuthorization || diagnosticPilotAuthorization(),
+    inputSnapshot: {
+      path: requiredString(inputPath, 'inputSnapshot.path'),
+      hash: requiredString(inputHash, 'inputSnapshot.hash'),
+    },
+  };
+  if (reason) request.reason = reason;
+  assertWarpSideEffectRequest(request, request.kind);
+  return request;
+};
+
+const mirrorFields = [
+  ['operationId'],
+  ['attemptRef', 'jobId'],
+  ['attemptRef', 'attemptId'],
+  ['attemptRef', 'leaseToken'],
+  ['lockEpoch'],
+  ['binding', 'bindingId'],
+  ['binding', 'role'],
+  ['binding', 'bindingGeneration'],
+  ['binding', 'sessionId'],
+  ['binding', 'sessionNonceHash'],
+  ['targetFingerprintHash'],
+  ['targetChallengeId'],
+  ['capabilityEvidenceId'],
+  ['pilotAuthorization', 'allowlistId'],
+  ['pilotAuthorization', 'allowlistHash'],
+  ['pilotAuthorization', 'expiresAt'],
+  ['inputSnapshot', 'path'],
+  ['inputSnapshot', 'hash'],
+];
+
+const pathValue = (object, parts) => parts.reduce((current, part) => current?.[part], object);
+
+export const assertWarpSideEffectRequest = (request, expectedKind = null) => {
+  requiredObject(request, 'request');
+  if (expectedKind && request.kind !== expectedKind) throw new Error('side-effect-request-kind-mismatch');
+  if (!['warp-macos.submit-request', 'warp-macos.interrupt-request'].includes(request.kind)) {
+    throw new Error('invalid-side-effect-request-kind');
+  }
+  requiredString(request.operationId, 'request.operationId');
+  requiredObject(request.attemptRef, 'request.attemptRef');
+  requiredString(request.attemptRef.jobId, 'request.attemptRef.jobId');
+  requiredString(request.attemptRef.attemptId, 'request.attemptRef.attemptId');
+  requiredString(request.attemptRef.leaseToken, 'request.attemptRef.leaseToken');
+  requiredInteger(request.lockEpoch, 'request.lockEpoch');
+  requiredObject(request.binding, 'request.binding');
+  requiredString(request.binding.bindingId, 'request.binding.bindingId');
+  requiredString(request.binding.role, 'request.binding.role');
+  requiredInteger(request.binding.bindingGeneration, 'request.binding.bindingGeneration');
+  requiredString(request.binding.sessionId, 'request.binding.sessionId');
+  requiredString(request.binding.sessionNonceHash, 'request.binding.sessionNonceHash');
+  requiredString(request.targetFingerprintHash, 'request.targetFingerprintHash');
+  requiredString(request.targetChallengeId, 'request.targetChallengeId');
+  requiredString(request.capabilityEvidenceId, 'request.capabilityEvidenceId');
+  requiredObject(request.pilotAuthorization, 'request.pilotAuthorization');
+  requiredString(request.pilotAuthorization.allowlistId, 'request.pilotAuthorization.allowlistId');
+  requiredString(request.pilotAuthorization.allowlistHash, 'request.pilotAuthorization.allowlistHash');
+  parseTime(request.pilotAuthorization.expiresAt, 'request.pilotAuthorization.expiresAt');
+  requiredObject(request.inputSnapshot, 'request.inputSnapshot');
+  requiredString(request.inputSnapshot.path, 'request.inputSnapshot.path');
+  requiredString(request.inputSnapshot.hash, 'request.inputSnapshot.hash');
+  return request;
+};
+
+export const assertWarpResultMirrorsRequest = ({ result, request, resultKind }) => {
+  requiredObject(result, 'result');
+  assertWarpSideEffectRequest(request);
+  if (result.kind !== resultKind) return { ok: false, reason: 'side-effect-result-kind-mismatch' };
+  if (Object.prototype.hasOwnProperty.call(result, 'candidateFingerprintHash')) {
+    return { ok: false, reason: 'target-fingerprint-alias-forbidden' };
+  }
+  const mismatch = mirrorFields.find(parts => (pathValue(result, parts) ?? null) !== (pathValue(request, parts) ?? null));
+  if (mismatch) return { ok: false, reason: `side-effect-result-${mismatch.join('.')}-mismatch` };
+  return { ok: true };
+};
+
+export const assertSideEffectMapping = (result, { expectedTargetFingerprintHash = null, evidence = null, expectedAttempt = null, expectedRequest = null } = {}) => {
   const state = result?.sideEffectState;
   if (!['none', 'input-mutated', 'submitted', 'unknown'].includes(state)) {
     throw new Error('invalid-submit-side-effect-state');
   }
   if (result.usedClipboard !== false) throw new Error('clipboard-dispatch-forbidden');
+  if (expectedRequest) {
+    const mirror = assertWarpResultMirrorsRequest({
+      result,
+      request: expectedRequest,
+      resultKind: 'warp-macos.submit-result',
+    });
+    if (!mirror.ok) return { status: 'dispatch-uncertain', reason: mirror.reason };
+  }
   if (state === 'none') {
     if (result.settled !== true || !result.transportEvidenceId || !result.evidencePath) {
       return { status: 'dispatch-uncertain', reason: 'missing-durable-none-evidence' };
@@ -303,26 +446,37 @@ export class FixtureWarpMacosHelper {
       .map(candidate => ({ ...candidate }));
   }
 
-  async submitText(candidate, payload, options = {}) {
+  async submitText(request, options = {}) {
     if (this.crash) throw new Error('helper-crash');
-    this.submissions.push({ candidate, payload, options });
+    assertWarpSideEffectRequest(request, 'warp-macos.submit-request');
+    this.submissions.push({ request, options });
     if (this.submitResult) {
-      const supplied = { ...this.submitResult };
-      supplied.operationId ??= options.operationId ?? null;
-      supplied.jobId ??= options.attempt?.jobId ?? null;
-      supplied.attemptId ??= options.attempt?.attemptId ?? null;
-      supplied.leaseToken ??= options.attempt?.leaseToken ?? null;
-      supplied.candidateFingerprintHash ??= candidate.targetFingerprintHash || targetFingerprintHashForCandidate(candidate);
+      const supplied = {
+        ...this.submitResult,
+        operationId: this.submitResult.operationId ?? request.operationId,
+        attemptRef: this.submitResult.attemptRef ?? { ...request.attemptRef },
+        lockEpoch: this.submitResult.lockEpoch ?? request.lockEpoch,
+        binding: this.submitResult.binding ?? { ...request.binding },
+        targetFingerprintHash: this.submitResult.targetFingerprintHash ?? request.targetFingerprintHash,
+        targetChallengeId: this.submitResult.targetChallengeId ?? request.targetChallengeId,
+        capabilityEvidenceId: this.submitResult.capabilityEvidenceId ?? request.capabilityEvidenceId,
+        pilotAuthorization: this.submitResult.pilotAuthorization ?? { ...request.pilotAuthorization },
+        inputSnapshot: this.submitResult.inputSnapshot ?? { ...request.inputSnapshot },
+      };
       if (this.store && supplied.writeEvidence !== false && supplied.transportEvidenceId) {
         this.store.writeTransportEvidence(supplied.transportEvidenceId, {
           protocolVersion: 1,
           kind: 'warp-macos.submit-evidence',
           transportEvidenceId: supplied.transportEvidenceId,
           operationId: supplied.operationId,
-          jobId: supplied.jobId,
-          attemptId: supplied.attemptId,
-          leaseToken: supplied.leaseToken,
-          candidateFingerprintHash: supplied.candidateFingerprintHash,
+          attemptRef: supplied.attemptRef,
+          lockEpoch: supplied.lockEpoch,
+          binding: supplied.binding,
+          targetFingerprintHash: supplied.targetFingerprintHash,
+          targetChallengeId: supplied.targetChallengeId,
+          capabilityEvidenceId: supplied.capabilityEvidenceId,
+          pilotAuthorization: supplied.pilotAuthorization,
+          inputSnapshot: supplied.inputSnapshot,
           sideEffectState: supplied.sideEffectState,
           usedClipboard: supplied.usedClipboard,
           createdAt: new Date().toISOString(),
@@ -334,11 +488,15 @@ export class FixtureWarpMacosHelper {
     const result = {
       protocolVersion: 1,
       kind: 'warp-macos.submit-result',
-      operationId: options.operationId || randomUUID(),
-      jobId: options.attempt?.jobId || null,
-      attemptId: options.attempt?.attemptId || null,
-      leaseToken: options.attempt?.leaseToken || null,
-      candidateFingerprintHash: candidate.targetFingerprintHash || targetFingerprintHashForCandidate(candidate),
+      operationId: request.operationId,
+      attemptRef: { ...request.attemptRef },
+      lockEpoch: request.lockEpoch,
+      binding: { ...request.binding },
+      targetFingerprintHash: request.targetFingerprintHash,
+      targetChallengeId: request.targetChallengeId,
+      capabilityEvidenceId: request.capabilityEvidenceId,
+      pilotAuthorization: { ...request.pilotAuthorization },
+      inputSnapshot: { ...request.inputSnapshot },
       transportEvidenceId,
       sideEffectState: 'submitted',
       settled: true,
@@ -351,10 +509,14 @@ export class FixtureWarpMacosHelper {
       kind: 'warp-macos.submit-evidence',
       transportEvidenceId,
       operationId: result.operationId,
-      jobId: result.jobId,
-      attemptId: result.attemptId,
-      leaseToken: result.leaseToken,
-      candidateFingerprintHash: result.candidateFingerprintHash,
+      attemptRef: result.attemptRef,
+      lockEpoch: result.lockEpoch,
+      binding: result.binding,
+      targetFingerprintHash: result.targetFingerprintHash,
+      targetChallengeId: result.targetChallengeId,
+      capabilityEvidenceId: result.capabilityEvidenceId,
+      pilotAuthorization: result.pilotAuthorization,
+      inputSnapshot: result.inputSnapshot,
       sideEffectState: result.sideEffectState,
       usedClipboard: result.usedClipboard,
       createdAt: result.submittedAt,
@@ -362,9 +524,32 @@ export class FixtureWarpMacosHelper {
     return result;
   }
 
-  async interrupt(candidate, attempt) {
-    this.interruptions.push({ candidate, attempt });
-    return { status: 'cancelled', interrupted: true, attemptId: attempt.attemptId };
+  async interrupt(request) {
+    assertWarpSideEffectRequest(request, 'warp-macos.interrupt-request');
+    this.interruptions.push({ request });
+    const transportEvidenceId = randomUUID();
+    return {
+      protocolVersion: 1,
+      kind: 'warp-macos.interrupt-result',
+      operationId: request.operationId,
+      attemptRef: { ...request.attemptRef },
+      lockEpoch: request.lockEpoch,
+      binding: { ...request.binding },
+      targetFingerprintHash: request.targetFingerprintHash,
+      targetChallengeId: request.targetChallengeId,
+      capabilityEvidenceId: request.capabilityEvidenceId,
+      pilotAuthorization: { ...request.pilotAuthorization },
+      inputSnapshot: { ...request.inputSnapshot },
+      transportEvidenceId,
+      sideEffectState: 'interrupted',
+      settled: true,
+      usedClipboard: false,
+      evidencePath: `transport://${transportEvidenceId}`,
+      interruptedAt: new Date().toISOString(),
+      status: 'cancelled',
+      interrupted: true,
+      attemptId: request.attemptRef.attemptId,
+    };
   }
 }
 
@@ -466,13 +651,20 @@ export class WarpMacosAdapter {
     } catch (error) {
       return { status: 'target-unavailable', submitted: false, error: error.message, safeBeforeSideEffect: true };
     }
+    let request;
+    try {
+      request = createWarpSideEffectRequest({
+        kind: 'submit',
+        operationId: options.operationId,
+        job,
+        target,
+      });
+    } catch (error) {
+      return { status: 'target-unavailable', submitted: false, error: error.message, safeBeforeSideEffect: true };
+    }
     let result;
     try {
-      result = await this.helper.submitText(target, job.promptText || job.promptPath, {
-        operationId: options.operationId,
-        attempt: job.attempt,
-        signal: options.signal,
-      });
+      result = await this.helper.submitText(request, { signal: options.signal });
     } catch (error) {
       return { status: 'dispatch-error', error: error.message, ambiguous: true };
     }
@@ -480,6 +672,7 @@ export class WarpMacosAdapter {
     const mapped = assertSideEffectMapping(result, {
       expectedTargetFingerprintHash: target.targetFingerprintHash,
       expectedAttempt: job.attempt,
+      expectedRequest: request,
       evidence,
     });
     return { ...result, ...mapped };
@@ -493,7 +686,32 @@ export class WarpMacosAdapter {
     } catch (error) {
       return { status: 'stale-attempt', interrupted: false, reason: error.message };
     }
-    return this.helper.interrupt(target, attempt);
+    const job = {
+      attempt,
+      promptText: '',
+      pilotAuthorization: attempt.pilotAuthorization || diagnosticPilotAuthorization(),
+    };
+    const operationId = attempt.operationId || randomUUID();
+    let request;
+    try {
+      request = createWarpSideEffectRequest({
+        kind: 'interrupt',
+        operationId,
+        job,
+        target,
+        reason: 'operator-cancel',
+      });
+    } catch (error) {
+      return { status: 'stale-attempt', interrupted: false, reason: error.message };
+    }
+    const result = await this.helper.interrupt(request);
+    const mirror = assertWarpResultMirrorsRequest({
+      result,
+      request,
+      resultKind: 'warp-macos.interrupt-result',
+    });
+    if (!mirror.ok) return { status: 'stale-attempt', interrupted: false, reason: mirror.reason };
+    return result;
   }
 
   async settleDispatch() {

@@ -97,6 +97,33 @@ function readStatus(taskId) {
   return JSON.parse(fs.readFileSync(p, 'utf-8'));
 }
 
+function workflowStatusSnapshot(taskId) {
+  const status = readStatus(taskId);
+  return {
+    taskId: status.taskId,
+    currentSubtask: status.currentSubtask,
+    currentStage: status.currentStage,
+    subtasks: Object.fromEntries(Object.entries(status.subtasks || {}).map(([subtaskId, subtask]) => [
+      subtaskId,
+      {
+        status: subtask.status,
+        planRound: subtask.planRound,
+        codeRound: subtask.codeRound,
+        deliveryRound: subtask.deliveryRound,
+        stages: Object.fromEntries(Object.entries(subtask.stages || {}).map(([stageId, stage]) => [
+          stageId,
+          {
+            stageStatus: stage.stageStatus,
+            currentOutputPath: stage.currentOutputPath,
+            latestAcceptedOutputPath: stage.latestAcceptedOutputPath,
+            outputs: stage.outputs || [],
+          },
+        ])),
+      },
+    ])),
+  };
+}
+
 function activeSubmittedStatus(taskId, bindingId) {
   const status = readStatus(taskId);
   if (!status?.execution?.activeAttemptId) return null;
@@ -2720,6 +2747,38 @@ Expected: Should be fixed
       assert.match(stale.stderr, /binding-stale/);
     });
 
+    it('supports worker-launch heartbeat and detach without leaking raw nonce or changing workflow status', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const before = workflowStatusSnapshot('W6-A');
+
+      const launched = harness('worker-launch W6-A --role work --binding wrapper.work');
+      assert.equal(launched.success, true, launched.stderr);
+      assert.doesNotMatch(launched.stdout, /rawNonce|sessionNonce[^H]/);
+      assert.deepEqual(workflowStatusSnapshot('W6-A'), before);
+
+      const bindingPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'bindings', 'wrapper.work.json');
+      const original = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+      const heartbeat = harness('worker-heartbeat W6-A --binding wrapper.work');
+      assert.equal(heartbeat.success, true, heartbeat.stderr);
+      assert.match(heartbeat.stdout, /heartbeat-recorded/);
+      const refreshed = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+      assert.ok(Date.parse(refreshed.heartbeatAt) >= Date.parse(original.heartbeatAt));
+      assert.equal(refreshed.state, 'live');
+      assert.deepEqual(workflowStatusSnapshot('W6-A'), before);
+
+      const detached = harness('worker-detach W6-A --binding wrapper.work --reason done');
+      assert.equal(detached.success, true, detached.stderr);
+      assert.match(detached.stdout, /"status": "detached"/);
+      const detachedBinding = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+      assert.equal(detachedBinding.state, 'detached');
+      assert.equal(detachedBinding.detachReason, 'done');
+      assert.deepEqual(workflowStatusSnapshot('W6-A'), before);
+
+      const staleHeartbeat = harness('worker-heartbeat W6-A --binding wrapper.work');
+      assert.equal(staleHeartbeat.success, false);
+      assert.match(staleHeartbeat.stderr, /binding-unavailable/);
+    });
+
     it('rejects binding replacement while an active attempt for the role exists', async () => {
       assert.equal(harness('init W6-A --force').success, true);
       assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
@@ -2788,6 +2847,41 @@ Expected: Should be fixed
       assert.equal(fs.readFileSync(statusFile, 'utf8'), before);
       assert.match(doctor.stdout, /"completionReceiptCapability": "available"/);
       assert.match(doctor.stdout, /"needsInputCapability": "available"/);
+    });
+
+    it('keeps worker-hook-probe fixture diagnostics from authorizing pilot-doctor', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      fs.rmSync(path.join(HARNESS_DIR, 'runs', 'W6-A', 'capabilities', 'claude-hook.json'), { force: true });
+      const fixture = path.join(TEST_ROOT, 'hook-fixture-only.json');
+      fs.writeFileSync(fixture, JSON.stringify({
+        hookSource: 'claude-code-hook',
+        hookVersion: 'test-1',
+        completionPhase: 'claude-completed',
+        attemptRefSource: 'wrapper-injected',
+        bindingSessionSource: 'wrapper-injected',
+        needsInputCategorySource: 'hook-payload',
+        kind: 'job.completed',
+        occurredAt: new Date().toISOString(),
+        needsInputCategory: 'agent-question',
+      }), 'utf8');
+      const before = workflowStatusSnapshot('W6-A');
+      const probe = harness(`worker-hook-probe W6-A --payload ${fixture}`);
+      assert.equal(probe.success, true, probe.stderr);
+      assert.match(probe.stdout, /fixture-diagnostic-recorded/);
+      assert.match(probe.stdout, /"realCapabilityWritten": false/);
+      assert.deepEqual(workflowStatusSnapshot('W6-A'), before);
+      assert.equal(fs.existsSync(path.join(HARNESS_DIR, 'runs', 'W6-A', 'capabilities', 'claude-hook.json')), false);
+
+      const parsed = JSON.parse(probe.stdout);
+      const diagnostic = JSON.parse(fs.readFileSync(parsed.diagnosticPath, 'utf8'));
+      assert.equal(diagnostic.fixture, true);
+      assert.equal(diagnostic.pilotEligible, false);
+
+      const doctor = harness('pilot-doctor W6-A --json');
+      assert.equal(doctor.success, true, doctor.stderr);
+      const pilot = JSON.parse(doctor.stdout);
+      assert.equal(pilot.hookCapabilities.completionReceiptCapability, 'unavailable');
+      assert.equal(pilot.pilotRun.allowed, false);
     });
 
     it('keeps hook capability unavailable for missing, stale, drifted, or incomplete evidence', () => {
@@ -2912,6 +3006,51 @@ Expected: Should be fixed
       const cancelled = harness(`cancel W6-A --job ${status.execution.activeJobId} --attempt ${status.execution.activeAttemptId} --lease-token ${status.execution.activeLeaseToken}`);
       assert.equal(cancelled.success, true, `${cancelled.stderr}\n${cancelled.stdout}`);
       await running.completed;
+    });
+
+    it('fails closed for real target binding without falling back to fixture challenge', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
+      assert.equal(harness('warp-doctor W6-A --probe-fixture --enable-phase5-candidate').success, true);
+
+      const fixtureEvidence = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --real');
+      assert.equal(fixtureEvidence.success, false);
+      assert.match(fixtureEvidence.stderr, /warp-bind-target-real-capability-unavailable/);
+      const bindingPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'bindings', 'wrapper.work.json');
+      let binding = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+      assert.equal(binding.targetBinding, undefined);
+
+      const capabilityPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'capabilities', 'warp-macos.json');
+      fs.writeFileSync(capabilityPath, JSON.stringify({
+        protocolVersion: 1,
+        kind: 'warp-macos.capability',
+        capturedAt: new Date().toISOString(),
+        fixture: false,
+        warp: { detected: true, bundleId: 'dev.warp.Warp-Stable', version: 'fixture-test' },
+        accessibility: { permission: 'granted', helper: 'real-helper', helperVersion: 1 },
+        targetDiscovery: {
+          available: true,
+          stableFingerprintFields: ['bundleId', 'windowId', 'tabId', 'roleBindingMarker'],
+          requiresTwoScanStability: true,
+        },
+        inputSubmission: {
+          available: true,
+          method: 'accessibility-key-events',
+          usesClipboard: false,
+          settleBarrier: 'helper-submit-result',
+        },
+        targetIdentity: { available: true, requiresWrapperBinding: true, requiresChallenge: true },
+        diagnosticEligible: true,
+        phase4RunEnabled: false,
+        phase5ProductionCandidate: true,
+        reasons: [],
+      }, null, 2), 'utf8');
+
+      const noTargetLocalChannel = harness('warp-bind-target W6-A --role work --binding wrapper.work --candidate candidate-work --real');
+      assert.equal(noTargetLocalChannel.success, false);
+      assert.match(noTargetLocalChannel.stderr, /warp-bind-target-real-target-local-response-channel-unavailable/);
+      binding = JSON.parse(fs.readFileSync(bindingPath, 'utf8'));
+      assert.equal(binding.targetBinding, undefined);
     });
 
     it('requires hook completion and needs-input capability before warp production-test run prepares a job', () => {

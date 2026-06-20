@@ -465,7 +465,10 @@ const MANUAL_PROGRESS_COMMANDS = new Set([
   'init', 'next', 'step', 'check', 'advance', 'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current',
 ]);
 
-const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set(['worker-attach', 'warp-bind-target', 'pilot-allow']);
+const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set([
+  'worker-attach', 'worker-launch', 'worker-heartbeat', 'worker-detach',
+  'worker-hook-probe', 'warp-bind-target', 'pilot-allow',
+]);
 
 function assertNoActiveExecution(taskId, command) {
   if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
@@ -2756,13 +2759,17 @@ Examples:
   harness reconcile W6-A --attempt <attemptId> --decision sent|not-sent|abandon [evidence]
   harness <manual-command> W6-A --takeover --reason "<reason>"
   harness worker-attach W6-A --role work|review --binding <bindingId> [--cwd <path>] [--dry-run]
+  harness worker-launch W6-A --role work|review --binding <bindingId> [--cwd <path>] [--dry-run]
+  harness worker-heartbeat W6-A --binding <bindingId>
+  harness worker-detach W6-A --binding <bindingId> --reason <text>
+  harness worker-hook-probe W6-A --payload <payload.json>
   harness worker-bindings W6-A [--json]
   harness worker-challenge W6-A --binding <bindingId>
   harness worker-challenge W6-A --probe-hook-payload <fixture.json>
   harness worker-receipt W6-A --attempt <attemptId> --kind job.completed --sequence 1 [--binding <bindingId>]
   harness warp-doctor W6-A [--json] [--probe-fixture]
   harness warp-targets W6-A --role work|review [--json]
-  harness warp-bind-target W6-A --role work|review --binding <bindingId> --candidate <candidateId> [--respond-fixture]
+  harness warp-bind-target W6-A --role work|review --binding <bindingId> --candidate <candidateId> [--respond-fixture] [--real]
   harness warp-shadow-send W6-A --role work|review --binding <bindingId> [--message <text>]
   harness pilot-doctor W6-A [--json]
   harness pilot-allow W6-A --subtask <subtaskId> --work-stage <stageId> --review-stage <stageId> --roles work,review --reason <text> --expires-at <iso>
@@ -3822,6 +3829,87 @@ function cmdWorkerAttach(taskId, opts = {}) {
   return result;
 }
 
+function cmdWorkerHeartbeat(taskId, opts = {}) {
+  const bindingId = opts.binding;
+  if (!bindingId) throw new Error('--binding required');
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const binding = store.readBinding(bindingId);
+  if (!binding) throw new Error('binding-not-found');
+  if (['terminal', 'revoked', 'detached'].includes(binding.state)) throw new Error('binding-unavailable');
+  const heartbeatAt = new Date().toISOString();
+  const next = { ...binding, heartbeatAt, state: binding.state || 'live' };
+  store.writeBinding(next);
+  const result = {
+    status: 'heartbeat-recorded',
+    bindingId,
+    role: next.role,
+    bindingGeneration: next.bindingGeneration,
+    sessionId: next.sessionId,
+    heartbeatAt,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerDetach(taskId, opts = {}) {
+  const bindingId = opts.binding;
+  if (!bindingId) throw new Error('--binding required');
+  const reason = opts.reason;
+  if (!reason) throw new Error('--reason required');
+  const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
+  const binding = store.readBinding(bindingId);
+  if (!binding) throw new Error('binding-not-found');
+  const detachedAt = new Date().toISOString();
+  const next = { ...binding, state: 'detached', detachedAt, detachReason: reason };
+  store.writeBinding(next);
+  const result = {
+    status: 'detached',
+    bindingId,
+    role: next.role,
+    bindingGeneration: next.bindingGeneration,
+    sessionId: next.sessionId,
+    detachedAt,
+    reason,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function cmdWorkerHookProbe(taskId, opts = {}) {
+  const payloadPath = opts.payload;
+  if (!payloadPath) throw new Error('--payload required');
+  const resolved = path.resolve(String(payloadPath));
+  const payload = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  const observedFields = Object.keys(payload).sort();
+  const payloadHash = stableHash(payload);
+  const capturedAt = new Date().toISOString();
+  const diagnostic = {
+    protocolVersion: 1,
+    kind: 'claude-hook.fixture-diagnostic',
+    fixture: true,
+    source: resolved,
+    capturedAt,
+    payloadHash,
+    observedFields,
+    realCapabilityWritten: false,
+    pilotEligible: false,
+    reason: 'fixture-hook-payload-cannot-authorize-real-pilot',
+  };
+  const diagnosticsDir = path.join(HARNESS_ROOT, 'runs', taskId, 'diagnostics', 'hook-fixtures');
+  const diagnosticId = `${Date.now()}-${createHash('sha256').update(payloadHash).digest('hex').slice(0, 12)}`;
+  const diagnosticPath = path.join(diagnosticsDir, `${diagnosticId}.json`);
+  writeJSON(diagnosticPath, diagnostic);
+  const result = {
+    status: 'fixture-diagnostic-recorded',
+    diagnosticPath,
+    payloadHash,
+    realCapabilityWritten: false,
+    pilotEligible: false,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 function cmdWorkerBindings(taskId, opts = {}) {
   const { store } = createWorkerRuntime(taskId, { adapterName: opts.adapter || 'fake' });
   const result = {
@@ -4087,6 +4175,7 @@ async function cmdWarpBindTarget(taskId, opts = {}) {
   const role = opts.role;
   const bindingId = opts.binding;
   const candidateId = opts.candidate;
+  const real = opts.real === true || opts.real === 'true';
   if (!['work', 'review'].includes(role)) throw new Error('--role must be work or review');
   if (!bindingId) throw new Error('--binding required');
   if (!candidateId) throw new Error('--candidate required');
@@ -4106,6 +4195,12 @@ async function cmdWarpBindTarget(taskId, opts = {}) {
   }
   const capability = store.readCapability(WARP_CAPABILITY_NAME);
   const capabilities = deriveWarpCapabilities(capability, { requireProductionTest: false });
+  if (real) {
+    if (!capability || capability.fixture === true || !capabilities.phase5ProductionCandidate) {
+      throw new Error('warp-bind-target-real-capability-unavailable');
+    }
+    throw new Error('warp-bind-target-real-target-local-response-channel-unavailable');
+  }
   if (!capabilities.diagnosticEligible) throw new Error('warp-macos-capability-unavailable');
   const discoveryPlan = warpFixtureDiscoveryPlan(binding, candidateId, opts);
   const helper = new FixtureWarpMacosHelper(discoveryPlan);
@@ -4173,10 +4268,7 @@ async function cmdWarpShadowSend(taskId, opts = {}) {
       protocolVersion: 1,
       kind: 'warp-macos.submit-result',
       operationId,
-      jobId: null,
-      attemptId: null,
-      leaseToken: null,
-      candidateFingerprintHash: target.targetFingerprintHash,
+      targetFingerprintHash: target.targetFingerprintHash,
       transportEvidenceId: randomUUID(),
       sideEffectState: opts['side-effect-state'],
       settled: true,
@@ -4187,7 +4279,21 @@ async function cmdWarpShadowSend(taskId, opts = {}) {
   });
   const adapter = new WarpMacosAdapter({ store, helper, productionTest: true, scratchTask: true });
   const result = await adapter.dispatch(
-    { jobId: null, promptText: message, attempt: { jobId: null, attemptId: null, leaseToken: null } },
+    {
+      jobId: `shadow:${operationId}`,
+      promptText: message,
+      attempt: {
+        jobId: `shadow:${operationId}`,
+        attemptId: `shadow-attempt:${operationId}`,
+        leaseToken: `shadow-lease:${operationId}`,
+        lockEpoch: 0,
+      },
+      pilotAuthorization: {
+        allowlistId: 'warp-shadow-send',
+        allowlistHash: 'sha256:warp-shadow-send',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    },
     target,
     { operationId }
   );
@@ -4255,7 +4361,8 @@ async function main() {
     const commandsNeedingConfig = ['init', 'next', 'step', 'current', 'check', 'advance', 'status', 'summary',
       'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current', 'brief',
       'doctor', 'run', 'pump', 'jobs', 'retry', 'cancel', 'reconcile',
-      'worker-attach', 'worker-bindings', 'worker-challenge', 'worker-receipt',
+      'worker-attach', 'worker-launch', 'worker-heartbeat', 'worker-detach',
+      'worker-hook-probe', 'worker-bindings', 'worker-challenge', 'worker-receipt',
       'warp-doctor', 'warp-targets', 'warp-bind-target', 'warp-shadow-send',
       'pilot-doctor', 'pilot-allow'];
     if (commandsNeedingConfig.includes(command) && taskId) {
@@ -4389,6 +4496,26 @@ async function main() {
       case 'worker-attach': {
         if (!taskId) throw new Error('taskId required');
         commandResult = cmdWorkerAttach(taskId, opts);
+        break;
+      }
+      case 'worker-launch': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerAttach(taskId, opts);
+        break;
+      }
+      case 'worker-heartbeat': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerHeartbeat(taskId, opts);
+        break;
+      }
+      case 'worker-detach': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerDetach(taskId, opts);
+        break;
+      }
+      case 'worker-hook-probe': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdWorkerHookProbe(taskId, opts);
         break;
       }
       case 'worker-bindings': {

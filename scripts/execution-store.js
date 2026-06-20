@@ -52,6 +52,24 @@ const atomicWriteJson = (filePath, value, faultInjector) => {
   }
 };
 
+const sleepSync = ms => {
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+};
+
+const acquireFileLock = (lockPath, timeoutMs = 1000) => {
+  ensureDir(path.dirname(lockPath));
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      return fs.openSync(lockPath, 'wx', 0o600);
+    } catch (err) {
+      if (err.code !== 'EEXIST' || Date.now() >= deadline) throw err;
+      sleepSync(10);
+    }
+  }
+};
+
 const readJson = filePath => {
   if (!fs.existsSync(filePath)) return null;
   try {
@@ -131,6 +149,63 @@ export class ExecutionStore {
 
   readAttempt(attemptId) {
     return this.readRecord('attempts', attemptId);
+  }
+
+  receiptSequenceLedgerPath(attemptId) {
+    if (!attemptId) throw new Error('attemptId is required');
+    return path.join(this.paths.attempts, attemptId, 'receipt-sequence-ledger.json');
+  }
+
+  allocateReceiptSequence({ attemptId, eventId, payloadHash, receiptPath }) {
+    if (!attemptId || !eventId || !payloadHash || !receiptPath) {
+      throw new Error('attemptId, eventId, payloadHash, and receiptPath are required');
+    }
+    const ledgerPath = this.receiptSequenceLedgerPath(attemptId);
+    const lockPath = `${ledgerPath}.lock`;
+    const lockFd = acquireFileLock(lockPath);
+    try {
+      const ledger = readJson(ledgerPath) || {
+        protocolVersion: 1,
+        attemptId,
+        nextSequence: 1,
+        events: {},
+        payloads: {},
+      };
+      if (ledger.attemptId !== attemptId) throw new Error(`receipt-sequence-ledger-attempt-mismatch: ${attemptId}`);
+      if (!Number.isInteger(ledger.nextSequence) || ledger.nextSequence <= 0) {
+        throw new Error(`receipt-sequence-ledger-corrupt: ${attemptId}`);
+      }
+      const existingEvent = ledger.events[eventId] || null;
+      if (existingEvent) {
+        if (existingEvent.payloadHash !== payloadHash) throw new Error(`event-id-collision: ${eventId}`);
+        return { status: 'duplicate-event', ...existingEvent };
+      }
+      const duplicateEventId = ledger.payloads[payloadHash] || null;
+      if (duplicateEventId) {
+        const duplicate = ledger.events[duplicateEventId];
+        if (duplicate) return { status: 'duplicate-payload', eventId: duplicateEventId, ...duplicate };
+      }
+      const sequence = ledger.nextSequence;
+      const nextLedger = {
+        ...ledger,
+        nextSequence: sequence + 1,
+        events: {
+          ...ledger.events,
+          [eventId]: { eventId, payloadHash, sequence, receiptPath },
+        },
+        payloads: {
+          ...ledger.payloads,
+          [payloadHash]: eventId,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+      atomicWriteJson(ledgerPath, nextLedger, this.faultInjector);
+      return { status: 'allocated', eventId, payloadHash, sequence, receiptPath };
+    } finally {
+      fs.closeSync(lockFd);
+      fs.rmSync(lockPath, { force: true });
+      fsyncDirectory(path.dirname(lockPath));
+    }
   }
 
   writeOperation(operation) {
