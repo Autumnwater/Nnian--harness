@@ -98,6 +98,7 @@ const unavailableCapabilities = reason => ({
 export const deriveWarpCapabilities = (evidence, {
   nowMs = Date.now(),
   requireProductionTest = false,
+  requirePhase5Pilot = false,
 } = {}) => {
   if (!evidence) return unavailableCapabilities('missing-warp-capability-evidence');
   const capturedAtMs = Date.parse(evidence.capturedAt);
@@ -126,15 +127,19 @@ export const deriveWarpCapabilities = (evidence, {
     requireProductionTest &&
     evidence.phase4RunEnabled === true &&
     evidence.fixture === true;
+  const phase5ProductionCandidate = diagnosticEligible &&
+    evidence.phase5ProductionCandidate === true &&
+    evidence.fixture !== true;
+  const phase5RunEnabled = requirePhase5Pilot && phase5ProductionCandidate;
   return {
-    dispatch: phase4RunEnabled,
-    cancel: phase4RunEnabled,
-    abortableDispatch: phase4RunEnabled,
-    settleBarrier: phase4RunEnabled,
+    dispatch: phase4RunEnabled || phase5RunEnabled,
+    cancel: phase4RunEnabled || phase5RunEnabled,
+    abortableDispatch: phase4RunEnabled || phase5RunEnabled,
+    settleBarrier: phase4RunEnabled || phase5RunEnabled,
     mode: 'warp-macos',
     diagnosticEligible,
     phase4RunEnabled,
-    phase5ProductionCandidate: diagnosticEligible && evidence.phase5ProductionCandidate === true,
+    phase5ProductionCandidate,
     reasons,
     capturedAt: evidence.capturedAt,
   };
@@ -364,17 +369,21 @@ export class FixtureWarpMacosHelper {
 }
 
 export class WarpMacosAdapter {
-  constructor({ store, helper = new FixtureWarpMacosHelper(), productionTest = false, scratchTask = false } = {}) {
+  constructor({ store, helper = new FixtureWarpMacosHelper(), productionTest = false, scratchTask = false, phase5Pilot = false } = {}) {
     this.store = store;
     this.helper = helper;
     this.helper?.setStore?.(store);
     this.productionTest = productionTest;
     this.scratchTask = scratchTask;
+    this.phase5Pilot = phase5Pilot;
   }
 
   async capabilities() {
     const evidence = this.store?.readCapability(WARP_CAPABILITY_NAME);
-    return deriveWarpCapabilities(evidence, { requireProductionTest: this.productionTest && this.scratchTask });
+    return deriveWarpCapabilities(evidence, {
+      requireProductionTest: this.productionTest && this.scratchTask,
+      requirePhase5Pilot: this.phase5Pilot,
+    });
   }
 
   async discoverTargets() {

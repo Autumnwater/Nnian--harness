@@ -27,6 +27,7 @@ import { deriveAdvanceTransition, evaluateStageCheck } from './workflow-core.js'
 import {
   FixtureWarpMacosHelper,
   WARP_CAPABILITY_NAME,
+  WARP_CAPABILITY_TTL_MS,
   WarpMacosAdapter,
   createTargetChallengePayload,
   createTargetChallengeResponse,
@@ -2768,7 +2769,7 @@ Examples:
 `);
 }
 
-function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = false, productionTest = false, scratchTask = false } = {}) {
+function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = false, productionTest = false, scratchTask = false, phase5Pilot = false } = {}) {
   const store = new ExecutionStore({ harnessRoot: HARNESS_ROOT, taskId });
   const targets = [
     { bindingId: 'fake.work', role: 'work' },
@@ -2778,11 +2779,20 @@ function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = fal
   if (adapterName === 'manual') {
     adapter = new ManualWorkerAdapter();
   } else if (adapterName === 'warp-macos') {
+    const useFixtureHelper = (productionTest && scratchTask) || process.env.HARNESS_ENABLE_TEST_WARP_HELPER === '1';
     adapter = new WarpMacosAdapter({
       store,
-      helper: new FixtureWarpMacosHelper({ candidates: warpTargetCandidates(store), store }),
+      helper: useFixtureHelper
+        ? new FixtureWarpMacosHelper({ candidates: warpTargetCandidates(store), store })
+        : {
+          setStore() {},
+          async scanTargets() { return []; },
+          async submitText() { throw new Error('warp-macos-helper-unavailable'); },
+          async interrupt() { return { status: 'stale-attempt', interrupted: false, reason: 'warp-macos-helper-unavailable' }; },
+        },
       productionTest,
       scratchTask,
+      phase5Pilot,
     });
   } else {
     adapter = new FakeWorkerAdapter({ targets, transportStore: store });
@@ -2845,6 +2855,42 @@ function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = fal
     workflow,
     transaction: alreadyLocked ? callback => callback() : callback => withTaskExecutionLockRetry(taskId, 'worker-transaction', callback),
     validatePilotAuthorization: (authorization, context) => validatePilotAuthorization(taskId, authorization, context),
+    capturePilotAuthorization: ({ jobInput, status, target }) => {
+      if (!jobInput.phase5Pilot) return jobInput.pilotAuthorization || null;
+      const allowlist = readPilotAllowlist(taskId);
+      const unit = findPilotUnit(allowlist, jobInput.pilotUnitId);
+      if (!unit) throw new Error('pilot-unit-not-allowed');
+      const hookCapabilities = deriveHookCapabilities(store.readCapability('claude-hook'));
+      if (hookCapabilities.completionReceiptCapability !== 'available' ||
+          hookCapabilities.needsInputCapability !== 'available') {
+        throw new Error('hook-completion-and-needs-input-required');
+      }
+      const warpCapabilities = deriveWarpCapabilities(store.readCapability(WARP_CAPABILITY_NAME), {
+        requireProductionTest: productionTest && scratchTask,
+        requirePhase5Pilot: !(productionTest && scratchTask),
+      });
+      if (productionTest && scratchTask) {
+        if (warpCapabilities.phase4RunEnabled !== true) throw new Error('phase5-test-warp-capability-required');
+      } else if (warpCapabilities.phase5ProductionCandidate !== true ||
+          !warpCapabilities.dispatch ||
+          !warpCapabilities.abortableDispatch ||
+          !warpCapabilities.settleBarrier) {
+        throw new Error('phase5-production-candidate-required');
+      }
+      if (target.bindingId !== jobInput.targetBinding || target.role !== jobInput.role) {
+        throw new Error('pilot-target-binding-conflict');
+      }
+      if (adapterName === 'warp-macos') {
+        adapter.assertCurrentTargetIdentity(target);
+      }
+      return createPilotAuthorizationSnapshot(taskId, {
+        allowlist,
+        unit,
+        role: jobInput.role,
+        status,
+        store,
+      });
+    },
     onPilotEvent: event => applyPilotCounterEvent(taskId, event),
     onWorkflowCommitted: ({ job, attempt, evaluation, postCursor, pilotRoleProgress }) => {
       const authorization = job.pilotAuthorization || attempt.pilotAuthorization || null;
@@ -3102,6 +3148,38 @@ function createPilotAuthorizationSnapshot(taskId, { allowlist, unit, role, statu
     derivedClassificationHash: classification.classificationHash,
     reasonHash: stableHash(allowlist.reason || ''),
   };
+}
+
+function applyPhase5TestMutationAfterNext(taskId, mutation) {
+  if (mutation === 'allowlist-drift') {
+    const allowlistPath = pilotAllowlistPath(taskId);
+    const allowlist = readJSON(allowlistPath);
+    if (!allowlist) throw new Error('test-mutation-allowlist-missing');
+    allowlist.allowedPilotUnits[0].testMutation = randomUUID();
+    writeJSON(allowlistPath, allowlist);
+    return;
+  }
+  if (mutation === 'allowlist-expired') {
+    const allowlist = readPilotAllowlist(taskId);
+    if (!allowlist) throw new Error('test-mutation-allowlist-missing');
+    writePilotAllowlist(taskId, {
+      ...allowlist,
+      allowlistHash: null,
+      expiresAt: '2000-01-01T00:00:00.000Z',
+    });
+    return;
+  }
+  if (mutation === 'capability-drift') {
+    const store = new ExecutionStore({ harnessRoot: HARNESS_ROOT, taskId });
+    const capability = store.readCapability(WARP_CAPABILITY_NAME);
+    if (!capability) throw new Error('test-mutation-capability-missing');
+    store.writeCapability(WARP_CAPABILITY_NAME, {
+      ...capability,
+      capturedAt: new Date(Date.now() - WARP_CAPABILITY_TTL_MS - 10_000).toISOString(),
+    });
+    return;
+  }
+  throw new Error(`unknown-phase5-test-mutation: ${mutation}`);
 }
 
 function validatePilotAuthorization(taskId, authorization, { status }) {
@@ -3422,7 +3500,7 @@ function cmdPilotDoctor(taskId, opts = {}) {
     allowlistReason = error.message;
   }
   const hookCapabilities = deriveHookCapabilities(store.readCapability('claude-hook'));
-  const warpCapabilities = deriveWarpCapabilities(store.readCapability(WARP_CAPABILITY_NAME), { requireProductionTest: true });
+  const warpCapabilities = deriveWarpCapabilities(store.readCapability(WARP_CAPABILITY_NAME), { requirePhase5Pilot: true });
   const pilotReasons = [];
   let selectedPilotUnit = null;
   let selectedRole = null;
@@ -3561,6 +3639,8 @@ function cmdPilotAllow(taskId, opts = {}) {
 
 async function cmdWorkerRun(taskId, opts = {}) {
   const phase5Pilot = opts['phase5-pilot'] === true || opts['phase5-pilot'] === 'true';
+  const productionTest = opts['production-test'] === true || opts['production-test'] === 'true';
+  const productionTestTask = isWarpProductionTestTask(taskId, opts);
   if (opts.adapter === 'warp-macos' && !isWarpProductionTestTask(taskId, opts) && !phase5Pilot) {
     const result = { success: false, status: 'warp-macos-production-disabled' };
     console.log(JSON.stringify(result, null, 2));
@@ -3568,8 +3648,9 @@ async function cmdWorkerRun(taskId, opts = {}) {
   }
   const runtime = createWorkerRuntime(taskId, {
     adapterName: opts.adapter,
-    productionTest: opts['production-test'] === true || opts['production-test'] === 'true' || phase5Pilot,
-    scratchTask: isWarpProductionTestTask(taskId, opts) || phase5Pilot,
+    productionTest,
+    scratchTask: productionTestTask,
+    phase5Pilot,
   });
   const capabilities = await runtime.adapter.capabilities();
   if (!capabilities.dispatch || !capabilities.abortableDispatch || !capabilities.settleBarrier) {
@@ -3619,15 +3700,12 @@ async function cmdWorkerRun(taskId, opts = {}) {
   }
   const nextResult = await withTaskExecutionLock(taskId, 'worker-next', () => cmdNext(taskId, { copy: false }));
   if (nextResult.error) return { success: false, error: nextResult.error };
+  if (phase5Pilot && process.env.HARNESS_ENABLE_TEST_FAULTS === '1' && process.env.HARNESS_PHASE5_TEST_MUTATE_AFTER_NEXT) {
+    applyPhase5TestMutationAfterNext(taskId, process.env.HARNESS_PHASE5_TEST_MUTATE_AFTER_NEXT);
+  }
   const status = loadStatus(taskId);
   const stageData = status.subtasks[status.currentSubtask].stages[status.currentStage];
   const role = phase5Pilot ? opts.role : workerRoleForStage(status.currentStage);
-  let pilotAuthorization = null;
-  if (phase5Pilot) {
-    const allowlist = readPilotAllowlist(taskId);
-    const unit = findPilotUnit(allowlist, phase5Preflight.unit.pilotUnitId);
-    pilotAuthorization = createPilotAuthorizationSnapshot(taskId, { allowlist, unit, role, status, store: runtime.store });
-  }
   const promptSnapshot = getFileSnapshot(nextResult.promptPath);
   const { supervisor } = runtime;
   const prepared = await supervisor.prepare({
@@ -3644,7 +3722,10 @@ async function cmdWorkerRun(taskId, opts = {}) {
     promptSha256: promptSnapshot.sha256,
     primaryReportPath: stageData.primaryReportPath,
     outputBaseline: stageData.outputBaseline,
-    ...(pilotAuthorization ? { pilotAuthorization } : {}),
+    ...(phase5Pilot ? {
+      phase5Pilot: true,
+      pilotUnitId: phase5Preflight.unit.pilotUnitId,
+    } : {}),
   });
   const dispatched = await supervisor.dispatch(prepared.operationId, {
     timeoutMs: Number(opts['dispatch-timeout-ms'] || 30_000),

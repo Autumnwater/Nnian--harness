@@ -90,7 +90,7 @@ const validateReceipt = (receipt, nowMs, maxClockSkewMs) => {
 };
 
 export class ExecutionSupervisor {
-  constructor({ taskId, store, statusStore, adapter, workflow, clock = isoNow, faultInjector = null, maxClockSkewMs = 60_000, transaction = callback => callback(), validatePilotAuthorization = null, onPilotEvent = null, onWorkflowCommitted = null }) {
+  constructor({ taskId, store, statusStore, adapter, workflow, clock = isoNow, faultInjector = null, maxClockSkewMs = 60_000, transaction = callback => callback(), validatePilotAuthorization = null, capturePilotAuthorization = null, onPilotEvent = null, onWorkflowCommitted = null }) {
     this.taskId = required(taskId, 'taskId');
     this.store = store;
     this.statusStore = statusStore;
@@ -101,6 +101,7 @@ export class ExecutionSupervisor {
     this.maxClockSkewMs = maxClockSkewMs;
     this.transaction = transaction;
     this.validatePilotAuthorization = validatePilotAuthorization;
+    this.capturePilotAuthorization = capturePilotAuthorization;
     this.onPilotEvent = onPilotEvent;
     this.onWorkflowCommitted = onWorkflowCommitted;
   }
@@ -154,8 +155,7 @@ export class ExecutionSupervisor {
   }
 
   async prepare(jobInput) {
-    const target = await this.resolveTarget(jobInput);
-    return this.transaction(() => {
+    return this.transaction(async () => {
       this.recoverOperations();
       const status = this.statusStore.load();
     if (status.execution?.activeJobId || status.execution?.activeAttemptId) {
@@ -165,10 +165,13 @@ export class ExecutionSupervisor {
       throw new Error('stage-cas-conflict: stageRevision');
     }
 
+    const target = await this.resolveTarget(jobInput);
     const operationId = randomUUID();
     const capturedBindingIdentity = targetBindingIdentity(target);
     const capturedAdapterIdentity = targetAdapterIdentity(target);
-    const pilotAuthorization = jobInput.pilotAuthorization || null;
+    const pilotAuthorization = this.capturePilotAuthorization
+      ? await this.capturePilotAuthorization({ jobInput, status, target })
+      : jobInput.pilotAuthorization || null;
     const jobBase = createJob(jobInput);
     const attemptBase = createAttempt({ jobId: jobBase.jobId, lockEpoch: status.execution.lockEpoch });
     let job = {
