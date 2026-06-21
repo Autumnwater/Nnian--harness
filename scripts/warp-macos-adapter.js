@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 import {
   bindingIdentity,
@@ -25,6 +26,19 @@ const requiredObject = (value, field) => {
 const requiredInteger = (value, field) => {
   if (!Number.isInteger(value)) throw new Error(`${field} is required`);
   return value;
+};
+
+const parseHelperJson = (result, command) => {
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const stderr = String(result.stderr || '').trim();
+    throw new Error(stderr || `warp-macos-helper-${command}-failed`);
+  }
+  try {
+    return JSON.parse(String(result.stdout || '{}'));
+  } catch (error) {
+    throw new Error(`warp-macos-helper-${command}-invalid-json: ${error.message}`);
+  }
 };
 
 const parseTime = (value, field) => {
@@ -105,12 +119,37 @@ const unavailableCapabilities = reason => ({
   reason,
 });
 
+const sha256HashPattern = /^sha256:[a-f0-9]{64}$/;
+
+const realCapabilityValidationReasons = evidence => {
+  const reasons = [];
+  if (evidence?.protocolVersion !== 1) reasons.push('warp-capability-protocol-invalid');
+  if (evidence?.kind !== 'warp-macos.capability') reasons.push('warp-capability-kind-invalid');
+  if (evidence?.fixture !== false) reasons.push('real-helper-fixture-flag-required');
+  if (evidence?.helper?.kind !== 'warp-macos-helper') reasons.push('real-helper-kind-invalid');
+  if (!Number.isInteger(evidence?.helper?.version) || evidence.helper.version < 1) {
+    reasons.push('real-helper-version-invalid');
+  }
+  if (typeof evidence?.helper?.pathHash !== 'string' || !sha256HashPattern.test(evidence.helper.pathHash)) {
+    reasons.push('real-helper-path-hash-invalid');
+  }
+  return reasons;
+};
+
+export const assertRealWarpCapabilityEvidence = evidence => {
+  const reasons = realCapabilityValidationReasons(evidence);
+  if (reasons.length > 0) throw new Error(`invalid-real-warp-capability-evidence: ${reasons.join(',')}`);
+  return evidence;
+};
+
 export const deriveWarpCapabilities = (evidence, {
   nowMs = Date.now(),
   requireProductionTest = false,
   requirePhase5Pilot = false,
 } = {}) => {
   if (!evidence) return unavailableCapabilities('missing-warp-capability-evidence');
+  if (evidence.protocolVersion !== 1) return unavailableCapabilities('warp-capability-protocol-invalid');
+  if (evidence.kind !== 'warp-macos.capability') return unavailableCapabilities('warp-capability-kind-invalid');
   const capturedAtMs = Date.parse(evidence.capturedAt);
   if (!Number.isFinite(capturedAtMs) ||
       nowMs - capturedAtMs > WARP_CAPABILITY_TTL_MS ||
@@ -132,14 +171,16 @@ export const deriveWarpCapabilities = (evidence, {
       evidence.targetIdentity?.requiresChallenge !== true) {
     reasons.push('target-identity-contract-incomplete');
   }
+  const realCapabilityReasons = realCapabilityValidationReasons(evidence);
   const diagnosticEligible = reasons.length === 0;
   const phase4RunEnabled = diagnosticEligible &&
     requireProductionTest &&
     evidence.phase4RunEnabled === true &&
     evidence.fixture === true;
   const phase5ProductionCandidate = diagnosticEligible &&
+    realCapabilityReasons.length === 0 &&
     evidence.phase5ProductionCandidate === true &&
-    evidence.fixture !== true;
+    evidence.fixture === false;
   const phase5RunEnabled = requirePhase5Pilot && phase5ProductionCandidate;
   return {
     dispatch: phase4RunEnabled || phase5RunEnabled,
@@ -150,7 +191,7 @@ export const deriveWarpCapabilities = (evidence, {
     diagnosticEligible,
     phase4RunEnabled,
     phase5ProductionCandidate,
-    reasons,
+    reasons: requirePhase5Pilot ? [...reasons, ...realCapabilityReasons] : reasons,
     capturedAt: evidence.capturedAt,
   };
 };
@@ -550,6 +591,42 @@ export class FixtureWarpMacosHelper {
       interrupted: true,
       attemptId: request.attemptRef.attemptId,
     };
+  }
+}
+
+export class ProcessWarpMacosHelper {
+  constructor({ command = process.execPath, scriptPath = new URL('./warp-macos-helper.js', import.meta.url).pathname, env = process.env } = {}) {
+    this.command = command;
+    this.scriptPath = scriptPath;
+    this.env = env;
+  }
+
+  run(args) {
+    return parseHelperJson(spawnSync(this.command, [this.scriptPath, ...args], {
+      encoding: 'utf8',
+      env: { ...process.env, ...this.env },
+    }), args[0] || 'unknown');
+  }
+
+  async probeCapability() {
+    return this.run(['probe-capability', '--json']);
+  }
+
+  async scanTargets({ role } = {}) {
+    const args = ['scan-targets', '--json'];
+    if (role) args.push('--role', role);
+    const result = this.run(args);
+    return Array.isArray(result.targets) ? result.targets : result;
+  }
+
+  async submitText(request) {
+    assertWarpSideEffectRequest(request, 'warp-macos.submit-request');
+    return this.run(['submit-text', '--request', JSON.stringify(request), '--json']);
+  }
+
+  async interrupt(request) {
+    assertWarpSideEffectRequest(request, 'warp-macos.interrupt-request');
+    return this.run(['interrupt', '--request', JSON.stringify(request), '--json']);
   }
 }
 

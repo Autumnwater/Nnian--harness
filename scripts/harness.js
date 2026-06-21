@@ -26,11 +26,13 @@ import { ExecutionSupervisor } from './execution-supervisor.js';
 import { deriveAdvanceTransition, evaluateStageCheck } from './workflow-core.js';
 import {
   FixtureWarpMacosHelper,
+  ProcessWarpMacosHelper,
   WARP_CAPABILITY_NAME,
   WARP_CAPABILITY_TTL_MS,
   WarpMacosAdapter,
   createTargetChallengePayload,
   createTargetChallengeResponse,
+  assertRealWarpCapabilityEvidence,
   deriveWarpCapabilities,
   discoverStableTarget,
   targetFingerprintHash,
@@ -2767,7 +2769,7 @@ Examples:
   harness worker-challenge W6-A --binding <bindingId>
   harness worker-challenge W6-A --probe-hook-payload <fixture.json>
   harness worker-receipt W6-A --attempt <attemptId> --kind job.completed --sequence 1 [--binding <bindingId>]
-  harness warp-doctor W6-A [--json] [--probe-fixture]
+  harness warp-doctor W6-A [--json] [--probe-fixture] [--probe-real]
   harness warp-targets W6-A --role work|review [--json]
   harness warp-bind-target W6-A --role work|review --binding <bindingId> --candidate <candidateId> [--respond-fixture] [--real]
   harness warp-shadow-send W6-A --role work|review --binding <bindingId> [--message <text>]
@@ -2791,12 +2793,7 @@ function createWorkerRuntime(taskId, { adapterName = 'fake', alreadyLocked = fal
       store,
       helper: useFixtureHelper
         ? new FixtureWarpMacosHelper({ candidates: warpTargetCandidates(store), store })
-        : {
-          setStore() {},
-          async scanTargets() { return []; },
-          async submitText() { throw new Error('warp-macos-helper-unavailable'); },
-          async interrupt() { return { status: 'stale-attempt', interrupted: false, reason: 'warp-macos-helper-unavailable' }; },
-        },
+        : new ProcessWarpMacosHelper({ scriptPath: path.join(__dirname, 'warp-macos-helper.js') }),
       productionTest,
       scratchTask,
       phase5Pilot,
@@ -4051,7 +4048,7 @@ function cmdWorkerReceipt(taskId, opts = {}) {
   return result;
 }
 
-function cmdWarpDoctor(taskId, opts = {}) {
+async function cmdWarpDoctor(taskId, opts = {}) {
   const { store } = createWorkerRuntime(taskId, { adapterName: 'fake' });
   if (opts['probe-fixture'] === true || opts['probe-fixture'] === 'true') {
     const evidence = {
@@ -4069,6 +4066,13 @@ function cmdWarpDoctor(taskId, opts = {}) {
       phase5ProductionCandidate: opts['enable-phase5-candidate'] === true || opts['enable-phase5-candidate'] === 'true',
       reasons: [],
     };
+    store.writeCapability(WARP_CAPABILITY_NAME, evidence);
+  }
+  if (opts['probe-real'] === true || opts['probe-real'] === 'true') {
+    const helper = new ProcessWarpMacosHelper({ scriptPath: path.join(__dirname, 'warp-macos-helper.js') });
+    const evidence = await helper.probeCapability();
+    assertRealWarpCapabilityEvidence(evidence);
+    if (evidence.inputSubmission?.usesClipboard !== false) throw new Error('warp-probe-real-clipboard-forbidden');
     store.writeCapability(WARP_CAPABILITY_NAME, evidence);
   }
   const evidence = store.readCapability(WARP_CAPABILITY_NAME);
@@ -4535,7 +4539,7 @@ async function main() {
       }
       case 'warp-doctor': {
         if (!taskId) throw new Error('taskId required');
-        commandResult = cmdWarpDoctor(taskId, opts);
+        commandResult = await cmdWarpDoctor(taskId, opts);
         break;
       }
       case 'warp-targets': {

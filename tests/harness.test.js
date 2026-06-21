@@ -15,6 +15,7 @@ const REVIEW_ROOT = path.join(TEST_ROOT, 'review');
 const CODE_REPO = path.join(TEST_ROOT, 'hexai');
 const HARNESS_DIR = path.join(REVIEW_ROOT, 'Harness');
 const HARNESS_SCRIPT = path.join(HARNESS_DIR, 'scripts', 'harness.js');
+const REAL_HELPER_PATH_HASH = `sha256:${'b'.repeat(64)}`;
 process.env.HARNESS_ENABLE_TEST_WARP_HELPER = '1';
 process.env.HARNESS_ENABLE_TEST_FAULTS = '1';
 
@@ -169,6 +170,7 @@ function setupPhase5PilotCapabilities(taskId) {
     name: 'warp-macos',
     capturedAt: new Date().toISOString(),
     fixture: false,
+    helper: { kind: 'warp-macos-helper', version: 1, pathHash: REAL_HELPER_PATH_HASH },
     warp: { detected: true, bundleId: 'dev.warp.Warp-Stable', version: 'phase5-test' },
     accessibility: { permission: 'granted', helper: 'macos-accessibility-helper', helperVersion: 1 },
     targetDiscovery: { available: true, stableFingerprintFields: ['bindingId', 'role', 'candidateId'], requiresTwoScanStability: true },
@@ -2931,6 +2933,21 @@ Expected: Should be fixed
       assert.equal(status.execution.activeJobId, null);
     });
 
+    it('records real helper probe evidence as non-fixture but fail-closed when unavailable', () => {
+      assert.equal(harness('init W6-A --force').success, true);
+      const doctor = harness('warp-doctor W6-A --probe-real --json');
+      assert.equal(doctor.success, true, doctor.stderr);
+      const parsed = JSON.parse(doctor.stdout);
+      assert.equal(parsed.evidence.fixture, false);
+      assert.equal(parsed.evidence.inputSubmission.usesClipboard, false);
+      assert.equal(parsed.capabilities.phase5ProductionCandidate, false);
+      assert.match(parsed.capabilities.reasons.join(','), /warp-not-detected|accessibility-unavailable|target-discovery-unavailable/);
+
+      const run = harness('run W6-A --adapter warp-macos --phase5-pilot --pilot-unit W6-A-04-plan-review');
+      assert.equal(run.success, false);
+      assert.match(run.stdout, /capability-unavailable/);
+    });
+
     it('binds a fixture warp target through target challenge without writing workflow status', () => {
       assert.equal(harness('init W6-A --force').success, true);
       assert.equal(harness('worker-attach W6-A --role work --binding wrapper.work').success, true);
@@ -3026,6 +3043,7 @@ Expected: Should be fixed
         kind: 'warp-macos.capability',
         capturedAt: new Date().toISOString(),
         fixture: false,
+        helper: { kind: 'warp-macos-helper', version: 1, pathHash: REAL_HELPER_PATH_HASH },
         warp: { detected: true, bundleId: 'dev.warp.Warp-Stable', version: 'fixture-test' },
         accessibility: { permission: 'granted', helper: 'real-helper', helperVersion: 1 },
         targetDiscovery: {
@@ -3133,6 +3151,31 @@ Expected: Should be fixed
 
       assert.equal(run.success, false);
       assert.match(run.stdout + run.stderr, /capability-unavailable|phase5-production-candidate-required/);
+      const status = readStatus(taskId);
+      assert.equal(status.execution.activeAttemptId, null);
+      assert.equal(status.execution.activeJobId, null);
+    });
+
+    it('rejects malformed real warp evidence before phase5 pilot dispatch', () => {
+      const taskId = 'PH5-MALFORMED-CAPABILITY';
+      const pilotUnitId = `${taskId}-W6-A-01-code-pilot`;
+      assert.equal(harness(`init ${taskId} --force`).success, true);
+      assert.equal(harness(`set-current ${taskId} W6-A-01 code-implementation`).success, true);
+      setupPhase5PilotCapabilities(taskId);
+      setupVerifiedWarpPilotRole(taskId, 'work');
+      const allow = harness(`pilot-allow ${taskId} --subtask W6-A-01 --work-stage code-implementation --review-stage code-review --roles work,review --reason pilot --expires-at ${futureIso()}`);
+      assert.equal(allow.success, true, allow.stderr);
+
+      const capabilityPath = path.join(HARNESS_DIR, 'runs', taskId, 'capabilities', 'warp-macos.json');
+      const malformed = JSON.parse(fs.readFileSync(capabilityPath, 'utf8'));
+      delete malformed.fixture;
+      delete malformed.helper;
+      fs.writeFileSync(capabilityPath, JSON.stringify(malformed, null, 2) + '\n', 'utf8');
+
+      const run = harness(`run ${taskId} --adapter warp-macos --phase5-pilot --pilot-unit ${pilotUnitId} --role work --confirm-real-target --confirm-manual-fallback --confirm-no-auto-approval`);
+
+      assert.equal(run.success, false);
+      assert.match(run.stdout + run.stderr, /phase5-production-candidate-required|capability-unavailable/);
       const status = readStatus(taskId);
       assert.equal(status.execution.activeAttemptId, null);
       assert.equal(status.execution.activeJobId, null);

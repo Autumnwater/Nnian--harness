@@ -3,13 +3,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { ExecutionStore } from '../scripts/execution-store.js';
 import { createBinding } from '../scripts/execution-protocol.js';
 import {
   WARP_CAPABILITY_NAME,
   FixtureWarpMacosHelper,
+  ProcessWarpMacosHelper,
   WarpMacosAdapter,
+  assertRealWarpCapabilityEvidence,
   assertSideEffectMapping,
   assertWarpResultMirrorsRequest,
   createTargetChallengePayload,
@@ -20,6 +24,8 @@ import {
   targetFingerprintHash,
   validateTargetChallengeResponse,
 } from '../scripts/warp-macos-adapter.js';
+
+const HELPER_SCRIPT = fileURLToPath(new URL('../scripts/warp-macos-helper.js', import.meta.url));
 
 const makeStore = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-warp-adapter-'));
@@ -41,6 +47,31 @@ const capabilityEvidence = overrides => ({
   phase4RunEnabled: false,
   phase5ProductionCandidate: false,
   reasons: [],
+  ...overrides,
+});
+
+const realCapabilityEvidence = overrides => capabilityEvidence({
+  fixture: false,
+  helper: {
+    kind: 'warp-macos-helper',
+    version: 1,
+    pathHash: `sha256:${'a'.repeat(64)}`,
+  },
+  warp: { detected: true, bundleId: 'dev.warp.Warp-Stable', version: 'real-test' },
+  accessibility: { permission: 'granted', helper: 'real-helper', helperVersion: 1 },
+  targetDiscovery: {
+    available: true,
+    stableFingerprintFields: ['bundleId', 'windowId', 'tabId', 'roleBindingMarker'],
+    requiresTwoScanStability: true,
+  },
+  inputSubmission: {
+    available: true,
+    method: 'accessibility-key-events',
+    usesClipboard: false,
+    settleBarrier: 'helper-submit-result',
+  },
+  targetIdentity: { available: true, requiresWrapperBinding: true, requiresChallenge: true },
+  phase5ProductionCandidate: true,
   ...overrides,
 });
 
@@ -110,6 +141,29 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
     assert.equal(productionTest.diagnosticEligible, true);
     assert.equal(productionTest.phase4RunEnabled, true);
     assert.equal(productionTest.dispatch, true);
+  });
+
+  it('requires strict real helper provenance before phase5 warp eligibility', () => {
+    const valid = deriveWarpCapabilities(realCapabilityEvidence(), { requirePhase5Pilot: true });
+    assert.equal(valid.phase5ProductionCandidate, true);
+    assert.equal(valid.dispatch, true);
+
+    const missingFixture = realCapabilityEvidence();
+    delete missingFixture.fixture;
+    const missingHelper = realCapabilityEvidence();
+    delete missingHelper.helper;
+    for (const evidence of [
+      missingFixture,
+      missingHelper,
+      realCapabilityEvidence({ kind: 'warp-macos.other-capability' }),
+      realCapabilityEvidence({ protocolVersion: 2 }),
+    ]) {
+      const capabilities = deriveWarpCapabilities(evidence, { requirePhase5Pilot: true });
+      assert.equal(capabilities.phase5ProductionCandidate, false);
+      assert.equal(capabilities.dispatch, false);
+    }
+    assert.throws(() => assertRealWarpCapabilityEvidence(missingFixture), /real-helper-fixture-flag-required/);
+    assert.throws(() => assertRealWarpCapabilityEvidence(missingHelper), /real-helper-kind-invalid/);
   });
 
   it('maps submit side-effect states fail-closed', () => {
@@ -382,6 +436,80 @@ describe('V3 Phase 4 warp-macos adapter contract', () => {
       () => helper.submitText(target, '/tmp/prompt.md', { attempt: job.attempt, operationId: 'operation-split' }),
       /invalid-side-effect-request-kind|request\.attemptRef is required|side-effect-request-kind-mismatch/
     );
+  });
+
+  it('uses the warp-macos helper process boundary and rejects split side-effect CLI arguments', async () => {
+    const { target } = makeBoundWarpTarget();
+    const helper = new ProcessWarpMacosHelper({ scriptPath: HELPER_SCRIPT });
+    const capability = await helper.probeCapability();
+    assert.equal(capability.kind, 'warp-macos.capability');
+    assert.equal(capability.fixture, false);
+    assert.equal(capability.phase5ProductionCandidate, false);
+    assert.equal(capability.inputSubmission.usesClipboard, false);
+    assert.deepEqual(await helper.scanTargets({ role: 'work' }), []);
+
+    const request = createWarpSideEffectRequest({
+      kind: 'submit',
+      operationId: 'operation-process-helper',
+      job: {
+        promptPath: '/tmp/prompt.md',
+        promptSha256: 'sha256:prompt',
+        attempt: { jobId: 'job-1', attemptId: 'attempt-1', leaseToken: 'lease-1', lockEpoch: 2 },
+        pilotAuthorization: {
+          allowlistId: 'allow-1',
+          allowlistHash: 'sha256:allow',
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        },
+      },
+      target,
+    });
+    const result = await helper.submitText(request);
+    assert.equal(result.kind, 'warp-macos.submit-result');
+    assert.equal(result.operationId, request.operationId);
+    assert.equal(result.targetFingerprintHash, request.targetFingerprintHash);
+    assert.equal(result.sideEffectState, 'none');
+    assert.equal(result.usedClipboard, false);
+
+    const split = spawnSync(process.execPath, [
+      HELPER_SCRIPT,
+      'submit-text',
+      '--target',
+      'candidate-1',
+      '--input-file',
+      '/tmp/prompt.md',
+      '--json',
+    ], { encoding: 'utf8' });
+    assert.notEqual(split.status, 0);
+    assert.match(split.stderr, /split-side-effect-argument-forbidden/);
+
+    const unknownSubmitArg = spawnSync(process.execPath, [
+      HELPER_SCRIPT,
+      'submit-text',
+      '--request',
+      JSON.stringify(request),
+      '--foo',
+      'bar',
+      '--json',
+    ], { encoding: 'utf8' });
+    assert.notEqual(unknownSubmitArg.status, 0);
+    assert.match(unknownSubmitArg.stderr, /side-effect-argument-forbidden: --foo/);
+
+    const interruptRequest = {
+      ...request,
+      kind: 'warp-macos.interrupt-request',
+      operationId: 'operation-process-helper-interrupt',
+    };
+    const unknownInterruptArg = spawnSync(process.execPath, [
+      HELPER_SCRIPT,
+      'interrupt',
+      '--request',
+      JSON.stringify(interruptRequest),
+      '--foo',
+      'bar',
+      '--json',
+    ], { encoding: 'utf8' });
+    assert.notEqual(unknownInterruptArg.status, 0);
+    assert.match(unknownInterruptArg.stderr, /side-effect-argument-forbidden: --foo/);
   });
 
   it('rejects submit results that rename or fail to mirror fenced request fields', async () => {
