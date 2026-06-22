@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 
-export const STATUS_SCHEMA_VERSION = 4;
+export const STATUS_SCHEMA_VERSION = 5;
 export const WORKER_PROTOCOL_VERSION = 1;
 
 const EXECUTION_DEFAULTS = Object.freeze({
@@ -10,6 +10,14 @@ const EXECUTION_DEFAULTS = Object.freeze({
   activeLeaseToken: null,
   lockEpoch: 0,
   lastJobId: null,
+});
+
+const MAILBOX_DEFAULTS = Object.freeze({
+  mode: 'manual',
+  activeSessionId: null,
+  activeAttemptId: null,
+  activeCursorHash: null,
+  lastSessionId: null,
 });
 
 const isoNow = () => new Date().toISOString();
@@ -51,6 +59,7 @@ const positiveInteger = (value, field) => {
 };
 
 export const createExecutionDefaults = () => ({ ...EXECUTION_DEFAULTS });
+export const createMailboxDefaults = () => ({ ...MAILBOX_DEFAULTS });
 
 export const migrateExecutionState = status => {
   let migrated = false;
@@ -73,7 +82,7 @@ export const migrateExecutionState = status => {
     status.stateRevision = 0;
     migrated = true;
   } else if (status.stateRevision === undefined) {
-    throw new Error('stateRevision is required for schemaVersion 4');
+    throw new Error(`stateRevision is required for schemaVersion ${STATUS_SCHEMA_VERSION}`);
   } else {
     nonNegativeInteger(status.stateRevision, 'stateRevision');
   }
@@ -81,7 +90,7 @@ export const migrateExecutionState = status => {
     status.stageRevision = 0;
     migrated = true;
   } else if (status.stageRevision === undefined) {
-    throw new Error('stageRevision is required for schemaVersion 4');
+    throw new Error(`stageRevision is required for schemaVersion ${STATUS_SCHEMA_VERSION}`);
   } else {
     nonNegativeInteger(status.stageRevision, 'stageRevision');
   }
@@ -90,7 +99,7 @@ export const migrateExecutionState = status => {
     status.execution = createExecutionDefaults();
     migrated = true;
   } else if (!status.execution || typeof status.execution !== 'object' || Array.isArray(status.execution)) {
-    throw new Error('execution must be an object for schemaVersion 4');
+    throw new Error(`execution must be an object for schemaVersion ${STATUS_SCHEMA_VERSION}`);
   } else {
     if (status.execution.mode !== undefined && !['manual', 'worker'].includes(status.execution.mode)) {
       throw new Error('execution.mode must be manual or worker');
@@ -106,8 +115,35 @@ export const migrateExecutionState = status => {
     }
     for (const [key, value] of Object.entries(EXECUTION_DEFAULTS)) {
       if (status.execution[key] === undefined) {
-        if (!isLegacy) throw new Error(`execution.${key} is required for schemaVersion 4`);
+        if (!isLegacy) throw new Error(`execution.${key} is required for schemaVersion ${STATUS_SCHEMA_VERSION}`);
         status.execution[key] = value;
+        migrated = true;
+      }
+    }
+  }
+
+  if ((!status.mailbox || typeof status.mailbox !== 'object' || Array.isArray(status.mailbox)) && isLegacy) {
+    status.mailbox = createMailboxDefaults();
+    migrated = true;
+  } else if (!status.mailbox || typeof status.mailbox !== 'object' || Array.isArray(status.mailbox)) {
+    throw new Error(`mailbox must be an object for schemaVersion ${STATUS_SCHEMA_VERSION}`);
+  } else {
+    const allowedFields = new Set(Object.keys(MAILBOX_DEFAULTS));
+    const unknownFields = Object.keys(status.mailbox).filter(field => !allowedFields.has(field));
+    if (unknownFields.length > 0) throw new Error(`mailbox.unknown-fields: ${unknownFields.join(',')}`);
+    if (status.mailbox.mode !== undefined && status.mailbox.mode !== 'manual') {
+      throw new Error('mailbox.mode must be manual');
+    }
+    for (const field of ['activeSessionId', 'activeAttemptId', 'activeCursorHash', 'lastSessionId']) {
+      const value = status.mailbox[field];
+      if (value !== undefined && value !== null && (typeof value !== 'string' || value.length === 0)) {
+        throw new Error(`mailbox.${field} must be null or a non-empty string`);
+      }
+    }
+    for (const [key, value] of Object.entries(MAILBOX_DEFAULTS)) {
+      if (status.mailbox[key] === undefined) {
+        if (!isLegacy) throw new Error(`mailbox.${key} is required for schemaVersion ${STATUS_SCHEMA_VERSION}`);
+        status.mailbox[key] = value;
         migrated = true;
       }
     }

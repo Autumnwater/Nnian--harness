@@ -16,11 +16,17 @@ import {
   assertStageCursor,
   createBinding,
   createExecutionDefaults,
+  createMailboxDefaults,
   createEvent,
   createStageCursor,
   migrateExecutionState,
   verifySessionProof,
 } from './execution-protocol.js';
+import {
+  MailboxStore,
+  activeCursorHash,
+  createMailboxStageCursor,
+} from './mailbox-store.js';
 import { ExecutionStore } from './execution-store.js';
 import { ExecutionSupervisor } from './execution-supervisor.js';
 import { deriveAdvanceTransition, evaluateStageCheck } from './workflow-core.js';
@@ -38,6 +44,7 @@ import {
   targetFingerprintHash,
   validateTargetChallengeResponse,
 } from './warp-macos-adapter.js';
+import { canonicalHash } from './file-protocol.js';
 import {
   acquireExecutionLock,
   finalizeRecoveredExecutionLock,
@@ -467,6 +474,22 @@ const MANUAL_PROGRESS_COMMANDS = new Set([
   'init', 'next', 'step', 'check', 'advance', 'accept', 'import', 'resume', 'set-current', 'interrupt', 'resume-current',
 ]);
 
+const MAILBOX_COMMANDS = new Set([
+  'mailbox-bind', 'mailbox-publish', 'mailbox-peek', 'mailbox-claim', 'mailbox-start',
+  'mailbox-complete', 'mailbox-failed', 'mailbox-needs-input', 'mailbox-pump',
+  'mailbox-close', 'mailbox-reconcile', 'mailbox-takeover',
+  'mailbox-worker-peek', 'mailbox-worker-claim', 'mailbox-worker-start',
+  'mailbox-worker-complete', 'mailbox-worker-failed', 'mailbox-worker-needs-input',
+]);
+
+const LOCKED_MAILBOX_COMMANDS = new Set([
+  'mailbox-bind', 'mailbox-publish', 'mailbox-claim', 'mailbox-start',
+  'mailbox-complete', 'mailbox-failed', 'mailbox-needs-input', 'mailbox-pump',
+  'mailbox-close', 'mailbox-reconcile', 'mailbox-takeover',
+  'mailbox-worker-claim', 'mailbox-worker-start', 'mailbox-worker-complete',
+  'mailbox-worker-failed', 'mailbox-worker-needs-input',
+]);
+
 const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set([
   'worker-attach', 'worker-launch', 'worker-heartbeat', 'worker-detach',
   'worker-hook-probe', 'warp-bind-target', 'pilot-allow',
@@ -475,6 +498,12 @@ const LOCKED_WORKER_ARTIFACT_COMMANDS = new Set([
 function assertNoActiveExecution(taskId, command) {
   if (!MANUAL_PROGRESS_COMMANDS.has(command) || !fs.existsSync(statusPath(taskId))) return;
   const status = readJSON(statusPath(taskId));
+  if (status?.mailbox?.activeSessionId && command !== 'check') {
+    throw new Error(
+      `active-mailbox-conflict: ${command} cannot change workflow state while ` +
+      `session=${status.mailbox.activeSessionId} attempt=${status.mailbox.activeAttemptId || '(unknown)'} is active`
+    );
+  }
   // Delivery acceptance is gate evidence for the active attempt, not workflow
   // progression. It is serialized by the task lock and may be recorded while
   // the Supervisor waits for completion.
@@ -997,6 +1026,7 @@ function cmdInit(taskId, opts = {}) {
     stateRevision: 0,
     stageRevision: 0,
     execution: createExecutionDefaults(),
+    mailbox: createMailboxDefaults(),
     currentSubtask: fromSubtask,
     currentStage: startStage,
     awaitingCommit: false,     // P2-2
@@ -4354,6 +4384,814 @@ async function cmdWorkerTakeover(taskId, reason) {
 }
 
 // ---------------------------------------------------------------------------
+// File Mailbox Phase C — operator-assisted CLI skeleton
+// ---------------------------------------------------------------------------
+function createMailboxStore(taskId) {
+  return new MailboxStore({
+    harnessRoot: HARNESS_ROOT,
+    reviewRoot: getEffectiveReviewRoot(),
+    taskId,
+  });
+}
+
+function sha256FilePrefixed(filePath) {
+  const snapshot = getFileSnapshot(filePath);
+  if (!snapshot.exists) throw new Error(`file-not-found: ${filePath}`);
+  return `sha256:${snapshot.sha256}`;
+}
+
+function sha256TextPrefixed(text) {
+  return `sha256:${createHash('sha256').update(String(text)).digest('hex')}`;
+}
+
+function mailboxRoleForStage(stage) {
+  const target = getTargetWindow(stage);
+  if (target === 'work' || target === 'review') return target;
+  throw new Error(`mailbox-stage-not-eligible: ${stage}`);
+}
+
+function mailboxExpectedSkill(stage) {
+  const requiredSkill = getStageConfig(stage)?.requiredSkill;
+  if (requiredSkill?.startsWith('hexai-')) return `nNian-${requiredSkill.slice('hexai-'.length)}`;
+  return requiredSkill || `nNian-${stage}`;
+}
+
+function emitMailboxResult(result) {
+  console.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function prepareMailboxPromptArtifact(taskId) {
+  const status = loadStatus(taskId);
+  if (status.awaitingCommit) throw new Error('awaiting-commit');
+  if (status.execution?.activeJobId || status.execution?.activeAttemptId) {
+    throw new Error('active-job-conflict: mailbox-publish cannot start while execution is active');
+  }
+  if (status.mailbox?.activeSessionId) {
+    throw new Error(`active-mailbox-conflict: mailbox-publish cannot start while session=${status.mailbox.activeSessionId} is active`);
+  }
+
+  const { currentSubtask, currentStage } = status;
+  const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
+  if (!stageData) throw new Error(`No stage data for ${currentSubtask} / ${currentStage}`);
+
+  const subtask = getSubtasksForTask().find(s => s.id === currentSubtask);
+  if (!subtask) throw new Error(`Unknown subtask: ${currentSubtask}`);
+
+  const round = getRoundForStage(status, currentSubtask, currentStage);
+  if (!stageData.primaryReportPath) {
+    stageData.primaryReportPath = generateReportPath(taskId, subtask, currentStage, round);
+  }
+  if (!stageData.mirrorOutputPath) {
+    stageData.mirrorOutputPath = path.join(outputsDir(taskId, currentSubtask), path.basename(stageData.primaryReportPath));
+  }
+  if (!stageData.handoffPath) {
+    stageData.handoffPath = generateHandoffPath(taskId, subtask, currentStage);
+  }
+  if (!stageData.mirrorHandoffPath) {
+    stageData.mirrorHandoffPath = generateMirrorHandoffPath(taskId, subtask, currentStage);
+  }
+
+  stageData.currentOutputPath = stageData.primaryReportPath;
+  stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
+  stageData.outputBaselineCapturedAt = now();
+  const wasInterrupted = stageData.stageStatus === 'interrupted';
+  stageData.stageStatus = 'active';
+  if (!stageData.startedAt) stageData.startedAt = now();
+  bumpStageRevision(status);
+
+  const result = wasInterrupted
+    ? generateContinuationPrompt(taskId, status, currentSubtask, currentStage, subtask)
+    : {
+        prompt: substituteTemplate(loadTemplate(getTemplateName(currentStage)), buildTemplateVars(taskId, currentSubtask, currentStage, status)),
+        stage: currentStage,
+        subtask: currentSubtask,
+        continuation: false,
+      };
+
+  const promptPath = promptFilePath(taskId, currentSubtask, currentStage);
+
+  return {
+    status,
+    currentSubtask,
+    currentStage,
+    round,
+    promptPath,
+    primaryReportPath: stageData.primaryReportPath,
+    outputBaseline: stageData.outputBaseline,
+    prompt: result.prompt,
+  };
+}
+
+function assertMailboxStatusActive(status, ledger) {
+  if (status.mailbox?.activeSessionId !== ledger.sessionId ||
+      status.mailbox?.activeAttemptId !== ledger.attemptId ||
+      status.mailbox?.activeCursorHash !== ledger.activeCursorHash) {
+    throw new Error('active-mailbox-cursor-mismatch');
+  }
+}
+
+function readActiveMailboxContext(taskId, sessionId = null) {
+  const status = loadStatus(taskId);
+  const activeSessionId = sessionId || status.mailbox?.activeSessionId;
+  if (!activeSessionId) throw new Error('mailbox-no-active-session');
+  const store = createMailboxStore(taskId);
+  const { ledger, marker } = store.assertPublishCommitted(activeSessionId);
+  assertMailboxStatusActive(status, ledger);
+  const session = store.readSession(activeSessionId);
+  if (!session) throw new Error(`mailbox-session-not-found: ${activeSessionId}`);
+  const envelope = store.readEnvelope(activeSessionId);
+  if (!envelope) throw new Error(`mailbox-envelope-not-found: ${activeSessionId}`);
+  return { status, store, ledger, marker, session, envelope };
+}
+
+function readMailboxCloseContext(taskId, sessionId) {
+  const status = loadStatus(taskId);
+  const store = createMailboxStore(taskId);
+  const session = store.readSession(sessionId);
+  if (!session) throw new Error(`mailbox-session-not-found: ${sessionId}`);
+  const envelope = store.readEnvelope(sessionId);
+  if (!envelope) throw new Error(`mailbox-envelope-not-found: ${sessionId}`);
+  const closeLedger = store.readCloseLedger(sessionId);
+  const activeSessionId = status.mailbox?.activeSessionId || null;
+  let publish = null;
+  if (activeSessionId === sessionId) {
+    publish = store.assertPublishCommitted(sessionId);
+    assertMailboxStatusActive(status, publish.ledger);
+  } else if (activeSessionId) {
+    throw new Error(`active-mailbox-other-session: ${activeSessionId}`);
+  } else if (session.state !== 'closed' || !closeLedger) {
+    throw new Error('mailbox-close-status-not-active');
+  }
+  return { status, store, session, envelope, closeLedger, publish };
+}
+
+function updateMailboxSession(store, session, updates) {
+  const next = { ...session, ...updates, updatedAt: now() };
+  store.writeSession(next);
+  return next;
+}
+
+function appendMailboxEvent(store, event) {
+  return store.appendEvent({
+    protocolVersion: 1,
+    eventId: randomUUID(),
+    occurredAt: now(),
+    ...event,
+  });
+}
+
+function workerIdentityHashFromOpts(opts = {}) {
+  if (opts['worker-identity-hash']) return opts['worker-identity-hash'];
+  if (opts['worker-identity']) return sha256TextPrefixed(opts['worker-identity']);
+  return null;
+}
+
+function mailboxSourceForMode(mode) {
+  return mode === 'worker' ? 'claude-code-worker' : 'claude-code-operator';
+}
+
+function assertMailboxClaimOwnerForMode(session, binding, mode, action) {
+  if (mode === 'worker') {
+    if (session.claimSource !== 'claude-code-worker') {
+      throw new Error(`mailbox-worker-claim-owner-mismatch: ${action}: source`);
+    }
+    if (session.claimBindingId !== binding.bindingId) {
+      throw new Error(`mailbox-worker-claim-owner-mismatch: ${action}: binding`);
+    }
+    if (session.claimBindingGeneration !== binding.bindingGeneration) {
+      throw new Error(`mailbox-worker-claim-owner-mismatch: ${action}: generation`);
+    }
+    if (session.claimWorkerIdentityHash !== binding.workerIdentityHash) {
+      throw new Error(`mailbox-worker-claim-owner-mismatch: ${action}: worker-identity`);
+    }
+    return;
+  }
+  if (session.claimSource === 'claude-code-worker') {
+    throw new Error(`mailbox-worker-session-requires-takeover: ${action}`);
+  }
+}
+
+function frozenWorkerClaimBinding(session, envelope) {
+  if (session.claimSource !== 'claude-code-worker') return null;
+  if (!session.claimBindingId || !session.claimBindingGeneration || !session.claimWorkerIdentityHash) {
+    throw new Error('mailbox-worker-claim-owner-incomplete');
+  }
+  return {
+    bindingId: session.claimBindingId,
+    bindingGeneration: session.claimBindingGeneration,
+    workerIdentityHash: session.claimWorkerIdentityHash,
+    role: envelope.role,
+  };
+}
+
+function assertWorkerCompleteArtifacts(store, ledger, session, envelope) {
+  if (session.promptPath !== envelope.prompt.path) throw new Error('mailbox-worker-prompt-path-mismatch');
+  if (session.promptSha256 !== envelope.prompt.sha256) throw new Error('mailbox-worker-prompt-hash-mismatch');
+  if (ledger.promptHash !== envelope.prompt.sha256) throw new Error('mailbox-worker-ledger-prompt-hash-mismatch');
+  store.validatePromptForLedger(ledger, session.promptPath, session.promptSha256, 'worker-complete');
+  if (session.primaryReportPath !== envelope.expectedOutput.primaryReportPath) {
+    throw new Error('mailbox-worker-output-path-mismatch');
+  }
+}
+
+function cmdMailboxBind(taskId, opts = {}) {
+  const role = opts.role;
+  const bindingId = opts.binding;
+  if (!['work', 'review'].includes(role)) throw new Error('mailbox-bind requires --role work|review');
+  if (!bindingId) throw new Error('mailbox-bind requires --binding <id>');
+  const store = createMailboxStore(taskId);
+  const { binding } = store.createBinding({
+    bindingId,
+    role,
+    replace: opts.replace === true || opts.replace === 'true',
+    workerIdentityHash: workerIdentityHashFromOpts(opts),
+    metadata: { operator: opts.operator || process.env.USER || 'cli' },
+  });
+  appendMailboxEvent(store, {
+    kind: opts.replace ? 'mailbox.binding-replaced' : 'mailbox.binding-created',
+    taskId,
+    bindingId,
+    role,
+    bindingGeneration: binding.bindingGeneration,
+  });
+  return emitMailboxResult({
+    ok: true,
+    code: opts.replace ? 'mailbox-binding-replaced' : 'mailbox-binding-created',
+    bindingId,
+    role,
+    bindingGeneration: binding.bindingGeneration,
+    workerIdentityHash: binding.workerIdentityHash || null,
+    noncePath: store.bindingSecretPath(bindingId),
+  });
+}
+
+function cmdMailboxPublish(taskId) {
+  const artifact = prepareMailboxPromptArtifact(taskId);
+  const store = createMailboxStore(taskId);
+  const sessionId = randomUUID();
+  const attemptId = randomUUID();
+  const stageCursor = {
+    subtaskId: artifact.currentSubtask,
+    stage: artifact.currentStage,
+    round: artifact.round,
+    stageRevision: artifact.status.stageRevision,
+  };
+  let ledger = store.createPublishIntent({
+    sessionId,
+    attemptId,
+    stageCursor,
+    statusRevisionBefore: artifact.status.stateRevision,
+  });
+  ensureDir(path.dirname(artifact.promptPath));
+  fs.writeFileSync(artifact.promptPath, artifact.prompt, 'utf-8');
+  saveStatus(taskId, artifact.status);
+  const promptHash = sha256FilePrefixed(artifact.promptPath);
+  ledger = store.markPromptWritten(sessionId, promptHash);
+  const role = mailboxRoleForStage(artifact.currentStage);
+  const session = {
+    protocolVersion: 1,
+    kind: 'hexai.mailbox.session',
+    taskId,
+    sessionId,
+    attemptId,
+    state: 'published',
+    stageCursor: ledger.stageCursor,
+    activeCursorHash: ledger.activeCursorHash,
+    bindingId: null,
+    promptPath: artifact.promptPath,
+    promptSha256: promptHash,
+    primaryReportPath: artifact.primaryReportPath,
+    createdAt: now(),
+    updatedAt: now(),
+    closedAt: null,
+    lastEventId: null,
+  };
+  ledger = store.markSessionWritten(sessionId, session);
+  const envelope = {
+    protocolVersion: 1,
+    kind: 'hexai.mailbox.task',
+    taskId,
+    sessionId,
+    attemptId,
+    createdAt: now(),
+    role,
+    expectedSkill: mailboxExpectedSkill(artifact.currentStage),
+    stageCursor: ledger.stageCursor,
+    activeCursorHash: ledger.activeCursorHash,
+    prompt: {
+      path: artifact.promptPath,
+      sha256: promptHash,
+    },
+    expectedOutput: {
+      primaryReportPath: artifact.primaryReportPath,
+      baseline: artifact.outputBaseline,
+    },
+    constraints: {
+      noAutoApprove: true,
+      noAutoDelivery: true,
+      noCommit: true,
+      noPush: true,
+      noClipboard: true,
+      noWarp: true,
+    },
+  };
+  ledger = store.markEnvelopePublished(sessionId, envelope, artifact.primaryReportPath);
+  artifact.status.mailbox = {
+    mode: 'manual',
+    activeSessionId: sessionId,
+    activeAttemptId: attemptId,
+    activeCursorHash: activeCursorHash(createMailboxStageCursor(ledger.stageCursor)),
+    lastSessionId: sessionId,
+  };
+  addHistory(artifact.status, 'mailbox-publish', {
+    sessionId,
+    attemptId,
+    activeCursorHash: artifact.status.mailbox.activeCursorHash,
+    promptPath: artifact.promptPath,
+    primaryReportPath: artifact.primaryReportPath,
+  });
+  saveStatus(taskId, artifact.status);
+  store.markStatusActive(sessionId, { statusRevisionAfter: artifact.status.stateRevision });
+  const committed = store.commitPublish(sessionId);
+  appendMailboxEvent(store, {
+    kind: 'mailbox.publish-committed',
+    taskId,
+    sessionId,
+    attemptId,
+    activeCursorHash: ledger.activeCursorHash,
+  });
+  return emitMailboxResult({
+    ok: true,
+    code: 'mailbox-published',
+    sessionId,
+    attemptId,
+    activeCursorHash: ledger.activeCursorHash,
+    promptPath: artifact.promptPath,
+    primaryReportPath: artifact.primaryReportPath,
+    committedAt: committed.committedAt,
+  });
+}
+
+function cmdMailboxPeek(taskId) {
+  const status = loadStatus(taskId, { persistMigration: false });
+  if (!status.mailbox?.activeSessionId) {
+    return emitMailboxResult({ ok: true, code: 'mailbox-empty', tasks: [] });
+  }
+  const { ledger, session, envelope } = readActiveMailboxContext(taskId);
+  return emitMailboxResult({
+    ok: true,
+    code: 'mailbox-active',
+    tasks: [{
+      sessionId: ledger.sessionId,
+      attemptId: ledger.attemptId,
+      activeCursorHash: ledger.activeCursorHash,
+      state: session.state,
+      role: envelope.role,
+      promptPath: envelope.prompt.path,
+      primaryReportPath: envelope.expectedOutput.primaryReportPath,
+      claimable: session.state === 'published',
+    }],
+  });
+}
+
+function cmdMailboxWorkerPeek(taskId, opts = {}) {
+  if (!opts.binding) throw new Error('mailbox-worker-peek requires --binding <id>');
+  if (!['work', 'review'].includes(opts.role)) throw new Error('mailbox-worker-peek requires --role work|review');
+  const store = createMailboxStore(taskId);
+  const binding = store.readBinding(opts.binding);
+  if (!binding || binding.state !== 'live') throw new Error(`binding-not-live: ${opts.binding}`);
+  if (binding.role !== opts.role) throw new Error(`binding-role-mismatch: expected ${opts.role}, got ${binding.role}`);
+  return cmdMailboxPeek(taskId);
+}
+
+function assertMailboxBindingForSession(store, bindingId, envelope) {
+  const binding = store.readBinding(bindingId);
+  if (!binding || binding.state !== 'live') throw new Error(`binding-not-live: ${bindingId}`);
+  if (binding.role !== envelope.role) throw new Error(`binding-role-mismatch: expected ${envelope.role}, got ${binding.role}`);
+  return binding;
+}
+
+function publishMailboxReceipt(store, kind, session, envelope, bindingId, details = {}, outputSnapshot = null, source = 'claude-code-operator') {
+  return store.publishReceipt({
+    kind,
+    bindingId,
+    role: envelope.role,
+    sessionId: session.sessionId,
+    attemptId: session.attemptId,
+    stageCursor: session.stageCursor,
+    activeCursorHash: session.activeCursorHash,
+    details,
+    outputSnapshot,
+    source,
+  });
+}
+
+function cmdMailboxClaim(taskId, opts = {}, mode = 'operator') {
+  if (!opts.session) throw new Error('mailbox-claim requires --session <id>');
+  if (!opts.binding) throw new Error('mailbox-claim requires --binding <id>');
+  if (mode !== 'worker' && !opts.reason) throw new Error('mailbox-claim requires --reason <text>');
+  const { store, session, envelope } = readActiveMailboxContext(taskId, opts.session);
+  if (session.state !== 'published') throw new Error(`mailbox-session-not-claimable: ${session.state}`);
+  const binding = assertMailboxBindingForSession(store, opts.binding, envelope);
+  const source = mailboxSourceForMode(mode);
+  if (mode === 'worker') store.assertNoOppositeRoleGateSatisfied({ session, binding, stageRole: binding.role, source });
+  const updated = updateMailboxSession(store, session, {
+    state: 'claimed',
+    bindingId: opts.binding,
+    claimBindingId: opts.binding,
+    claimBindingGeneration: binding.bindingGeneration,
+    claimWorkerIdentityHash: binding.workerIdentityHash || null,
+    claimSource: source,
+    claimedAt: now(),
+  });
+  if (mode === 'worker') store.appendClaimedRoleEvidence({ session: updated, binding, source });
+  const receipt = publishMailboxReceipt(store, 'session.claimed', updated, envelope, opts.binding, { reason: opts.reason || 'worker claim' }, null, source);
+  appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: mode === 'worker' ? 'worker-claim' : 'claim', taskId, sessionId: session.sessionId, attemptId: session.attemptId, reason: opts.reason || 'worker claim' });
+  return emitMailboxResult({ ok: true, code: mode === 'worker' ? 'mailbox-worker-claimed' : 'mailbox-claimed', sessionId: session.sessionId, attemptId: session.attemptId, activeCursorHash: session.activeCursorHash, receiptEventId: receipt.receipt.eventId });
+}
+
+function cmdMailboxStart(taskId, opts = {}, mode = 'operator') {
+  if (!opts.session) throw new Error('mailbox-start requires --session <id>');
+  if (!opts.binding) throw new Error('mailbox-start requires --binding <id>');
+  const { store, session, envelope } = readActiveMailboxContext(taskId, opts.session);
+  if (session.state !== 'claimed') throw new Error(`mailbox-session-not-claimed: ${session.state}`);
+  if (session.bindingId !== opts.binding) throw new Error('mailbox-binding-mismatch');
+  const binding = assertMailboxBindingForSession(store, opts.binding, envelope);
+  if (session.claimBindingGeneration && session.claimBindingGeneration !== binding.bindingGeneration) throw new Error('mailbox-binding-generation-mismatch');
+  assertMailboxClaimOwnerForMode(session, binding, mode, 'start');
+  const source = mailboxSourceForMode(mode);
+  const updated = updateMailboxSession(store, session, { state: 'running' });
+  const receipt = publishMailboxReceipt(store, 'session.running', updated, envelope, opts.binding, {}, null, source);
+  appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: mode === 'worker' ? 'worker-start' : 'start', taskId, sessionId: session.sessionId, attemptId: session.attemptId });
+  return emitMailboxResult({ ok: true, code: mode === 'worker' ? 'mailbox-worker-running' : 'mailbox-running', sessionId: session.sessionId, attemptId: session.attemptId, activeCursorHash: session.activeCursorHash, receiptEventId: receipt.receipt.eventId });
+}
+
+function cmdMailboxComplete(taskId, opts = {}, mode = 'operator') {
+  if (!opts.session) throw new Error('mailbox-complete requires --session <id>');
+  if (!opts.binding) throw new Error('mailbox-complete requires --binding <id>');
+  if (!opts.summary) throw new Error('mailbox-complete requires --summary <text>');
+  const { store, ledger, session, envelope } = readActiveMailboxContext(taskId, opts.session);
+  if (!['claimed', 'running'].includes(session.state)) throw new Error(`mailbox-session-not-completable: ${session.state}`);
+  if (session.bindingId !== opts.binding) throw new Error('mailbox-binding-mismatch');
+  const binding = assertMailboxBindingForSession(store, opts.binding, envelope);
+  if (session.claimBindingGeneration && session.claimBindingGeneration !== binding.bindingGeneration) throw new Error('mailbox-binding-generation-mismatch');
+  assertMailboxClaimOwnerForMode(session, binding, mode, 'complete');
+  const source = mailboxSourceForMode(mode);
+  if (mode === 'worker') store.assertNoOppositeRoleGateSatisfied({ session, binding, stageRole: binding.role, source });
+  if (mode === 'worker') assertWorkerCompleteArtifacts(store, ledger, session, envelope);
+  const outputSnapshot = getFileSnapshot(session.primaryReportPath);
+  if (!outputSnapshot.exists) throw new Error(`mailbox-output-missing: ${session.primaryReportPath}`);
+  const receipt = publishMailboxReceipt(store, 'session.completed', session, envelope, opts.binding, { summary: opts.summary }, outputSnapshot, source);
+  appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: mode === 'worker' ? 'worker-complete' : 'complete', taskId, sessionId: session.sessionId, attemptId: session.attemptId, reason: opts.summary, primarySnapshot: outputSnapshot });
+  return emitMailboxResult({ ok: true, code: mode === 'worker' ? 'mailbox-worker-completed-receipt-published' : 'mailbox-completed-receipt-published', sessionId: session.sessionId, attemptId: session.attemptId, activeCursorHash: session.activeCursorHash, receiptEventId: receipt.receipt.eventId });
+}
+
+function cmdMailboxTerminalReceipt(taskId, opts = {}, kind, action, mode = 'operator') {
+  if (!opts.session) throw new Error(`mailbox-${action} requires --session <id>`);
+  if (!opts.binding) throw new Error(`mailbox-${action} requires --binding <id>`);
+  if (!opts.reason) throw new Error(`mailbox-${action} requires --reason <text>`);
+  const { store, session, envelope } = readActiveMailboxContext(taskId, opts.session);
+  if (!['claimed', 'running'].includes(session.state)) throw new Error(`mailbox-session-not-${action}: ${session.state}`);
+  if (session.bindingId !== opts.binding) throw new Error('mailbox-binding-mismatch');
+  const binding = assertMailboxBindingForSession(store, opts.binding, envelope);
+  if (session.claimBindingGeneration && session.claimBindingGeneration !== binding.bindingGeneration) throw new Error('mailbox-binding-generation-mismatch');
+  assertMailboxClaimOwnerForMode(session, binding, mode, action);
+  const source = mailboxSourceForMode(mode);
+  if (mode === 'worker') store.assertNoOppositeRoleGateSatisfied({ session, binding, stageRole: binding.role, source });
+  const receipt = publishMailboxReceipt(store, kind, session, envelope, opts.binding, { reason: opts.reason }, null, source);
+  appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: mode === 'worker' ? `worker-${action}` : action, taskId, sessionId: session.sessionId, attemptId: session.attemptId, reason: opts.reason });
+  return emitMailboxResult({ ok: true, code: mode === 'worker' ? `mailbox-worker-${action}-receipt-published` : `mailbox-${action}-receipt-published`, sessionId: session.sessionId, attemptId: session.attemptId, activeCursorHash: session.activeCursorHash, receiptEventId: receipt.receipt.eventId });
+}
+
+function moveMailboxReceipt(store, filePath, bucket, receipt) {
+  const destination = store.receiptPath(bucket, receipt.attemptId, receipt.eventId);
+  store.ensureMailboxFileTarget(destination);
+  if (fs.existsSync(destination)) {
+    fs.rmSync(filePath, { force: true });
+    return destination;
+  }
+  fs.renameSync(filePath, destination);
+  return destination;
+}
+
+function cmdMailboxPump(taskId, opts = {}) {
+  const { store, session } = readActiveMailboxContext(taskId, opts.session);
+  const receipts = store.listReceipts('inbox').filter(item =>
+    item.receipt?.sessionId === session.sessionId && item.receipt?.attemptId === session.attemptId
+  ).sort((a, b) => (a.receipt?.sequence || 0) - (b.receipt?.sequence || 0));
+  const consumedSequences = new Set(
+    ['processed', 'rejected']
+      .flatMap(bucket => store.listReceipts(bucket))
+      .filter(item => item.receipt?.sessionId === session.sessionId && item.receipt?.attemptId === session.attemptId)
+      .map(item => item.receipt.sequence)
+  );
+  let expectedSequence = 1;
+  while (consumedSequences.has(expectedSequence)) expectedSequence += 1;
+  let next = session;
+  const processed = [];
+  for (const { filePath, receipt, error } of receipts) {
+    if (error || !receipt) continue;
+    if (receipt.sequence < expectedSequence) {
+      moveMailboxReceipt(store, filePath, 'processed', receipt);
+      continue;
+    }
+    if (receipt.sequence > expectedSequence) {
+      appendMailboxEvent(store, {
+        kind: 'mailbox.receipt-sequence-gap',
+        taskId,
+        sessionId: session.sessionId,
+        attemptId: session.attemptId,
+        expectedSequence,
+        foundSequence: receipt.sequence,
+        receiptEventId: receipt.eventId,
+      });
+      break;
+    }
+    if (!store.verifyBindingProof(receipt.binding?.bindingId, receipt)) {
+      appendMailboxEvent(store, { kind: 'mailbox.receipt-rejected', taskId, sessionId: session.sessionId, attemptId: session.attemptId, receiptEventId: receipt.eventId, reason: 'invalid-proof' });
+      moveMailboxReceipt(store, filePath, 'rejected', receipt);
+      consumedSequences.add(receipt.sequence);
+      expectedSequence += 1;
+      while (consumedSequences.has(expectedSequence)) expectedSequence += 1;
+      continue;
+    }
+    let state = next.state;
+    if (receipt.kind === 'session.completed') {
+      const output = getFileSnapshot(next.primaryReportPath);
+      state = output.exists ? 'output-detected' : 'receipt-seen';
+    } else if (receipt.kind === 'session.failed') {
+      state = 'failed';
+    } else if (receipt.kind === 'session.needs-input') {
+      state = 'needs-input';
+    } else if (receipt.kind === 'session.running') {
+      state = 'running';
+    } else if (receipt.kind === 'session.claimed') {
+      state = 'claimed';
+    }
+    next = updateMailboxSession(store, next, { state, lastEventId: receipt.eventId });
+    if (['session.completed', 'session.failed', 'session.needs-input'].includes(receipt.kind)) {
+      store.appendReceiptAcceptedRoleEvidence(receipt);
+    }
+    moveMailboxReceipt(store, filePath, 'processed', receipt);
+    consumedSequences.add(receipt.sequence);
+    expectedSequence += 1;
+    while (consumedSequences.has(expectedSequence)) expectedSequence += 1;
+    processed.push({ eventId: receipt.eventId, kind: receipt.kind, state });
+  }
+  appendMailboxEvent(store, { kind: 'mailbox.pump', taskId, sessionId: session.sessionId, attemptId: session.attemptId, processed });
+  return emitMailboxResult({ ok: true, code: 'mailbox-pumped', sessionId: session.sessionId, attemptId: session.attemptId, activeCursorHash: session.activeCursorHash, processed });
+}
+
+function cmdMailboxClose(taskId, opts = {}) {
+  if (!opts.session) throw new Error('mailbox-close requires --session <id>');
+  if (!opts.reason) throw new Error('mailbox-close requires --reason <text>');
+  const context = readMailboxCloseContext(taskId, opts.session);
+  const { status, store, session, envelope } = context;
+  let current = session;
+  let closeLedger = context.closeLedger;
+  const statusActiveForSession = status.mailbox?.activeSessionId === current.sessionId;
+
+  if (!statusActiveForSession && current.state === 'closed' && closeLedger) {
+    const recovery = store.recoverCloseAfterStatusCleared(current.sessionId, { statusActiveSessionId: null, reason: opts.reason });
+    appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: 'close-recovery', taskId, sessionId: current.sessionId, attemptId: current.attemptId, reason: opts.reason });
+    return emitMailboxResult({ ok: true, code: 'mailbox-close-recovered', sessionId: current.sessionId, attemptId: current.attemptId, activeCursorHash: current.activeCursorHash, closePhase: recovery.ledger.phase });
+  }
+
+  const afterCheck = opts['after-check'] === true || opts['after-check'] === 'true';
+  const closeBinding = frozenWorkerClaimBinding(current, envelope);
+  if (closeBinding) {
+    store.assertNoOppositeRoleGateSatisfied({
+      session: current,
+      binding: closeBinding,
+      stageRole: closeBinding.role,
+      source: 'claude-code-worker',
+    });
+  }
+  if (afterCheck && ['receipt-seen', 'output-detected'].includes(current.state)) {
+    const checkResult = cmdCheck(taskId, { persist: false });
+    if (!checkResult.pass) {
+      return emitMailboxResult({ ok: false, error: 'mailbox-close-check-failed', code: 'mailbox-close-check-failed', sessionId: current.sessionId, attemptId: current.attemptId, reasons: checkResult.reasons || [] });
+    }
+    if (closeBinding) {
+      store.appendGateSatisfiedRoleEvidence({
+        session: current,
+        binding: closeBinding,
+        source: 'claude-code-worker',
+        checkResultHash: canonicalHash(checkResult),
+        primarySnapshotHash: checkResult.primarySnapshot ? canonicalHash(checkResult.primarySnapshot) : null,
+      });
+    }
+    appendMailboxEvent(store, { kind: 'mailbox.check-passed', taskId, sessionId: current.sessionId, attemptId: current.attemptId, activeCursorHash: current.activeCursorHash, primarySnapshot: checkResult.primarySnapshot });
+    current = updateMailboxSession(store, current, { state: 'check-passed' });
+  }
+  const terminalSafe = ['check-passed', 'abandoned', 'rejected', 'taken-over'];
+  if (current.state !== 'closed' && !terminalSafe.includes(current.state)) {
+    throw new Error(`mailbox-close-not-terminal-safe: ${current.state}`);
+  }
+  if (closeBinding && current.state === 'check-passed') {
+    store.appendGateSatisfiedRoleEvidence({
+      session: current,
+      binding: closeBinding,
+      source: 'claude-code-worker',
+    });
+  }
+  if (!closeLedger) {
+    closeLedger = store.createCloseIntent({
+      sessionId: current.sessionId,
+      attemptId: current.attemptId,
+      activeCursorHash: current.activeCursorHash,
+      terminalPreconditionState: current.state,
+      statusWasActive: true,
+    });
+  }
+  if (closeLedger.phase === 'close-intent') closeLedger = store.advanceCloseLedger(current.sessionId, 'close-event-written');
+  if (current.state !== 'closed') {
+    current = updateMailboxSession(store, current, { state: 'closed', closedAt: now(), closeReason: opts.reason });
+  }
+  if (['close-intent', 'close-event-written'].includes(closeLedger.phase)) {
+    closeLedger = store.advanceCloseLedger(current.sessionId, 'session-closed');
+  }
+  if (status.mailbox?.activeSessionId === current.sessionId) {
+    status.mailbox = {
+      mode: 'manual',
+      activeSessionId: null,
+      activeAttemptId: null,
+      activeCursorHash: null,
+      lastSessionId: current.sessionId,
+    };
+    addHistory(status, 'mailbox-close', { sessionId: current.sessionId, attemptId: current.attemptId, reason: opts.reason });
+    saveStatus(taskId, status);
+  }
+  const recovery = store.recoverCloseAfterStatusCleared(current.sessionId, { statusActiveSessionId: status.mailbox?.activeSessionId || null, reason: opts.reason });
+  appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: 'close', taskId, sessionId: current.sessionId, attemptId: current.attemptId, reason: opts.reason });
+  return emitMailboxResult({ ok: true, code: 'mailbox-closed', sessionId: current.sessionId, attemptId: current.attemptId, activeCursorHash: current.activeCursorHash, closePhase: recovery.ledger.phase });
+}
+
+function cmdMailboxTakeover(taskId, opts = {}) {
+  if (!opts.session) throw new Error('mailbox-takeover requires --session <id>');
+  if (!opts.reason) throw new Error('mailbox-takeover requires --reason <text>');
+  const { store, session } = readActiveMailboxContext(taskId, opts.session);
+  const updated = updateMailboxSession(store, session, { state: 'taken-over' });
+  appendMailboxEvent(store, { kind: 'mailbox.operator-action', action: 'takeover', taskId, sessionId: session.sessionId, attemptId: session.attemptId, reason: opts.reason });
+  return emitMailboxResult({ ok: true, code: 'mailbox-taken-over', sessionId: updated.sessionId, attemptId: updated.attemptId, activeCursorHash: updated.activeCursorHash });
+}
+
+function cmdMailboxReconcile(taskId, opts = {}) {
+  if (!opts.session) throw new Error('mailbox-reconcile requires --session <id>');
+  if (!opts.outcome) throw new Error('mailbox-reconcile requires --outcome <value>');
+  if (!opts.reason) throw new Error('mailbox-reconcile requires --reason <text>');
+  const status = loadStatus(taskId);
+  const store = createMailboxStore(taskId);
+  const sessionBefore = store.readSession(opts.session);
+  const ledger = store.readPublishLedger(opts.session);
+  const statusBefore = structuredClone(status.mailbox || {});
+  let sessionAfter = sessionBefore;
+  let marker = null;
+
+  const clearActiveIfMatches = () => {
+    if (status.mailbox?.activeSessionId === opts.session) {
+      status.mailbox = {
+        mode: 'manual',
+        activeSessionId: null,
+        activeAttemptId: null,
+        activeCursorHash: null,
+        lastSessionId: opts.session,
+      };
+      addHistory(status, 'mailbox-reconcile', { sessionId: opts.session, outcome: opts.outcome, reason: opts.reason });
+      saveStatus(taskId, status);
+    }
+  };
+
+  const currentMailboxCursor = () => ({
+    subtaskId: status.currentSubtask,
+    stage: status.currentStage,
+    round: getRoundForStage(status, status.currentSubtask, status.currentStage),
+    stageRevision: status.stageRevision,
+  });
+
+  const mailboxCursorMatchesCurrent = stageCursor => {
+    const current = currentMailboxCursor();
+    return stageCursor?.subtaskId === current.subtaskId
+      && stageCursor?.stage === current.stage
+      && stageCursor?.round === current.round
+      && stageCursor?.stageRevision === current.stageRevision;
+  };
+
+  const rejectActiveStatusRecovery = (reason, extra = {}) => {
+    appendMailboxEvent(store, {
+      kind: 'mailbox.operator-action',
+      action: 'reconcile-rejected',
+      taskId,
+      sessionId: opts.session,
+      outcome: opts.outcome,
+      reason: opts.reason,
+      rejectionReason: reason,
+      statusBefore,
+      sessionBefore,
+      ledger,
+      ...extra,
+    });
+    throw new Error(reason);
+  };
+
+  const assertCanWriteActiveMailboxStatus = () => {
+    const activeSessionId = status.mailbox?.activeSessionId || null;
+    if (activeSessionId && activeSessionId !== opts.session) {
+      rejectActiveStatusRecovery(`mailbox-reconcile-active-other-session: ${activeSessionId}`, { activeSessionId });
+    }
+    if (!mailboxCursorMatchesCurrent(ledger?.stageCursor)) {
+      rejectActiveStatusRecovery(`mailbox-reconcile-stale-cursor: ${opts.session}`, {
+        expectedCursor: currentMailboxCursor(),
+        ledgerCursor: ledger?.stageCursor || null,
+      });
+    }
+  };
+
+  switch (opts.outcome) {
+    case 'commit-marker': {
+      if (!ledger) throw new Error(`publish-ledger-not-found: ${opts.session}`);
+      assertMailboxStatusActive(status, ledger);
+      marker = store.commitPublish(opts.session);
+      break;
+    }
+    case 'activate': {
+      if (!ledger) throw new Error(`publish-ledger-not-found: ${opts.session}`);
+      if (!['envelope-published', 'status-active', 'committed'].includes(ledger.phase)) {
+        throw new Error(`mailbox-reconcile-activate-invalid-phase: ${ledger.phase}`);
+      }
+      assertCanWriteActiveMailboxStatus();
+      status.mailbox = {
+        mode: 'manual',
+        activeSessionId: ledger.sessionId,
+        activeAttemptId: ledger.attemptId,
+        activeCursorHash: ledger.activeCursorHash,
+        lastSessionId: ledger.sessionId,
+      };
+      addHistory(status, 'mailbox-reconcile', { sessionId: opts.session, outcome: opts.outcome, reason: opts.reason });
+      saveStatus(taskId, status);
+      if (ledger.phase === 'envelope-published') {
+        store.markStatusActive(opts.session, { statusRevisionAfter: status.stateRevision });
+      }
+      marker = store.commitPublish(opts.session);
+      break;
+    }
+    case 'repair-status': {
+      if (!ledger) throw new Error(`publish-ledger-not-found: ${opts.session}`);
+      store.assertPublishCommitted(opts.session);
+      assertCanWriteActiveMailboxStatus();
+      status.mailbox = {
+        mode: 'manual',
+        activeSessionId: ledger.sessionId,
+        activeAttemptId: ledger.attemptId,
+        activeCursorHash: ledger.activeCursorHash,
+        lastSessionId: ledger.sessionId,
+      };
+      addHistory(status, 'mailbox-reconcile', { sessionId: opts.session, outcome: opts.outcome, reason: opts.reason });
+      saveStatus(taskId, status);
+      break;
+    }
+    case 'output-detected': {
+      if (!sessionBefore) throw new Error(`mailbox-session-not-found: ${opts.session}`);
+      const output = getFileSnapshot(sessionBefore.primaryReportPath);
+      if (!output.exists) throw new Error(`mailbox-output-missing: ${sessionBefore.primaryReportPath}`);
+      sessionAfter = updateMailboxSession(store, sessionBefore, { state: 'output-detected' });
+      break;
+    }
+    case 'reject':
+    case 'rejected': {
+      if (sessionBefore) sessionAfter = updateMailboxSession(store, sessionBefore, { state: 'rejected' });
+      clearActiveIfMatches();
+      break;
+    }
+    case 'abandon':
+    case 'abandoned':
+    case 'clear-stale': {
+      if (sessionBefore) sessionAfter = updateMailboxSession(store, sessionBefore, { state: 'abandoned' });
+      clearActiveIfMatches();
+      break;
+    }
+    default:
+      throw new Error(`unsupported-mailbox-reconcile-outcome: ${opts.outcome}`);
+  }
+
+  appendMailboxEvent(store, {
+    kind: 'mailbox.operator-action',
+    action: 'reconcile',
+    taskId,
+    sessionId: opts.session,
+    outcome: opts.outcome,
+    reason: opts.reason,
+    statusBefore,
+    statusAfter: status.mailbox || {},
+    sessionBefore,
+    sessionAfter,
+    marker,
+  });
+  return emitMailboxResult({ ok: true, code: 'mailbox-reconciled', sessionId: opts.session, outcome: opts.outcome });
+}
+
+// ---------------------------------------------------------------------------
 // Main dispatcher
 // ---------------------------------------------------------------------------
 async function main() {
@@ -4368,7 +5206,12 @@ async function main() {
       'worker-attach', 'worker-launch', 'worker-heartbeat', 'worker-detach',
       'worker-hook-probe', 'worker-bindings', 'worker-challenge', 'worker-receipt',
       'warp-doctor', 'warp-targets', 'warp-bind-target', 'warp-shadow-send',
-      'pilot-doctor', 'pilot-allow'];
+      'pilot-doctor', 'pilot-allow',
+      'mailbox-bind', 'mailbox-publish', 'mailbox-peek', 'mailbox-claim', 'mailbox-start',
+      'mailbox-complete', 'mailbox-failed', 'mailbox-needs-input', 'mailbox-pump',
+      'mailbox-close', 'mailbox-reconcile', 'mailbox-takeover',
+      'mailbox-worker-peek', 'mailbox-worker-claim', 'mailbox-worker-start',
+      'mailbox-worker-complete', 'mailbox-worker-failed', 'mailbox-worker-needs-input'];
     if (commandsNeedingConfig.includes(command) && taskId) {
       loadWorkflowConfig(taskId);
     }
@@ -4567,6 +5410,96 @@ async function main() {
         commandResult = cmdPilotAllow(taskId, opts);
         break;
       }
+      case 'mailbox-bind': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxBind(taskId, opts);
+        break;
+      }
+      case 'mailbox-publish': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxPublish(taskId, opts);
+        break;
+      }
+      case 'mailbox-peek': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxPeek(taskId, opts);
+        break;
+      }
+      case 'mailbox-worker-peek': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxWorkerPeek(taskId, opts);
+        break;
+      }
+      case 'mailbox-claim': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxClaim(taskId, opts);
+        break;
+      }
+      case 'mailbox-worker-claim': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxClaim(taskId, opts, 'worker');
+        break;
+      }
+      case 'mailbox-start': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxStart(taskId, opts);
+        break;
+      }
+      case 'mailbox-worker-start': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxStart(taskId, opts, 'worker');
+        break;
+      }
+      case 'mailbox-complete': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxComplete(taskId, opts);
+        break;
+      }
+      case 'mailbox-worker-complete': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxComplete(taskId, opts, 'worker');
+        break;
+      }
+      case 'mailbox-failed': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxTerminalReceipt(taskId, opts, 'session.failed', 'failed');
+        break;
+      }
+      case 'mailbox-worker-failed': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxTerminalReceipt(taskId, opts, 'session.failed', 'failed', 'worker');
+        break;
+      }
+      case 'mailbox-needs-input': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxTerminalReceipt(taskId, opts, 'session.needs-input', 'needs-input');
+        break;
+      }
+      case 'mailbox-worker-needs-input': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxTerminalReceipt(taskId, opts, 'session.needs-input', 'needs-input', 'worker');
+        break;
+      }
+      case 'mailbox-pump': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxPump(taskId, opts);
+        break;
+      }
+      case 'mailbox-close': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxClose(taskId, opts);
+        break;
+      }
+      case 'mailbox-reconcile': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxReconcile(taskId, opts);
+        break;
+      }
+      case 'mailbox-takeover': {
+        if (!taskId) throw new Error('taskId required');
+        commandResult = cmdMailboxTakeover(taskId, opts);
+        break;
+      }
       default:
         console.error(`Unknown command: ${command}`);
         printUsage();
@@ -4575,6 +5508,8 @@ async function main() {
     };
 
     if (taskId && MANUAL_PROGRESS_COMMANDS.has(command)) {
+      await withTaskExecutionLockRetry(taskId, command, dispatch);
+    } else if (taskId && LOCKED_MAILBOX_COMMANDS.has(command)) {
       await withTaskExecutionLockRetry(taskId, command, dispatch);
     } else if (taskId && LOCKED_WORKER_ARTIFACT_COMMANDS.has(command) &&
         !(opts['dry-run'] === true || opts['dry-run'] === 'true')) {

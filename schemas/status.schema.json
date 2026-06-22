@@ -4,10 +4,10 @@
   "title": "Harness Run Status",
   "description": "Machine-readable status for a Harness task run",
   "type": "object",
-  "required": ["schemaVersion", "stateRevision", "stageRevision", "execution", "taskId", "taskTitle", "createdAt", "updatedAt", "currentSubtask", "currentStage", "subtasks", "history"],
+  "required": ["schemaVersion", "stateRevision", "stageRevision", "execution", "mailbox", "taskId", "taskTitle", "createdAt", "updatedAt", "currentSubtask", "currentStage", "subtasks", "history"],
   "properties": {
     "schemaVersion": {
-      "const": 4,
+      "const": 5,
       "description": "Internal status.json storage schema version"
     },
     "stateRevision": {
@@ -31,6 +31,18 @@
         "activeLeaseToken": { "type": ["string", "null"] },
         "lockEpoch": { "type": "integer", "minimum": 0 },
         "lastJobId": { "type": ["string", "null"] }
+      }
+    },
+    "mailbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "activeSessionId", "activeAttemptId", "activeCursorHash", "lastSessionId"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["manual"] },
+        "activeSessionId": { "type": ["string", "null"] },
+        "activeAttemptId": { "type": ["string", "null"] },
+        "activeCursorHash": { "type": ["string", "null"] },
+        "lastSessionId": { "type": ["string", "null"] }
       }
     },
     "taskId": {

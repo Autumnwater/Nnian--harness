@@ -8,6 +8,7 @@ import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
 import os from 'node:os';
 import { createSessionProof } from '../scripts/execution-protocol.js';
+import { MailboxStore } from '../scripts/mailbox-store.js';
 
 // Create temp directories for isolated testing
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-test-'));
@@ -59,6 +60,11 @@ function harnessEnv(envOverrides, args = '') {
       exitCode: err.status,
     };
   }
+}
+
+function parseJsonOutput(result) {
+  assert.equal(result.success, true, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
 }
 
 function startHarness(args) {
@@ -123,6 +129,26 @@ function workflowStatusSnapshot(taskId) {
       },
     ])),
   };
+}
+
+function clearActiveWorkflowBlockers(taskId) {
+  const status = readStatus(taskId);
+  if (!status) return;
+  if (status.execution) {
+    status.execution.activeJobId = null;
+    status.execution.activeAttemptId = null;
+    status.execution.activeLeaseToken = null;
+  }
+  if (status.mailbox) {
+    status.mailbox.activeSessionId = null;
+    status.mailbox.activeAttemptId = null;
+    status.mailbox.activeCursorHash = null;
+  }
+  saveStatus(taskId, status);
+}
+
+function mailboxStore(taskId) {
+  return new MailboxStore({ harnessRoot: HARNESS_DIR, reviewRoot: REVIEW_ROOT, taskId });
 }
 
 function activeSubmittedStatus(taskId, bindingId) {
@@ -2284,13 +2310,13 @@ Expected: Should be fixed
   });
 
   // ===================================================================
-  // V3 Phase 1: schemaVersion 4 migration and execution safety
+  // V3 Phase 1 / Mailbox Phase C: schemaVersion 5 migration and execution safety
   // ===================================================================
-  describe('V3 Phase 1: schemaVersion 4 migration and execution safety', () => {
-    it('should add schemaVersion: 4 and manual execution defaults to new status', () => {
+  describe('V3 Phase 1 / Mailbox Phase C: schemaVersion 5 migration and execution safety', () => {
+    it('should add schemaVersion: 5 with manual execution and mailbox defaults to new status', () => {
       harness('init W6-A --force');
       const status = readStatus('W6-A');
-      assert.equal(status.schemaVersion, 4, 'New status should have schemaVersion: 4');
+      assert.equal(status.schemaVersion, 5, 'New status should have schemaVersion: 5');
       assert.ok(status.stateRevision >= 1, 'New status should have a persisted stateRevision');
       assert.equal(status.stageRevision, 0, 'New status should initialize stageRevision');
       assert.deepEqual(status.execution, {
@@ -2300,6 +2326,13 @@ Expected: Should be fixed
         activeLeaseToken: null,
         lockEpoch: 0,
         lastJobId: null,
+      });
+      assert.deepEqual(status.mailbox, {
+        mode: 'manual',
+        activeSessionId: null,
+        activeAttemptId: null,
+        activeCursorHash: null,
+        lastSessionId: null,
       });
       assert.deepEqual(status.acceptances, {}, 'New status should initialize acceptances');
       assert.equal(status.awaitingCommit, false, 'New status should have awaitingCommit: false');
@@ -2357,12 +2390,14 @@ Expected: Should be fixed
       assert.equal(next.success, true, 'Locked next should persist migration and baseline evidence');
 
       const migrated = readStatus(taskId);
-      assert.equal(migrated.schemaVersion, 4, 'Should have schemaVersion: 4 after migration');
+      assert.equal(migrated.schemaVersion, 5, 'Should have schemaVersion: 5 after migration');
       assert.ok(migrated.stateRevision >= 1, 'Migration should persist stateRevision');
       assert.ok(migrated.stageRevision >= 1, 'next should persist a new stage revision');
       assert.equal(migrated.execution.mode, 'manual', 'Migration should default to manual mode');
       assert.equal(migrated.execution.activeJobId, null);
       assert.equal(migrated.execution.activeAttemptId, null);
+      assert.equal(migrated.mailbox.mode, 'manual', 'Migration should default mailbox to manual mode');
+      assert.equal(migrated.mailbox.activeSessionId, null);
       assert.ok(migrated.subtasks['W6-A-02'].stages['implementation-plan'].outputBaseline,
         'next should persist output baseline evidence');
       assert.deepEqual(migrated.acceptances, {}, 'Should initialize acceptances during migration');
@@ -2377,14 +2412,14 @@ Expected: Should be fixed
       }
     });
 
-    it('should persist schemaVersion: 4 after saveStatus', () => {
+    it('should persist schemaVersion: 5 after saveStatus', () => {
       harness('init W6-A --force');
       const status = readStatus('W6-A');
-      assert.equal(status.schemaVersion, 4, 'Should write schemaVersion: 4');
+      assert.equal(status.schemaVersion, 5, 'Should write schemaVersion: 5');
       // Trigger a save
       harness('current W6-A');
       const saved = readStatus('W6-A');
-      assert.equal(saved.schemaVersion, 4, 'schemaVersion should persist after save');
+      assert.equal(saved.schemaVersion, 5, 'schemaVersion should persist after save');
     });
 
     it('should reject progress while another task execution holds the lock', () => {
@@ -2539,6 +2574,425 @@ Expected: Should be fixed
       const initResult = harness('init W6-A --force');
       assert.equal(initResult.success, false);
       assert.match(initResult.stderr, /active-job-conflict/);
+    });
+  });
+
+  describe('File Mailbox Phase C: operator-assisted CLI skeleton', () => {
+    it('publishes a committed mailbox session and blocks manual progress while active', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      assert.equal(published.code, 'mailbox-published');
+      assert.ok(published.sessionId);
+      assert.ok(published.attemptId);
+      assert.ok(published.activeCursorHash);
+      assert.equal(fs.existsSync(published.promptPath), true);
+
+      const status = readStatus('W6-A');
+      assert.equal(status.mailbox.activeSessionId, published.sessionId);
+      assert.equal(status.mailbox.activeAttemptId, published.attemptId);
+      assert.equal(status.mailbox.activeCursorHash, published.activeCursorHash);
+
+      const peek = parseJsonOutput(harness('mailbox-peek W6-A'));
+      assert.equal(peek.code, 'mailbox-active');
+      assert.equal(peek.tasks[0].sessionId, published.sessionId);
+      assert.equal(peek.tasks[0].claimable, true);
+
+      for (const command of ['next W6-A', 'step W6-A', 'advance W6-A', 'accept W6-A', 'advance W6-A --confirm-committed']) {
+        const result = harness(command);
+        assert.equal(result.success, false, `${command} should fail while mailbox is active`);
+        assert.match(result.stderr, /active-mailbox-conflict/);
+      }
+
+      const check = harness('check W6-A');
+      assert.equal(check.success, false, 'check can run but should fail because the report is still missing');
+      assert.doesNotMatch(check.stderr, /active-mailbox-conflict/);
+    });
+
+    it('runs operator-assisted claim/start/complete/pump/close before advance', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const binding = parseJsonOutput(harness('mailbox-bind W6-A --role work --binding phasec.work'));
+      assert.equal(binding.code, 'mailbox-binding-created');
+      assert.equal(binding.role, 'work');
+
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const claim = parseJsonOutput(harness(`mailbox-claim W6-A --session ${published.sessionId} --binding phasec.work --reason "operator accepted"`));
+      assert.equal(claim.code, 'mailbox-claimed');
+      const start = parseJsonOutput(harness(`mailbox-start W6-A --session ${published.sessionId} --binding phasec.work`));
+      assert.equal(start.code, 'mailbox-running');
+
+      fs.mkdirSync(path.dirname(published.primaryReportPath), { recursive: true });
+      fs.writeFileSync(published.primaryReportPath, [
+        '# Phase C mailbox implementation plan',
+        '',
+        '## Fabric 官方能力核查',
+        '',
+        '已核查。',
+        '',
+      ].join('\n'), 'utf-8');
+
+      const complete = parseJsonOutput(harness(`mailbox-complete W6-A --session ${published.sessionId} --binding phasec.work --summary "report written"`));
+      assert.equal(complete.code, 'mailbox-completed-receipt-published');
+      const pump = parseJsonOutput(harness(`mailbox-pump W6-A --session ${published.sessionId}`));
+      assert.equal(pump.code, 'mailbox-pumped');
+      assert.equal(pump.processed.at(-1).state, 'output-detected');
+      const inboxDir = path.join(HARNESS_DIR, 'runs', 'W6-A', 'mailbox', 'receipts', 'inbox', published.attemptId);
+      const processedDir = path.join(HARNESS_DIR, 'runs', 'W6-A', 'mailbox', 'receipts', 'processed', published.attemptId);
+      assert.equal(fs.existsSync(inboxDir) ? fs.readdirSync(inboxDir).filter(name => name.endsWith('.json')).length : 0, 0);
+      assert.ok(fs.readdirSync(processedDir).filter(name => name.endsWith('.json')).length >= 3);
+
+      const beforeCloseAdvance = harness('advance W6-A');
+      assert.equal(beforeCloseAdvance.success, false);
+      assert.match(beforeCloseAdvance.stderr, /active-mailbox-conflict/);
+
+      const close = harness(`mailbox-close W6-A --session ${published.sessionId} --after-check --reason "gate passed"`);
+      assert.equal(close.success, true, close.stderr || close.stdout);
+      const closedStatus = readStatus('W6-A');
+      assert.equal(closedStatus.mailbox.activeSessionId, null);
+      assert.equal(closedStatus.mailbox.lastSessionId, published.sessionId);
+
+      const advance = harness('advance W6-A');
+      assert.equal(advance.success, true, advance.stderr || advance.stdout);
+      assert.equal(readStatus('W6-A').currentStage, 'plan-review');
+    });
+
+    it('leaves later mailbox receipts pending when a receipt sequence gap exists', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      parseJsonOutput(harness('mailbox-bind W6-A --role work --binding phasec.gap'));
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      parseJsonOutput(harness(`mailbox-claim W6-A --session ${published.sessionId} --binding phasec.gap --reason "operator accepted"`));
+      parseJsonOutput(harness(`mailbox-start W6-A --session ${published.sessionId} --binding phasec.gap`));
+      fs.mkdirSync(path.dirname(published.primaryReportPath), { recursive: true });
+      fs.writeFileSync(published.primaryReportPath, [
+        '# Phase C mailbox implementation plan',
+        '',
+        '## Fabric 官方能力核查',
+        '',
+        '已核查。',
+        '',
+      ].join('\n'), 'utf-8');
+      parseJsonOutput(harness(`mailbox-complete W6-A --session ${published.sessionId} --binding phasec.gap --summary "report written"`));
+
+      const store = mailboxStore('W6-A');
+      const held = store.listReceipts('inbox').find(item => item.receipt?.sequence === 2);
+      assert.ok(held, 'sequence 2 receipt should exist before fault injection');
+      const heldPath = path.join(TEST_ROOT, 'held-sequence-2.json');
+      fs.renameSync(held.filePath, heldPath);
+
+      const firstPump = parseJsonOutput(harness(`mailbox-pump W6-A --session ${published.sessionId}`));
+      assert.equal(firstPump.processed.length, 1);
+      assert.equal(firstPump.processed[0].kind, 'session.claimed');
+      assert.equal(store.readSession(published.sessionId).state, 'claimed');
+      assert.ok(store.listReceipts('inbox').some(item => item.receipt?.sequence === 3), 'later receipt should remain pending in inbox');
+
+      fs.renameSync(heldPath, held.filePath);
+      const secondPump = parseJsonOutput(harness(`mailbox-pump W6-A --session ${published.sessionId}`));
+      assert.equal(secondPump.processed.at(-1).state, 'output-detected');
+      assert.equal(store.readSession(published.sessionId).state, 'output-detected');
+    });
+
+    it('repairs status-active publish without committed marker through reconcile', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const ledgerPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'mailbox', 'publish-ledger', `${published.sessionId}.json`);
+      const markerPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'mailbox', 'publish-committed', `${published.sessionId}.json`);
+      const ledger = JSON.parse(fs.readFileSync(ledgerPath, 'utf-8'));
+      ledger.phase = 'status-active';
+      ledger.committedAt = null;
+      fs.writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, 'utf-8');
+      fs.rmSync(markerPath, { force: true });
+
+      const blocked = harness('next W6-A');
+      assert.equal(blocked.success, false);
+      assert.match(blocked.stderr, /active-mailbox-conflict/);
+      const peek = harness('mailbox-peek W6-A');
+      assert.equal(peek.success, false);
+      assert.match(peek.stderr, /publish-not-committed|publish-ledger-not-committed/);
+
+      const repaired = parseJsonOutput(harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome commit-marker --reason "repair marker"`));
+      assert.equal(repaired.code, 'mailbox-reconciled');
+      assert.equal(fs.existsSync(markerPath), true);
+      const after = parseJsonOutput(harness('mailbox-peek W6-A'));
+      assert.equal(after.tasks[0].sessionId, published.sessionId);
+      assert.equal(after.tasks[0].claimable, true);
+    });
+
+    it('rejects reconcile activate and repair-status when another mailbox session is active', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const status = readStatus('W6-A');
+      status.mailbox = {
+        mode: 'manual',
+        activeSessionId: 'other-session',
+        activeAttemptId: 'other-attempt',
+        activeCursorHash: 'other-cursor',
+        lastSessionId: 'other-session',
+      };
+      saveStatus('W6-A', status);
+
+      for (const outcome of ['activate', 'repair-status']) {
+        const result = harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome ${outcome} --reason "must not overwrite"`);
+        assert.equal(result.success, false, `${outcome} should reject while another mailbox is active`);
+        assert.match(result.stderr, /mailbox-reconcile-active-other-session: other-session/);
+        assert.equal(readStatus('W6-A').mailbox.activeSessionId, 'other-session');
+      }
+
+      const rejectedEvents = mailboxStore('W6-A').readEvents()
+        .filter(event => event.action === 'reconcile-rejected' && event.sessionId === published.sessionId);
+      assert.equal(rejectedEvents.length, 2);
+    });
+
+    it('rejects reconcile activate and repair-status when the publish cursor is stale', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const status = readStatus('W6-A');
+      status.mailbox = {
+        mode: 'manual',
+        activeSessionId: null,
+        activeAttemptId: null,
+        activeCursorHash: null,
+        lastSessionId: published.sessionId,
+      };
+      status.stageRevision += 1;
+      saveStatus('W6-A', status);
+
+      for (const outcome of ['activate', 'repair-status']) {
+        const result = harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome ${outcome} --reason "stale cursor"`);
+        assert.equal(result.success, false, `${outcome} should reject stale cursor recovery`);
+        assert.match(result.stderr, /mailbox-reconcile-stale-cursor/);
+        assert.equal(readStatus('W6-A').mailbox.activeSessionId, null);
+      }
+
+      const rejectedEvents = mailboxStore('W6-A').readEvents()
+        .filter(event => event.action === 'reconcile-rejected' && event.sessionId === published.sessionId);
+      assert.equal(rejectedEvents.length, 2);
+    });
+
+    it('recovers mailbox-close after session closed before status clear', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const store = mailboxStore('W6-A');
+      const session = store.readSession(published.sessionId);
+      store.writeSession({ ...session, state: 'closed', closedAt: new Date().toISOString(), closeReason: 'fault injected' });
+      store.createCloseIntent({
+        sessionId: session.sessionId,
+        attemptId: session.attemptId,
+        activeCursorHash: session.activeCursorHash,
+        terminalPreconditionState: 'check-passed',
+      });
+      store.advanceCloseLedger(session.sessionId, 'close-event-written');
+      store.advanceCloseLedger(session.sessionId, 'session-closed');
+
+      const close = parseJsonOutput(harness(`mailbox-close W6-A --session ${published.sessionId} --reason "recover close"`));
+      assert.equal(close.code, 'mailbox-closed');
+      assert.equal(readStatus('W6-A').mailbox.activeSessionId, null);
+      assert.equal(store.readCloseLedger(published.sessionId).phase, 'close-committed');
+    });
+
+    it('recovers mailbox-close after status clear before close committed', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const store = mailboxStore('W6-A');
+      const session = store.readSession(published.sessionId);
+      store.writeSession({ ...session, state: 'closed', closedAt: new Date().toISOString(), closeReason: 'fault injected' });
+      store.createCloseIntent({
+        sessionId: session.sessionId,
+        attemptId: session.attemptId,
+        activeCursorHash: session.activeCursorHash,
+        terminalPreconditionState: 'check-passed',
+      });
+      store.advanceCloseLedger(session.sessionId, 'close-event-written');
+      store.advanceCloseLedger(session.sessionId, 'session-closed');
+      const status = readStatus('W6-A');
+      status.mailbox = {
+        mode: 'manual',
+        activeSessionId: null,
+        activeAttemptId: null,
+        activeCursorHash: null,
+        lastSessionId: published.sessionId,
+      };
+      saveStatus('W6-A', status);
+
+      const close = parseJsonOutput(harness(`mailbox-close W6-A --session ${published.sessionId} --reason "recover cleared status"`));
+      assert.equal(close.code, 'mailbox-close-recovered');
+      assert.equal(readStatus('W6-A').mailbox.activeSessionId, null);
+      assert.equal(store.readCloseLedger(published.sessionId).phase, 'close-committed');
+    });
+  });
+
+  describe('File Mailbox Phase D: worker-facing contract and role evidence', () => {
+    it('publishes worker receipts, records role evidence, and blocks same-identity review close', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const workBinding = parseJsonOutput(harness('mailbox-bind W6-A --role work --binding phased.work --worker-identity shared-worker'));
+      assert.equal(workBinding.code, 'mailbox-binding-created');
+      assert.ok(workBinding.workerIdentityHash);
+
+      const work = parseJsonOutput(harness('mailbox-publish W6-A'));
+      assert.equal(parseJsonOutput(harness(`mailbox-worker-claim W6-A --session ${work.sessionId} --binding phased.work`)).code, 'mailbox-worker-claimed');
+      assert.equal(parseJsonOutput(harness(`mailbox-worker-start W6-A --session ${work.sessionId} --binding phased.work`)).code, 'mailbox-worker-running');
+      fs.mkdirSync(path.dirname(work.primaryReportPath), { recursive: true });
+      fs.writeFileSync(work.primaryReportPath, [
+        '# Phase D mailbox implementation plan',
+        '',
+        '## Fabric 官方能力核查',
+        '',
+        '已核查。',
+        '',
+      ].join('\n'), 'utf-8');
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-worker-complete W6-A --session ${work.sessionId} --binding phased.work --summary "worker report written"`)).code,
+        'mailbox-worker-completed-receipt-published'
+      );
+      const workPump = parseJsonOutput(harness(`mailbox-pump W6-A --session ${work.sessionId}`));
+      assert.equal(workPump.processed.at(-1).state, 'output-detected');
+      assert.equal(harness(`mailbox-close W6-A --session ${work.sessionId} --after-check --reason "worker gate passed"`).success, true);
+
+      const store = mailboxStore('W6-A');
+      const workEvidence = store.readRoleEvidenceEvents().filter(event => event.sessionId === work.sessionId);
+      assert.ok(workEvidence.some(event => event.evidenceState === 'claimed'));
+      assert.ok(workEvidence.some(event => event.evidenceState === 'receipt-accepted'));
+      assert.ok(workEvidence.some(event => event.evidenceState === 'gate-satisfied'));
+      const processedReceipt = store.listReceipts('processed')
+        .find(item => item.receipt?.sessionId === work.sessionId && item.receipt?.kind === 'session.completed');
+      assert.equal(processedReceipt.receipt.source, 'claude-code-worker');
+
+      assert.equal(harness('advance W6-A').success, true);
+      assert.equal(readStatus('W6-A').currentStage, 'plan-review');
+
+      const reviewBinding = parseJsonOutput(harness('mailbox-bind W6-A --role review --binding phased.review --worker-identity shared-worker'));
+      assert.equal(reviewBinding.workerIdentityHash, workBinding.workerIdentityHash);
+      const review = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const reviewSession = store.readSession(review.sessionId);
+      store.writeSession({
+        ...reviewSession,
+        state: 'output-detected',
+        bindingId: 'phased.review',
+        claimBindingId: 'phased.review',
+        claimBindingGeneration: reviewBinding.bindingGeneration,
+        claimWorkerIdentityHash: reviewBinding.workerIdentityHash,
+        claimSource: 'claude-code-worker',
+        claimedAt: new Date().toISOString(),
+      });
+      assert.equal(
+        parseJsonOutput(harness('mailbox-bind W6-A --role review --binding phased.review --replace --worker-identity replacement-worker')).code,
+        'mailbox-binding-replaced'
+      );
+
+      const blockedClose = harness(`mailbox-close W6-A --session ${review.sessionId} --after-check --reason "must not close same worker review"`);
+      assert.equal(blockedClose.success, false);
+      assert.match(blockedClose.stderr, /mailbox-role-isolation-conflict/);
+      assert.equal(readStatus('W6-A').mailbox.activeSessionId, review.sessionId);
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-reconcile W6-A --session ${review.sessionId} --outcome rejected --reason "test cleanup"`)).code,
+        'mailbox-reconciled'
+      );
+    });
+
+    it('rejects worker claim when the identity already satisfied the opposite role gate', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      const store = mailboxStore('W6-A');
+      const workerIdentityHash = 'sha256:opposite-role-worker';
+      store.appendRoleEvidence({
+        sessionId: 'prior-work-session',
+        attemptId: 'prior-work-attempt',
+        activeCursorHash: 'sha256:prior',
+        stageCursor: {
+          subtaskId: 'W6-A-01',
+          stage: 'implementation-plan',
+          round: 1,
+          stageRevision: 1,
+          activeSessionId: 'prior-work-session',
+          activeAttemptId: 'prior-work-attempt',
+        },
+        stageRole: 'review',
+        evidenceState: 'gate-satisfied',
+        bindingId: 'prior.review',
+        bindingGeneration: 1,
+        workerIdentityHash,
+        source: 'claude-code-worker',
+      });
+      parseJsonOutput(harness(`mailbox-bind W6-A --role work --binding phased.reject-work --worker-identity-hash ${workerIdentityHash}`));
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      const result = harness(`mailbox-worker-claim W6-A --session ${published.sessionId} --binding phased.reject-work`);
+
+      assert.equal(result.success, false);
+      assert.match(result.stderr, /mailbox-role-isolation-conflict/);
+      assert.equal(store.readSession(published.sessionId).state, 'published');
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome rejected --reason "test cleanup"`)).code,
+        'mailbox-reconciled'
+      );
+    });
+
+    it('rejects worker terminal commands for operator-claimed sessions', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      parseJsonOutput(harness('mailbox-bind W6-A --role work --binding phased.mix-worker --worker-identity mix-worker'));
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-claim W6-A --session ${published.sessionId} --binding phased.mix-worker --reason "operator takes task"`)).code,
+        'mailbox-claimed'
+      );
+
+      const result = harness(`mailbox-worker-complete W6-A --session ${published.sessionId} --binding phased.mix-worker --summary "wrong source"`);
+      assert.equal(result.success, false);
+      assert.match(result.stderr, /mailbox-worker-claim-owner-mismatch: complete: source/);
+      const store = mailboxStore('W6-A');
+      assert.equal(store.listReceipts('inbox').some(item => item.receipt?.source === 'claude-code-worker'), false);
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome rejected --reason "test cleanup"`)).code,
+        'mailbox-reconciled'
+      );
+    });
+
+    it('rejects operator terminal commands for worker-claimed sessions without takeover', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      parseJsonOutput(harness('mailbox-bind W6-A --role work --binding phased.worker-owned --worker-identity worker-owned'));
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-worker-claim W6-A --session ${published.sessionId} --binding phased.worker-owned`)).code,
+        'mailbox-worker-claimed'
+      );
+
+      const result = harness(`mailbox-complete W6-A --session ${published.sessionId} --binding phased.worker-owned --summary "operator tries to finish"`);
+      assert.equal(result.success, false);
+      assert.match(result.stderr, /mailbox-worker-session-requires-takeover: complete/);
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome rejected --reason "test cleanup"`)).code,
+        'mailbox-reconciled'
+      );
+    });
+
+    it('requires binding and role for worker peek', () => {
+      clearActiveWorkflowBlockers('W6-A');
+      harness('init W6-A --force');
+      parseJsonOutput(harness('mailbox-bind W6-A --role work --binding phased.peek --worker-identity peek-worker'));
+      const published = parseJsonOutput(harness('mailbox-publish W6-A'));
+
+      const missingBinding = harness('mailbox-worker-peek W6-A');
+      assert.equal(missingBinding.success, false);
+      assert.match(missingBinding.stderr, /mailbox-worker-peek requires --binding/);
+      const roleMismatch = harness('mailbox-worker-peek W6-A --binding phased.peek --role review');
+      assert.equal(roleMismatch.success, false);
+      assert.match(roleMismatch.stderr, /binding-role-mismatch/);
+      const peek = parseJsonOutput(harness('mailbox-worker-peek W6-A --binding phased.peek --role work'));
+      assert.equal(peek.code, 'mailbox-active');
+      assert.equal(peek.tasks[0].sessionId, published.sessionId);
+      assert.equal(
+        parseJsonOutput(harness(`mailbox-reconcile W6-A --session ${published.sessionId} --outcome rejected --reason "test cleanup"`)).code,
+        'mailbox-reconciled'
+      );
     });
   });
 

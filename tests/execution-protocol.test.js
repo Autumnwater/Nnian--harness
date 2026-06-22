@@ -21,7 +21,7 @@ import {
 } from '../scripts/execution-protocol.js';
 
 describe('V3 Phase 1 execution protocol', () => {
-  it('migrates schema 3 status to schema 4 in manual mode', () => {
+  it('migrates schema 3 status to schema 5 in manual mode', () => {
     const status = { schemaVersion: 3 };
 
     const migrated = migrateExecutionState(status);
@@ -38,11 +38,18 @@ describe('V3 Phase 1 execution protocol', () => {
       lockEpoch: 0,
       lastJobId: null,
     });
+    assert.deepEqual(status.mailbox, {
+      mode: 'manual',
+      activeSessionId: null,
+      activeAttemptId: null,
+      activeCursorHash: null,
+      lastSessionId: null,
+    });
   });
 
-  it('does not overwrite existing V3 execution state during migration', () => {
+  it('does not overwrite existing execution and mailbox state during current schema validation', () => {
     const status = {
-      schemaVersion: 4,
+      schemaVersion: STATUS_SCHEMA_VERSION,
       stateRevision: 7,
       stageRevision: 3,
       execution: {
@@ -53,10 +60,18 @@ describe('V3 Phase 1 execution protocol', () => {
         lockEpoch: 2,
         lastJobId: 'job-0',
       },
+      mailbox: {
+        mode: 'manual',
+        activeSessionId: 'session-1',
+        activeAttemptId: 'attempt-1',
+        activeCursorHash: 'sha256:cursor',
+        lastSessionId: 'session-0',
+      },
     };
 
     assert.equal(migrateExecutionState(status), false);
     assert.equal(status.execution.activeAttemptId, 'attempt-1');
+    assert.equal(status.mailbox.activeSessionId, 'session-1');
     assert.equal(status.stageRevision, 3);
   });
 
@@ -67,56 +82,108 @@ describe('V3 Phase 1 execution protocol', () => {
     );
   });
 
-  it('rejects invalid schema 4 execution field types', () => {
+  it('rejects invalid schema 5 execution and mailbox field types', () => {
     assert.throws(
       () => migrateExecutionState({ schemaVersion: 3.5 }),
       /schemaVersion must be a positive integer/
     );
     assert.throws(
       () => migrateExecutionState({
-        schemaVersion: 4,
+        schemaVersion: STATUS_SCHEMA_VERSION,
         stateRevision: 0,
         stageRevision: 0,
         execution: { mode: 'auto' },
+        mailbox: {
+          mode: 'manual',
+          activeSessionId: null,
+          activeAttemptId: null,
+          activeCursorHash: null,
+          lastSessionId: null,
+        },
       }),
       /execution.mode must be manual or worker/
     );
     assert.throws(
       () => migrateExecutionState({
-        schemaVersion: 4,
+        schemaVersion: STATUS_SCHEMA_VERSION,
         stateRevision: 0,
         stageRevision: 0,
         execution: { mode: 'manual', lockEpoch: -1 },
+        mailbox: {
+          mode: 'manual',
+          activeSessionId: null,
+          activeAttemptId: null,
+          activeCursorHash: null,
+          lastSessionId: null,
+        },
       }),
       /execution.lockEpoch must be a non-negative integer/
     );
     assert.throws(
       () => migrateExecutionState({
-        schemaVersion: 4,
+        schemaVersion: STATUS_SCHEMA_VERSION,
         stateRevision: 0,
         stageRevision: 0,
         execution: { mode: 'manual', lockEpoch: 0, activeJobId: 42 },
+        mailbox: {
+          mode: 'manual',
+          activeSessionId: null,
+          activeAttemptId: null,
+          activeCursorHash: null,
+          lastSessionId: null,
+        },
       }),
       /execution.activeJobId must be null or a non-empty string/
     );
+    assert.throws(
+      () => migrateExecutionState({
+        schemaVersion: STATUS_SCHEMA_VERSION,
+        stateRevision: 0,
+        stageRevision: 0,
+        execution: {
+          mode: 'manual',
+          activeJobId: null,
+          activeAttemptId: null,
+          activeLeaseToken: null,
+          lockEpoch: 0,
+          lastJobId: null,
+        },
+        mailbox: {
+          mode: 'manual',
+          activeSessionId: null,
+          activeAttemptId: null,
+          activeCursorHash: null,
+          lastSessionId: null,
+          unexpected: true,
+        },
+      }),
+      /mailbox\.unknown-fields/
+    );
   });
 
-  it('rejects incomplete schema 4 state instead of filling defaults', () => {
+  it('rejects incomplete schema 5 state instead of filling defaults', () => {
     for (const status of [
-      { schemaVersion: 4 },
-      { schemaVersion: 4, stateRevision: 0 },
-      { schemaVersion: 4, stateRevision: 0, stageRevision: 0 },
-      { schemaVersion: 4, stateRevision: 0, stageRevision: 0, execution: null },
-      { schemaVersion: 4, stateRevision: 0, stageRevision: 0, execution: [] },
+      { schemaVersion: STATUS_SCHEMA_VERSION },
+      { schemaVersion: STATUS_SCHEMA_VERSION, stateRevision: 0 },
+      { schemaVersion: STATUS_SCHEMA_VERSION, stateRevision: 0, stageRevision: 0 },
+      { schemaVersion: STATUS_SCHEMA_VERSION, stateRevision: 0, stageRevision: 0, execution: null },
+      { schemaVersion: STATUS_SCHEMA_VERSION, stateRevision: 0, stageRevision: 0, execution: [] },
     ]) {
       assert.throws(() => migrateExecutionState(status), /required|execution must be an object/);
     }
     assert.throws(
       () => migrateExecutionState({
-        schemaVersion: 4,
+        schemaVersion: STATUS_SCHEMA_VERSION,
         stateRevision: 0,
         stageRevision: 0,
         execution: { mode: 'manual', lockEpoch: 0 },
+        mailbox: {
+          mode: 'manual',
+          activeSessionId: null,
+          activeAttemptId: null,
+          activeCursorHash: null,
+          lastSessionId: null,
+        },
       }),
       /execution.activeJobId is required/
     );
@@ -133,12 +200,48 @@ describe('V3 Phase 1 execution protocol', () => {
       delete execution[missingField];
       assert.throws(
         () => migrateExecutionState({
-          schemaVersion: 4,
+          schemaVersion: STATUS_SCHEMA_VERSION,
           stateRevision: 0,
           stageRevision: 0,
           execution,
+          mailbox: {
+            mode: 'manual',
+            activeSessionId: null,
+            activeAttemptId: null,
+            activeCursorHash: null,
+            lastSessionId: null,
+          },
         }),
         new RegExp(`execution\\.${missingField} is required`)
+      );
+    }
+    assert.throws(
+      () => migrateExecutionState({
+        schemaVersion: STATUS_SCHEMA_VERSION,
+        stateRevision: 0,
+        stageRevision: 0,
+        execution: completeExecution,
+      }),
+      /mailbox must be an object/
+    );
+    for (const missingField of ['activeSessionId', 'activeAttemptId', 'activeCursorHash', 'lastSessionId']) {
+      const mailbox = {
+        mode: 'manual',
+        activeSessionId: null,
+        activeAttemptId: null,
+        activeCursorHash: null,
+        lastSessionId: null,
+      };
+      delete mailbox[missingField];
+      assert.throws(
+        () => migrateExecutionState({
+          schemaVersion: STATUS_SCHEMA_VERSION,
+          stateRevision: 0,
+          stageRevision: 0,
+          execution: completeExecution,
+          mailbox,
+        }),
+        new RegExp(`mailbox\\.${missingField} is required`)
       );
     }
   });
