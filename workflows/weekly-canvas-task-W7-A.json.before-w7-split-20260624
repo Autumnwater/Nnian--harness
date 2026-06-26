@@ -1,17 +1,13 @@
 {
   "$schema": "./weekly-canvas-task.schema.json",
-  "$comment": "HEXAI Weekly Canvas Task Workflow — machine-readable config for Harness V1",
+  "$comment": "HEXAI Weekly Canvas Task Workflow — W7-A 画布可演示交互闭环 (machine-readable config for Harness V1 + W7-A minimal generalization)",
 
-  "taskId": "W6-A",
-  "taskTitle": "W6-A 画布本体UIUX收口",
+  "taskId": "W7-A",
+  "taskTitle": "W7-A 画布可演示交互闭环",
 
-  "reportRoot": "/Users/admin/project/ai/review/W6",
+  "reportRoot": "/Users/admin/project/ai/review/W7",
   "codeRepo": "/Users/admin/project/ai/work/HEXAI",
   "reviewRoot": "/Users/admin/project/ai/review",
-
-  "firstRunDefaults": {
-    "importedCompleted": ["W6-A-01"]
-  },
 
   "stages": [
     {
@@ -26,7 +22,7 @@
       "id": "plan-review",
       "label": "方案 Review",
       "requiredSkill": "hexai-plan-review",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-reviewer-deepseek",
       "nextStage": "plan-fix",
       "roundGroup": "plan"
     },
@@ -82,7 +78,7 @@
       "id": "delivery",
       "label": "交付物整理",
       "requiredSkill": "hexai-delivery",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-reviewer-deepseek",
       "nextStage": "done",
       "roundGroup": "delivery"
     },
@@ -102,15 +98,10 @@
 
   "fixReviewStages": ["plan-fix-review", "code-fix-review"],
 
-  "implementerStages": ["implementation-plan", "plan-fix", "code-implementation", "code-fix", "delivery"],
+  "implementerStages": ["implementation-plan", "plan-fix", "code-implementation", "code-fix"],
 
   "subtasks": [
-    { "id": "W6-A-01", "title": "缩放锚点", "shortTitle": "缩放锚点", "taskTheme": "W6-A画布本体UIUX收口" },
-    { "id": "W6-A-02", "title": "移动磁吸与红色参考线", "shortTitle": "移动磁吸与红色参考线", "taskTheme": "W6-A画布本体UIUX收口" },
-    { "id": "W6-A-03", "title": "选中态、控制点与 Cursor 补充优化", "shortTitle": "选中态控制点与Cursor补充优化", "taskTheme": "W6-A画布本体UIUX收口" },
-    { "id": "W6-A-04", "title": "CV-06编辑元素阶段补齐", "shortTitle": "CV-06编辑元素阶段补齐", "taskTheme": "W6-A画布本体UIUX收口" },
-    { "id": "W6-A-05", "title": "Space后移项跟踪", "shortTitle": "Space后移项跟踪", "taskTheme": "W6-A画布本体UIUX收口" },
-    { "id": "W6-A-06", "title": "右侧Agent边界确认", "shortTitle": "右侧Agent边界确认", "taskTheme": "W6-A画布本体UIUX收口" }
+    { "id": "W7-A", "title": "画布可演示交互闭环", "shortTitle": "画布可演示交互闭环", "taskTheme": "W7-A画布可演示交互闭环" }
   ],
 
   "fileNaming": {

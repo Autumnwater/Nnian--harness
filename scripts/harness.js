@@ -33,24 +33,72 @@ function getEffectiveReviewRoot() {
 }
 
 // ---------------------------------------------------------------------------
-// Workflow config — load from JSON (P1-4)
+// Workflow config — load from JSON (P1-4) + W7-A minimal generalization
 // ---------------------------------------------------------------------------
+// HW7A-P1-002: cacheKey 跨 taskId 隔离；cache miss 时完整重新解析 JSON 并
+// 替换 _workflowConfig 引用（不仅比较字符串）。
 let _workflowConfig = null;
+let _workflowConfigCacheKey = null;
 
 function loadWorkflowConfig(taskId) {
-  if (_workflowConfig && _workflowConfig.taskId === taskId && _workflowConfig._loaded) {
+  // HW7A-P1-002: cacheKey = HARNESS_ROOT + taskId，taskId 切换时必然 miss
+  const cacheKey = `${HARNESS_ROOT}::${taskId}`;
+
+  // 缓存命中：复用 _workflowConfig 引用
+  if (_workflowConfig && _workflowConfigCacheKey === cacheKey && _workflowConfig._loaded) {
     return _workflowConfig;
   }
-  const jsonPath = path.join(HARNESS_ROOT, 'workflows', 'weekly-canvas-task.json');
+
+  // HW7A-P1-002: 缓存失效分支——按 taskId-specific 路径查找，回退到 default
+  // HW7A-CR-P2-005: config 文件命名约定
+  //   workflows/weekly-canvas-task-{taskId}.json
+  //   e.g., weekly-canvas-task-W7-A.json, weekly-canvas-task-W8-A.json
+  const taskConfigPath = path.join(HARNESS_ROOT, 'workflows', `weekly-canvas-task-${taskId}.json`);
+  const defaultConfigPath = path.join(HARNESS_ROOT, 'workflows', 'weekly-canvas-task.json');
+  const usedFallback = !fs.existsSync(taskConfigPath);
+  const jsonPath = usedFallback ? defaultConfigPath : taskConfigPath;
+
   if (!fs.existsSync(jsonPath)) {
-    throw new Error(`Workflow config not found: ${jsonPath}`);
+    throw new Error(`Workflow config not found for ${taskId}: tried ${taskConfigPath} and ${defaultConfigPath}`);
   }
-  const raw = fs.readFileSync(jsonPath, 'utf-8');
-  _workflowConfig = JSON.parse(raw);
-  if (_workflowConfig.taskId !== taskId && taskId) {
-    // Allow fallback — config might define a different task as primary
-    console.error(`Warning: Config taskId "${_workflowConfig.taskId}" differs from requested "${taskId}". Using config.`);
+
+  let raw;
+  try {
+    raw = fs.readFileSync(jsonPath, 'utf-8');
+  } catch (err) {
+    throw new Error(`Config read failed for ${taskId} at ${jsonPath}: ${err.message}`);
   }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    // P2-004 修复：JSON 解析失败抛明确错误，不静默 fallback
+    throw new Error(`Config JSON parse failed for ${taskId} at ${jsonPath}: ${err.message}`);
+  }
+
+  // HW7A-P1-002: 完整替换 _workflowConfig 模块级引用（不依赖任何残留对象）
+  _workflowConfig = parsed;
+  _workflowConfigCacheKey = cacheKey;
+
+  // HW7A-CR-P1-001: 当 taskId-specific config 不存在且 default config.taskId !== taskId 时
+  // 必须 throw 而非仅 warning（避免 W8-A 静默使用 W6-A config 创建错误 status.json）
+  if (usedFallback && parsed.taskId !== taskId && taskId) {
+    throw new Error(
+      `No task-specific config found for ${taskId} (expected: ${taskConfigPath}). ` +
+      `Default config is for ${parsed.taskId}. ` +
+      `Create workflows/weekly-canvas-task-${taskId}.json first.`
+    );
+  }
+
+  // HW7A-P1-003: taskTitle 必填 throw（方案 A），避免 W6-A 字面值污染
+  if (!_workflowConfig.taskTitle) {
+    throw new Error(
+      `Config taskTitle is required for ${taskId}. ` +
+      `Please add "taskTitle" field to ${jsonPath}.`
+    );
+  }
+
   _workflowConfig._loaded = true;
   return _workflowConfig;
 }
@@ -120,8 +168,8 @@ function copyToClipboard(text) {
 // V2: Stage-to-window mapping
 // ---------------------------------------------------------------------------
 function getTargetWindow(stage) {
-  const workStages = ['implementation-plan', 'code-implementation', 'plan-fix', 'code-fix'];
-  const reviewStages = ['plan-review', 'plan-fix-review', 'code-review', 'code-fix-review', 'delivery'];
+  const workStages = ['implementation-plan', 'code-implementation', 'plan-fix', 'code-fix', 'delivery'];
+  const reviewStages = ['plan-review', 'plan-fix-review', 'code-review', 'code-fix-review'];
   const harnessStages = ['done'];
   if (workStages.includes(stage)) return 'work';
   if (reviewStages.includes(stage)) return 'review';
@@ -482,6 +530,7 @@ function chineseToNumber(cn) {
  * Parse findings from markdown report content.
  * Finding format:
  *   ### Finding W6-A-02-P1-001
+ *   ### W6-A-02-P1-001
  *   Priority: P1
  *   Status: open
  *   Owner: claude-implementer-minimax
@@ -496,13 +545,16 @@ function chineseToNumber(cn) {
  */
 function parseFindings(content) {
   const findings = [];
-  const blocks = content.split(/\n(?=### Finding\s+\S+)/);
+  const inferredSubtaskId = content.match(/\b(W\d+-[A-Z]-\d{2})\b/)?.[1] || '';
+  const headingRegex = /^###\s+(?:Finding\s+(\S+)|(W\d+-[A-Z]-\d{2}-P[012]-\d{2,3}))\s*$/gm;
+  const headingMatches = [...content.matchAll(headingRegex)];
 
-  for (const block of blocks) {
-    const m = block.match(/### Finding\s+(\S+)/);
-    if (!m) continue;
+  for (let i = 0; i < headingMatches.length; i += 1) {
+    const m = headingMatches[i];
+    const next = headingMatches[i + 1];
+    const block = content.slice(m.index, next ? next.index : undefined);
 
-    const f = { id: m[1] };
+    const f = { id: m[1] || m[2] };
     const lines = block.split('\n');
     let inFiles = false;
     const files = [];
@@ -534,6 +586,62 @@ function parseFindings(content) {
     findings.push(f);
   }
 
+  findings.push(...parseFindingStatusTables(content, inferredSubtaskId));
+
+  return findings;
+}
+
+function normalizeTableCell(cell) {
+  return cell
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/`/g, '')
+    .replace(/\*\*/g, '')
+    .replace(/[✅❌⚠️]/g, '')
+    .trim();
+}
+
+function normalizeFindingStatus(cell) {
+  const normalized = normalizeTableCell(cell).toLowerCase();
+  const allowed = ['false-positive', 'reopened', 'accepted', 'deferred', 'verified', 'fixed', 'open'];
+  return allowed.find(status => normalized.includes(status)) || '';
+}
+
+function parseFindingStatusTables(content, inferredSubtaskId = '') {
+  const findings = [];
+  const lines = content.split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith('|')) continue;
+
+    const headers = line.split('|').slice(1, -1).map(normalizeTableCell);
+    if (headers.length < 2) continue;
+
+    const idIdx = headers.findIndex(h => /^(finding|编号|id|finding id)$/i.test(h));
+    const statusIdx = headers.findIndex(h => /^(status|状态|最终状态)$/i.test(h));
+    if (idIdx === -1 || statusIdx === -1) continue;
+
+    for (let j = i + 1; j < lines.length; j++) {
+      const row = lines[j].trim();
+      if (!row.startsWith('|')) break;
+      const cells = row.split('|').slice(1, -1).map(normalizeTableCell);
+      if (cells.length < Math.max(idIdx, statusIdx) + 1) continue;
+      if (cells.every(cell => /^:?-{3,}:?$/.test(cell))) continue;
+
+      const rawId = cells[idIdx];
+      const fullIdMatch = rawId.match(/\b(W\d+-[A-Z]-\d{2}-P[012]-\d{2,3})\b/);
+      const shortIdMatch = rawId.match(/\b(P[012]-\d{2,3})\b/);
+      const id = fullIdMatch?.[1] || (inferredSubtaskId && shortIdMatch ? `${inferredSubtaskId}-${shortIdMatch[1]}` : '');
+      if (!id) continue;
+
+      const priority = id.match(/-(P[012])-/)?.[1] || '';
+      const status = normalizeFindingStatus(cells[statusIdx]);
+      if (!priority || !status) continue;
+
+      findings.push({ id, priority, status });
+    }
+  }
+
   return findings;
 }
 
@@ -560,7 +668,7 @@ function validateFindingContract(findings, subtaskId) {
 }
 
 function detectReviewDecision(content) {
-  const explicit = content.match(/^Decision:\s*(pass|changes-required)\s*$/mi);
+  const explicit = content.match(/^\s*(?:\*\*)?Decision:\s*(pass|changes-required)(?:\*\*)?\s*$/mi);
   if (explicit) return explicit[1].toLowerCase();
 
   if (/修复.{0,20}后.{0,20}(可|可以)进入|有条件通过|不可进入|阻塞/.test(content)) {
@@ -595,6 +703,45 @@ function getAllFindingsForSubtask(status, subtaskId) {
   for (const stageId of reviewStageIds) {
     const stage = stages[stageId];
     if (stage && stage.primaryReportPath && fs.existsSync(stage.primaryReportPath)) {
+      const reportDir = path.dirname(stage.primaryReportPath);
+      const reportBasename = path.basename(stage.primaryReportPath);
+
+      // Check if primary report has a round suffix (e.g., -2轮)
+      const roundSuffixMatch = reportBasename.match(/-[一二三四五六七八九十\d]+轮\.md$/);
+
+      if (roundSuffixMatch) {
+        // Primary has round suffix — read historical files first, then primary last
+        // This ensures primary's findings win in deduplication
+        const baseName = reportBasename.replace(/-[一二三四五六七八九十\d]+轮\.md$/, '');
+        if (fs.existsSync(reportDir)) {
+          const files = fs.readdirSync(reportDir);
+          const matchingFiles = files.filter(f => f.startsWith(baseName) && f !== reportBasename && f.endsWith('.md'));
+          const cnMap = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+          matchingFiles.sort((a, b) => {
+            const getRound = (name) => {
+              const m = name.match(/-([一二三四五六七八九十\d]+)轮\.md$/);
+              if (!m) return 0;
+              const num = parseInt(m[1], 10);
+              if (!isNaN(num)) return num;
+              return cnMap[m[1]] || 0;
+            };
+            return getRound(a) - getRound(b);
+          });
+          // Read historical files first (older rounds first)
+          for (const f of matchingFiles) {
+            const histPath = path.join(reportDir, f);
+            try {
+              const histContent = fs.readFileSync(histPath, 'utf-8');
+              const histFindings = parseFindings(histContent);
+              allFindings.push(...histFindings);
+            } catch {
+              // Skip unreadable files
+            }
+          }
+        }
+      }
+
+      // Read primary report LAST so its findings win in deduplication
       const content = fs.readFileSync(stage.primaryReportPath, 'utf-8');
       const findings = parseFindings(content);
       allFindings.push(...findings);
@@ -637,14 +784,16 @@ function parseFixMapping(content) {
     // Stop at next markdown heading (H1-H4)
     if (/^#{1,4}\s/.test(trimmed)) break;
     if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
-      const cells = trimmed.split('|').filter(c => c.trim()).map(c => c.trim());
+      const cells = trimmed.split('|').filter(c => c.trim()).map(normalizeTableCell);
       if (cells.length >= 2) {
         const headerVal = cells[0].toLowerCase();
         // Skip header row, separator row, and empty cells
-        if (headerVal === 'finding' || headerVal === '---' || cells[0] === '') continue;
+        // Separator row: any cell matching Markdown table separator pattern
+        // Covers: ---, ---------, :---, ---:, :---: (with any dash count)
+        if (headerVal === 'finding' || /^:?-+:?$/.test(cells[0]) || cells[0] === '') continue;
         mapping.push({
           finding: cells[0],
-          status: cells[1].toLowerCase(),
+          status: normalizeFindingStatus(cells[1]) || cells[1].toLowerCase(),
           fixFile: cells[2] || '',
           verification: cells[3] || '',
         });
@@ -805,7 +954,26 @@ function cmdInit(taskId, opts = {}) {
     // If force (without archive), we just overwrite below
   }
 
-  const fromSubtask = from || 'W6-A-02';
+  // P2-001 修复：from 默认值通用化。当未指定 from 时，取 config 的第一个
+// 不在 firstRunDefaults.importedCompleted 列表中的 subtask（保留 W6-A 行为：
+// W6-A-01 标记为 imported-completed，默认 from 跳过它到 W6-A-02）。
+//
+// HW7A-CR-P2-003: `_firstRunDefaultsForInit` 仅用于计算 fromSubtask 默认值；
+// 与下方 L925+ 的 `firstRunDefaults`（用于 residual risk + console.log）独立。
+const _firstRunDefaultsForInit = (getWorkflowConfig().firstRunDefaults) || {};
+const _importedCompleted = new Set(_firstRunDefaultsForInit.importedCompleted || []);
+const _defaultFromSubtask = (() => {
+  for (const s of getSubtasksForTask()) {
+    if (!_importedCompleted.has(s.id)) return s.id;
+  }
+  // HW7A-CR-P2-004: subtasks 为空数组时给出明确错误（而非 TypeError）
+  const first = getSubtasksForTask()[0];
+  if (!first) {
+    throw new Error(`No subtasks defined in workflow config for ${taskId}`);
+  }
+  return first.id;
+})();
+const fromSubtask = from || _defaultFromSubtask;
   const startStage = stage || 'implementation-plan';
 
   // Validate
@@ -816,7 +984,7 @@ function cmdInit(taskId, opts = {}) {
 
   const status = {
     taskId,
-    taskTitle: getWorkflowConfig().taskTitle || `${taskId} 画布本体UIUX收口`,
+    taskTitle: getWorkflowConfig().taskTitle,
     createdAt: now(),
     updatedAt: now(),
     schemaVersion: 3,
@@ -830,7 +998,8 @@ function cmdInit(taskId, opts = {}) {
     history: [],
   };
 
-  const isW6AFirstRun = taskId === 'W6-A' && !from && !stage;
+  const isFirstRun = !from && !stage;
+  const firstRunDefaults = (getWorkflowConfig().firstRunDefaults) || {};
 
   for (const s of subtasks) {
     const subtaskIdx = subtasks.findIndex(st => st.id === s.id);
@@ -919,10 +1088,13 @@ function cmdInit(taskId, opts = {}) {
     });
   }
 
-  if (isW6AFirstRun || (from === 'W6-A-02' && !stage)) {
-    const riskFor01 = status.residualRisks.find(r => r.subtask === 'W6-A-01');
-    if (riskFor01) {
-      riskFor01.risk = 'W6-A-01 completed before Harness creation; historical evidence was not re-run by Harness.';
+  if (isFirstRun && firstRunDefaults.importedCompleted) {
+    // P2-002 修复：firstRunDefaults.importedCompleted 抽象，W6-A JSON 显式注入 ['W6-A-01']
+    for (const sid of firstRunDefaults.importedCompleted) {
+      const risk = status.residualRisks.find(r => r.subtask === sid);
+      if (risk) {
+        risk.risk = `${sid} completed before Harness creation; historical evidence was not re-run by Harness.`;
+      }
     }
   }
 
@@ -940,8 +1112,10 @@ function cmdInit(taskId, opts = {}) {
   console.log(`✅ Initialized ${taskId} run`);
   console.log(`   currentSubtask: ${fromSubtask}`);
   console.log(`   currentStage: ${startStage}`);
-  if (fromSubtask === 'W6-A-02' && !from && !stage) {
-    console.log(`   W6-A-01: imported-completed (completed before Harness)`);
+  if (isFirstRun && firstRunDefaults.importedCompleted) {
+    for (const sid of firstRunDefaults.importedCompleted) {
+      console.log(`   ${sid}: imported-completed (completed before Harness)`);
+    }
   }
 
   return status;
@@ -991,11 +1165,13 @@ function cmdNext(taskId, opts = {}) {
 
   // Set currentOutputPath (P1-5)
   stageData.currentOutputPath = stageData.primaryReportPath;
-  // Every generated prompt starts a new production attempt. Capture the
-  // current artifact even when this stage was activated before, otherwise a
-  // stale baseline from an earlier attempt can make unchanged output look new.
-  stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
-  stageData.outputBaselineCapturedAt = now();
+  // Capture the stage baseline once, when the production attempt starts.
+  // Re-sending/copying a prompt after an agent has already produced the
+  // artifact must not turn that delivered artifact into the new baseline.
+  if (!stageData.outputBaseline) {
+    stageData.outputBaseline = getFileSnapshot(stageData.primaryReportPath);
+    stageData.outputBaselineCapturedAt = now();
+  }
 
   saveStatus(taskId, status);
 
@@ -1054,7 +1230,15 @@ function cmdNext(taskId, opts = {}) {
   }
   console.log('═══════════════════════════════════════════════');
   console.log();
-  console.log(result.prompt);
+  if (opts.show) {
+    console.log(result.prompt);
+  } else {
+    console.log(`Prompt body hidden by default to keep the H window from executing target-window instructions.`);
+    console.log(`Open or paste from: ${promptPath}`);
+    if (!opts.copy) {
+      console.log(`Tip: use --copy to copy it, or --show to print the full prompt intentionally.`);
+    }
+  }
 
   return { ...result, promptPath, copiedToClipboard: copied, targetWindow, nextAction, expectedSkill: config.requiredSkill };
 }
@@ -1118,7 +1302,7 @@ function cmdStep(taskId, opts = {}) {
 
   // Step 3: Next
   console.log('▶ NEXT');
-  const nextResult = cmdNext(taskId, { copy: opts.copy });
+  const nextResult = cmdNext(taskId, { copy: opts.copy, show: opts.show });
   if (nextResult.error) {
     console.log(`\n⛔ STEP STOPPED at next: ${nextResult.error}`);
     process.exitCode = 1;
@@ -1130,6 +1314,9 @@ function cmdStep(taskId, opts = {}) {
   console.log(`   Prompt path: ${nextResult.promptPath}`);
   if (opts.copy) {
     console.log(`   Copied to clipboard: ${nextResult.copiedToClipboard}`);
+  }
+  if (!opts.show) {
+    console.log('   Prompt body: hidden (use next/step --show to print intentionally)');
   }
 
   return { success: true, stoppedAt: null, ...nextResult };
@@ -1352,7 +1539,7 @@ function cmdCheck(taskId) {
 
     if (getReviewStages().includes(currentStage)) {
       const findings = parseFindings(content);
-      const legacyFindingHeading = content.match(/^#{3,6}\s+(?!Finding\s+)(?:NEW\s+)?(?:W\d+-[A-Z]-\d{2}-)?P[012](?:#|-)\d+/m);
+      const legacyFindingHeading = content.match(/(?:^#{4,6}\s+(?!Finding\s+)(?:NEW\s+)?(?:W\d+-[A-Z]-\d{2}-)?P[012](?:#|-)\d+|^#{3}\s+(?!Finding\s+)(?!W\d+-[A-Z]-\d{2}-P[012]-\d{2,3}\b)(?:NEW\s+)?(?:W\d+-[A-Z]-\d{2}-)?P[012](?:#|-)\d+)/m);
       const decision = detectReviewDecision(content);
       reviewDecision = decision;
       openFindingCount = findings.filter(f => f.status === 'open' || f.status === 'reopened').length;
@@ -2291,7 +2478,7 @@ function cmdInterrupt(taskId, opts = {}) {
 // ---------------------------------------------------------------------------
 // Resume current
 // ---------------------------------------------------------------------------
-function cmdResumeCurrent(taskId) {
+function cmdResumeCurrent(taskId, opts = {}) {
   const status = loadStatus(taskId);
   const { currentSubtask, currentStage } = status;
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
@@ -2323,7 +2510,12 @@ function cmdResumeCurrent(taskId) {
   console.log(`   promptPath: ${promptPath}`);
   console.log('═══════════════════════════════════════════════');
   console.log();
-  console.log(result.prompt);
+  if (opts.show) {
+    console.log(result.prompt);
+  } else {
+    console.log(`Prompt body hidden by default to keep the H window from executing target-window instructions.`);
+    console.log(`Open or paste from: ${promptPath}`);
+  }
 
   return { ...result, promptPath, targetWindow };
 }
@@ -2501,8 +2693,8 @@ function printUsage() {
 Usage:
   harness init <taskId> [--from <subtask>] [--stage <stage>]
                       [--force] [--archive-existing]
-  harness next <taskId> [--copy]
-  harness step <taskId> [--no-copy]
+  harness next <taskId> [--copy] [--show]
+  harness step <taskId> [--no-copy] [--show]
   harness current <taskId>
   harness check <taskId>
   harness advance <taskId> [--confirm-committed]
@@ -2513,7 +2705,7 @@ Usage:
   harness resume <taskId> --from <subtask> --stage <stage>
   harness set-current <taskId> <subtask> <stage>
   harness interrupt <taskId> --reason "<reason>"
-  harness resume-current <taskId>
+  harness resume-current <taskId> [--show]
   harness brief <taskId>
 
 V2 New Commands:
@@ -2523,6 +2715,7 @@ V2 New Commands:
 V2 New Options:
   --copy               Copy prompt to clipboard (macOS pbcopy)
   --no-copy            Do not copy prompt when using step (step copies by default)
+  --show               Print full prompt body intentionally (hidden by default)
   --confirm-committed  Confirm manual commit after delivery checkpoint
 
 Examples:
@@ -2569,12 +2762,18 @@ function main() {
       }
       case 'next': {
         if (!taskId) throw new Error('taskId required');
-        cmdNext(taskId, { copy: opts.copy === true || opts.copy === 'true' });
+        cmdNext(taskId, {
+          copy: opts.copy === true || opts.copy === 'true',
+          show: opts.show === true || opts.show === 'true',
+        });
         break;
       }
       case 'step': {
         if (!taskId) throw new Error('taskId required');
-        cmdStep(taskId, { copy: !(opts['no-copy'] === true || opts['no-copy'] === 'true') });
+        cmdStep(taskId, {
+          copy: !(opts['no-copy'] === true || opts['no-copy'] === 'true'),
+          show: opts.show === true || opts.show === 'true',
+        });
         break;
       }
       case 'current': {
@@ -2630,7 +2829,7 @@ function main() {
       }
       case 'resume-current': {
         if (!taskId) throw new Error('taskId required');
-        cmdResumeCurrent(taskId);
+        cmdResumeCurrent(taskId, { show: opts.show === true || opts.show === 'true' });
         break;
       }
       case 'brief': {

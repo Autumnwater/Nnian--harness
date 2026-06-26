@@ -103,13 +103,16 @@ function setupPlanFixReviewStage() {
 // ---------------------------------------------------------------------------
 // Setup before all tests
 // ---------------------------------------------------------------------------
+// HW7A-CR-P2-002: srcHarness declared at module scope so describe-level
+// before() hooks (notably W7-A) can read production configs
+const srcHarness = path.resolve(import.meta.dirname, '..');
+
 before(() => {
   fs.mkdirSync(REVIEW_ROOT, { recursive: true });
   fs.mkdirSync(CODE_REPO, { recursive: true });
   fs.mkdirSync(path.join(REVIEW_ROOT, 'ReviewPlaybooks'), { recursive: true });
   fs.mkdirSync(path.join(REVIEW_ROOT, 'W6', 'W6-A-01'), { recursive: true });
 
-  const srcHarness = path.resolve(import.meta.dirname, '..');
   execSync(`cp -r "${srcHarness}" "${REVIEW_ROOT}/"`, { encoding: 'utf-8' });
 
   fs.writeFileSync(path.join(REVIEW_ROOT, 'ReviewPlaybooks', 'plan-review-playbook.md'), '# Plan Review Playbook\nTest playbook.', 'utf-8');
@@ -311,52 +314,56 @@ describe('HEXAI Review Harness V1', () => {
   describe('harness next W6-A (implementation-plan prompt)', () => {
     let result;
     let status;
+    let prompt;
 
     before(() => {
       harness('init W6-A --force');
       result = harness('next W6-A');
       status = readStatus('W6-A');
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-implementation-plan.md');
+      prompt = fs.readFileSync(promptPath, 'utf-8');
     });
 
     it('should generate a prompt', () => {
       assert.equal(result.success, true);
-      assert.ok(result.stdout.length > 100, 'Prompt should be substantial');
+      assert.ok(prompt.length > 100, 'Prompt should be substantial');
+      assert.ok(result.stdout.includes('Prompt body hidden by default'));
     });
 
     it('should include taskId in prompt', () => {
-      assert.ok(result.stdout.includes('W6-A'));
+      assert.ok(prompt.includes('W6-A'));
     });
 
     it('should include subtaskId W6-A-02 in prompt', () => {
-      assert.ok(result.stdout.includes('W6-A-02'));
+      assert.ok(prompt.includes('W6-A-02'));
     });
 
     it('should include primaryReportPath in prompt', () => {
-      assert.ok(result.stdout.includes('primaryReportPath'));
-      assert.ok(result.stdout.includes('/W6/W6-A-02/'));
+      assert.ok(prompt.includes('primaryReportPath'));
+      assert.ok(prompt.includes('/W6/W6-A-02/'));
     });
 
     it('should include mirror output path in prompt', () => {
-      assert.ok(result.stdout.includes('mirrorOutput') || result.stdout.includes('mirror'), 'Should mention mirror output');
+      assert.ok(prompt.includes('mirrorOutput') || prompt.includes('mirror'), 'Should mention mirror output');
     });
 
     it('should include handoff path concept in prompt', () => {
       assert.ok(
-        result.stdout.includes('handoff') || result.stdout.includes('Handoff') || result.stdout.includes('HANDOFF'),
+        prompt.includes('handoff') || prompt.includes('Handoff') || prompt.includes('HANDOFF'),
         'Should mention handoff'
       );
     });
 
     it('should include requiredSkill info in prompt', () => {
-      assert.ok(result.stdout.includes('requiredSkill'));
+      assert.ok(prompt.includes('requiredSkill'));
     });
 
     it('should include codeRepo path in prompt', () => {
-      assert.ok(result.stdout.includes('codeRepo'));
+      assert.ok(prompt.includes('codeRepo'));
     });
 
     it('should include reportDir in prompt', () => {
-      assert.ok(result.stdout.includes('reportDir'));
+      assert.ok(prompt.includes('reportDir'));
     });
   });
 
@@ -499,6 +506,7 @@ describe('HEXAI Review Harness V1', () => {
 
   describe('harness resume-current', () => {
     let result;
+    let prompt;
 
     before(() => {
       const reportDir = path.join(REVIEW_ROOT, 'W6', 'W6-A-02');
@@ -518,27 +526,30 @@ describe('HEXAI Review Harness V1', () => {
         fs.writeFileSync(handoffPath, '# Handoff\nInterrupted during implementation plan.', 'utf-8');
       }
       result = harness('resume-current W6-A');
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-implementation-plan.md');
+      prompt = fs.readFileSync(promptPath, 'utf-8');
     });
 
     it('should generate a continuation prompt', () => {
       assert.equal(result.success, true);
-      assert.ok(result.stdout.includes('继续'), 'Prompt should indicate continuation');
-      assert.ok(result.stdout.includes('中断'), 'Prompt should mention interruption');
+      assert.ok(result.stdout.includes('Prompt body hidden by default'));
+      assert.ok(prompt.includes('继续'), 'Prompt should indicate continuation');
+      assert.ok(prompt.includes('中断'), 'Prompt should mention interruption');
     });
 
     it('should include handoffPath in prompt', () => {
-      assert.ok(result.stdout.includes('handoffPath') ||
-        result.stdout.includes('handoff'));
+      assert.ok(prompt.includes('handoffPath') ||
+        prompt.includes('handoff'));
     });
 
     it('should include primaryReportPath in prompt', () => {
-      assert.ok(result.stdout.includes('primaryReportPath') ||
-        result.stdout.includes('/W6/W6-A-02/'));
+      assert.ok(prompt.includes('primaryReportPath') ||
+        prompt.includes('/W6/W6-A-02/'));
     });
 
     it('should include mirror output path reference in prompt', () => {
       assert.ok(
-        result.stdout.includes('mirror') || result.stdout.includes('副本') || result.stdout.includes('Mirror'),
+        prompt.includes('mirror') || prompt.includes('副本') || prompt.includes('Mirror'),
         'Should reference mirror output'
       );
     });
@@ -707,6 +718,7 @@ describe('HEXAI Review Harness V1', () => {
 
   describe('continuation prompt from handoff', () => {
     let result;
+    let prompt;
 
     before(() => {
       const reportDir = path.join(REVIEW_ROOT, 'W6', 'W6-A-02');
@@ -725,14 +737,16 @@ describe('HEXAI Review Harness V1', () => {
         fs.writeFileSync(stage.handoffPath, '# Handoff\n\n## Completed\n- Read files\n\n## Remaining\n- Write plan', 'utf-8');
       }
       result = harness('resume-current W6-A');
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-implementation-plan.md');
+      prompt = fs.readFileSync(promptPath, 'utf-8');
     });
 
     it('should tell agent not to redo work', () => {
       assert.ok(
-        result.stdout.includes('不要从头重做') ||
-        result.stdout.includes('不要重复') ||
-        result.stdout.includes('中断任务') ||
-        result.stdout.includes('继续'),
+        prompt.includes('不要从头重做') ||
+        prompt.includes('不要重复') ||
+        prompt.includes('中断任务') ||
+        prompt.includes('继续'),
         'Should tell agent to continue, not restart'
       );
     });
@@ -740,26 +754,29 @@ describe('HEXAI Review Harness V1', () => {
 
   describe('prompt includes boundary rules', () => {
     let result;
+    let prompt;
 
     before(() => {
       harness('init W6-A --force');
       result = harness('next W6-A');
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-implementation-plan.md');
+      prompt = fs.readFileSync(promptPath, 'utf-8');
     });
 
     it('should mention .claude/settings.json prohibition', () => {
       assert.ok(
-        result.stdout.includes('.claude/settings.json') ||
-        result.stdout.includes('settings.json'),
+        prompt.includes('.claude/settings.json') ||
+        prompt.includes('settings.json'),
         'Should mention settings.json restriction'
       );
     });
 
     it('should mention implementer cannot approve own work', () => {
       assert.ok(
-        result.stdout.includes('不可批准') ||
-        result.stdout.includes('不能批准') ||
-        result.stdout.includes('cannot approve') ||
-        result.stdout.includes('不可自行批准'),
+        prompt.includes('不可批准') ||
+        prompt.includes('不能批准') ||
+        prompt.includes('cannot approve') ||
+        prompt.includes('不可自行批准'),
         'Should state implementer cannot approve own work'
       );
     });
@@ -770,9 +787,11 @@ describe('HEXAI Review Harness V1', () => {
       harness('init W6-A --from W6-A-03 --stage delivery --force');
       const result = harness('next W6-A');
       assert.equal(result.success, true);
-      assert.ok(result.stdout.includes('禁止写入或修改'));
-      assert.ok(result.stdout.includes('只能写入'));
-      assert.ok(!result.stdout.includes('有权读写'));
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-03-delivery.md');
+      const prompt = fs.readFileSync(promptPath, 'utf-8');
+      assert.ok(prompt.includes('禁止写入或修改'));
+      assert.ok(prompt.includes('只能写入'));
+      assert.ok(!prompt.includes('有权读写'));
     });
   });
 
@@ -1252,6 +1271,15 @@ Expected: Should be fixed
       const r = harness('check W6-A');
       assert.equal(r.success, true, 'Should pass when all findings are covered');
     });
+
+    it('should normalize markdown IDs and annotated statuses in Fix Mapping', () => {
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix',
+        '# Plan Fix Report\n\n### Fix Mapping\n\n| Finding | Status | 修复文件 | 验证 |\n| **W6-A-02-P1-001** | fixed（首轮） | src/a.ts | done |\n| **W6-A-02-P2-001** | accepted（本轮） | src/b.ts | noted |\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, true, r.stdout);
+    });
   });
 
   describe('P0-1: plan-fix-review loops open P0/P1 back to plan-fix', () => {
@@ -1308,6 +1336,26 @@ Expected: Should be fixed
       assert.ok(result.stdout.includes('Legacy finding heading'));
     });
 
+    it('should parse full finding ID headings without the Finding prefix', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n\n### W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, true, result.stdout);
+    });
+
+    it('should allow H3 full-ID detail headings before canonical Finding blocks', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n\n### W6-A-02-P1-001（detail）→ verified\n\n核验说明。\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, true, result.stdout);
+    });
+
     it('should reject malformed structured finding IDs', () => {
       setupPlanFixReviewStage();
       const status = readStatus('W6-A');
@@ -1324,6 +1372,36 @@ Expected: Should be fixed
       const status = readStatus('W6-A');
       createReport(status, 'plan-fix-review',
         '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n\n### Finding W6-A-02-P1-001\n\n**Priority**: P1\n**Status**: verified\n**Owner**: someone\n**Module**: M\n**Files**:\n- src/a.ts\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, true, result.stdout);
+    });
+
+    it('should parse markdown-bold Decision before heuristic fallback text', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\n**Decision: pass**\n\n## Fabric 官方能力核查\nVerified.\n\n说明：只要存在 open finding，必须使用 Decision: changes-required。\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, true, result.stdout);
+    });
+
+    it('should parse Chinese finding status tables with short finding IDs', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# W6-A-02 Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n\n| 编号 | 问题 | 程度 | 状态 | 核验证据 |\n| --- | --- | --- | --- | --- |\n| P1-001 | X | P1 | ✅ verified | done |\n');
+
+      const result = harness('check W6-A');
+      assert.equal(result.success, true, result.stdout);
+    });
+
+    it('should parse full finding status tables', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n## Fabric 官方能力核查\nVerified.\n\n| Finding | Status | 判定依据 |\n| --- | --- | --- |\n| W6-A-02-P1-001 | **fixed** | done |\n');
 
       const result = harness('check W6-A');
       assert.equal(result.success, true, result.stdout);
@@ -1359,11 +1437,13 @@ Expected: Should be fixed
 
       const result = harness('next W6-A');
       assert.equal(result.success, true);
-      assert.ok(result.stdout.includes('fixReportToReview:** /tmp/W6-A-03-code-fix.md'));
-      assert.ok(result.stdout.includes('previousReviewFindings:** /tmp/W6-A-03-code-review.md'));
-      assert.ok(!result.stdout.includes('计划FixReport'));
-      assert.ok(result.stdout.includes('禁止更新或覆盖上一轮 CodeReview 文件'));
-      assert.ok(result.stdout.includes('previousReviewFindings` 是只读输入'));
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-03-code-fix-review.md');
+      const prompt = fs.readFileSync(promptPath, 'utf-8');
+      assert.ok(prompt.includes('fixReportToReview:** /tmp/W6-A-03-code-fix.md'));
+      assert.ok(prompt.includes('previousReviewFindings:** /tmp/W6-A-03-code-review.md'));
+      assert.ok(!prompt.includes('计划FixReport'));
+      assert.ok(prompt.includes('禁止更新或覆盖上一轮 CodeReview 文件'));
+      assert.ok(prompt.includes('previousReviewFindings` 是只读输入'));
     });
   });
 
@@ -1639,8 +1719,15 @@ Expected: Should be fixed
       assert.ok(content.includes('W6-A'), 'Prompt file should contain taskId');
     });
 
-    it('should still contain the prompt content', () => {
-      assert.ok(result.stdout.includes('W6-A-02'), 'Should include subtask in prompt');
+    it('should keep prompt body out of stdout by default', () => {
+      assert.ok(result.stdout.includes('Prompt body hidden by default'));
+      assert.ok(!result.stdout.includes('# 实施方案编写'), 'Should not print full target-window prompt');
+    });
+
+    it('should print prompt body when --show is explicitly requested', () => {
+      const shown = harness('next W6-A --show');
+      assert.equal(shown.success, true);
+      assert.ok(shown.stdout.includes('# 实施方案编写'), 'Should print full prompt with --show');
     });
   });
 
@@ -1790,6 +1877,14 @@ Expected: Should be fixed
       );
     });
 
+    it('should route delivery to the work window', () => {
+      harness('set-current W6-A W6-A-02 delivery');
+      const deliveryResult = harness('current W6-A');
+      assert.equal(deliveryResult.success, true, deliveryResult.stdout);
+      assert.ok(deliveryResult.stdout.includes('| targetWindow | work |'), deliveryResult.stdout);
+      assert.ok(deliveryResult.stdout.includes('| expectedSkill | hexai-delivery |'), deliveryResult.stdout);
+    });
+
     it('should output expectedSkill', () => {
       assert.ok(result.stdout.includes('expectedSkill'), 'Should include expectedSkill');
     });
@@ -1882,6 +1977,7 @@ Expected: Should be fixed
 
   describe('V2: prompt includes Fix Mapping requirements', () => {
     let result;
+    let prompt;
 
     before(() => {
       harness('init W6-A --force');
@@ -1899,27 +1995,29 @@ Expected: Should be fixed
       status = readStatus('W6-A');
       assert.equal(status.currentStage, 'plan-fix');
       result = harness('next W6-A');
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W6-A', 'prompts', 'W6-A-02-plan-fix.md');
+      prompt = fs.readFileSync(promptPath, 'utf-8');
     });
 
     it('should include ### Fix Mapping requirement in plan-fix prompt', () => {
       assert.ok(
-        result.stdout.includes('### Fix Mapping'),
+        prompt.includes('### Fix Mapping'),
         'plan-fix prompt should mention ### Fix Mapping heading'
       );
     });
 
     it('should include requirement to cover ALL open/reopened findings', () => {
       assert.ok(
-        result.stdout.includes('open') || result.stdout.includes('reopened') ||
-        result.stdout.includes('覆盖') || result.stdout.includes('上一轮'),
+        prompt.includes('open') || prompt.includes('reopened') ||
+        prompt.includes('覆盖') || prompt.includes('上一轮'),
         'Should mention covering all open/reopened findings'
       );
     });
 
     it('should include requirement to copy IDs exactly from review', () => {
       assert.ok(
-        result.stdout.includes('原样复制') || result.stdout.includes('精确匹配') ||
-        result.stdout.includes('不要补零') || result.stdout.includes('不得重命名'),
+        prompt.includes('原样复制') || prompt.includes('精确匹配') ||
+        prompt.includes('不要补零') || prompt.includes('不得重命名'),
         'Should require exact ID copying'
       );
     });
@@ -2123,6 +2221,29 @@ Expected: Should be fixed
       );
       assert.ok(stage.mirrorSyncedAt, 'Passing check should record mirror sync time');
     });
+
+    it('should not recapture baseline when next is re-run after output is produced', () => {
+      harness('init W6-A --force');
+      let status = readStatus('W6-A');
+      let stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      if (fs.existsSync(stage.primaryReportPath)) fs.unlinkSync(stage.primaryReportPath);
+
+      assert.equal(harness('next W6-A').success, true);
+      status = readStatus('W6-A');
+      stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      assert.equal(stage.outputBaseline.exists, false);
+
+      createReportAt(stage.primaryReportPath,
+        '# Plan\n\n## Fabric 官方能力核查\nOK\n\nDelivered content.\n');
+
+      assert.equal(harness('next W6-A --copy').success, true);
+      status = readStatus('W6-A');
+      stage = status.subtasks['W6-A-02'].stages['implementation-plan'];
+      assert.equal(stage.outputBaseline.exists, false);
+
+      const check = harness('check W6-A');
+      assert.equal(check.success, true, check.stdout);
+    });
   });
 
   describe('V2.4: delivery acceptance contract', () => {
@@ -2176,8 +2297,11 @@ Expected: Should be fixed
     });
 
     it('should migrate old status without schemaVersion', () => {
-      // Use a unique task ID to avoid collision with any existing run
-      const taskId = 'W6-A-MIGRATE-TEST';
+      // HW7A-CR-P1-001: use a taskId with valid taskId-specific OR fallback config
+      // W6-A-MIGRATE-TEST now throws because no W6-A-MIGRATE-TEST.json exists and
+      // default config taskId !== requested. Use W6-A directly — TEST_ROOT is isolated
+      // so it won't pollute real runs/W6-A/status.json.
+      const taskId = 'W6-A';
       const statusPath = path.join(HARNESS_DIR, 'runs', taskId, 'status.json');
       const oldStatus = {
         taskId,
@@ -2251,6 +2375,319 @@ Expected: Should be fixed
       // outputs should NOT have grown just from next being called
       assert.equal(outputsAfter.length, outputsBefore.length,
         'outputs[] should not grow just from next being called');
+    });
+  });
+
+  // ===================================================================
+  // W7-A minimal generalization (Harness 最小泛化)
+  // ===================================================================
+  describe('W7-A minimal generalization (Harness 最小泛化)', () => {
+    before(() => {
+      // HW7A-CR-P2-002 (Option A): test config 派生自生产
+      // workflows/weekly-canvas-task-W7-A.json，仅重写路径前缀到 TEST_ROOT
+      const w7Dir = path.join(REVIEW_ROOT, 'W7');
+      const w7SubDir = path.join(w7Dir, 'W7-A-01');
+      fs.mkdirSync(w7SubDir, { recursive: true });
+
+      const productionConfigPath = path.join(srcHarness, 'workflows', 'weekly-canvas-task-W7-A.json');
+      if (!fs.existsSync(productionConfigPath)) {
+        throw new Error(`Test precondition failed: production ${productionConfigPath} not found`);
+      }
+      const productionConfig = JSON.parse(fs.readFileSync(productionConfigPath, 'utf-8'));
+
+      // 重写路径字段以指向 TEST_ROOT
+      const testConfig = JSON.parse(JSON.stringify(productionConfig));
+      testConfig.reportRoot = path.join(REVIEW_ROOT, 'W7');
+      testConfig.codeRepo = CODE_REPO;
+      testConfig.reviewRoot = REVIEW_ROOT;
+      if (testConfig.requiredPlaybooks) {
+        for (const key of Object.keys(testConfig.requiredPlaybooks)) {
+          testConfig.requiredPlaybooks[key] = testConfig.requiredPlaybooks[key].map(p =>
+            path.join(REVIEW_ROOT, 'ReviewPlaybooks', path.basename(p))
+          );
+        }
+      }
+
+      const w7ConfigPath = path.join(HARNESS_DIR, 'workflows', 'weekly-canvas-task-W7-A.json');
+      fs.writeFileSync(w7ConfigPath, JSON.stringify(testConfig, null, 2), 'utf-8');
+    });
+
+    after(() => {
+      // Clean up the W7-A config we created for these tests
+      const w7ConfigPath = path.join(HARNESS_DIR, 'workflows', 'weekly-canvas-task-W7-A.json');
+      if (fs.existsSync(w7ConfigPath)) fs.unlinkSync(w7ConfigPath);
+    });
+
+    it('W7-A init creates runs/W7-A/status.json', () => {
+      harness('init W7-A --force');
+      const status = readStatus('W7-A');
+      assert.ok(status, 'W7-A status.json should exist');
+      assert.equal(status.taskId, 'W7-A');
+      assert.equal(status.taskTitle, 'W7-A 画布可演示交互闭环');
+      assert.equal(status.currentSubtask, 'W7-A-01');
+      assert.equal(status.currentStage, 'implementation-plan');
+    });
+
+    it('W7-A init uses taskId-specific config (no warning)', () => {
+      harness('init W7-A --force');
+      const status = readStatus('W7-A');
+      assert.equal(status.subtasks['W7-A-01'].title, '占位入口治理 + 交互 P0');
+      assert.equal(status.subtasks['W7-A-01'].taskTheme, 'W7-A画布可演示交互闭环');
+    });
+
+    it('W7-A default fromSubtask is the first subtask (not W6-A-02)', () => {
+      harness('init W7-A --force');
+      const status = readStatus('W7-A');
+      assert.equal(status.currentSubtask, 'W7-A-01', 'default fromSubtask must come from config, not hardcoded W6-A-02');
+    });
+
+    it('W7-A current shows W7-A fields', () => {
+      harness('init W7-A --force');
+      const status = readStatus('W7-A');
+      const r = harness('current W7-A');
+      assert.equal(r.success, true);
+      assert.ok(r.stdout.includes('W7-A'));
+      assert.ok(r.stdout.includes('占位入口治理 + 交互 P0'), 'should show subtask title');
+      assert.ok(r.stdout.includes('implementation-plan'));
+      // taskTitle is stored in status.json even if cmdCurrent only renders subtaskTitle
+      assert.equal(status.taskTitle, 'W7-A 画布可演示交互闭环');
+    });
+
+    it('W7-A next generates prompt with taskId-specific paths', () => {
+      harness('init W7-A --force');
+      const r = harness('next W7-A');
+      assert.equal(r.success, true);
+      assert.ok(r.stdout.includes('W7-A'));
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W7-A', 'prompts', 'W7-A-01-implementation-plan.md');
+      const prompt = fs.readFileSync(promptPath, 'utf-8');
+      assert.ok(prompt.includes('W7-A画布可演示交互闭环'));
+      assert.ok(prompt.includes('/W7/W7-A-01/') || prompt.includes('reviewRoot'),
+        'prompt should reference W7-A report dir');
+    });
+
+    it('W7-A next --copy writes prompt to runs/W7-A/prompts/', () => {
+      harness('init W7-A --force');
+      harness('next W7-A');
+      const promptPath = path.join(HARNESS_DIR, 'runs', 'W7-A', 'prompts', 'W7-A-01-implementation-plan.md');
+      assert.ok(fs.existsSync(promptPath), 'Prompt file should exist at runs/W7-A/prompts/');
+    });
+
+    it('W7-A check fails without Fabric section (Fabric-first gate)', () => {
+      harness('init W7-A --force');
+      const status = readStatus('W7-A');
+      const stage = status.subtasks['W7-A-01'].stages['implementation-plan'];
+      fs.mkdirSync(path.dirname(stage.primaryReportPath), { recursive: true });
+      fs.writeFileSync(stage.primaryReportPath, '# Plan\n\nContent without Fabric section.\n', 'utf-8');
+
+      const r = harness('check W7-A');
+      assert.equal(r.success, false);
+      assert.ok(r.stdout.includes('Fabric') || r.stderr.includes('Fabric'));
+    });
+
+    it('W7-A check passes with Fabric section + advance to plan-review', () => {
+      harness('init W7-A --force');
+      const status = readStatus('W7-A');
+      const stage = status.subtasks['W7-A-01'].stages['implementation-plan'];
+      fs.mkdirSync(path.dirname(stage.primaryReportPath), { recursive: true });
+      fs.writeFileSync(stage.primaryReportPath,
+        '# Plan\n\n## Fabric 官方能力核查\n- Fabric API 覆盖\n- 自定义逻辑仅做业务桥接\n\n## 需求理解\nContent.\n',
+        'utf-8');
+
+      const r = harness('advance W7-A');
+      assert.equal(r.success, true, `advance should succeed: ${r.stderr}`);
+
+      const updated = readStatus('W7-A');
+      assert.equal(updated.currentStage, 'plan-review');
+      assert.equal(updated.subtasks['W7-A-01'].stages['implementation-plan'].stageStatus, 'completed');
+    });
+
+    it('cacheKey: W6-A and W7-A status files are independent', () => {
+      // Init both, verify they don't pollute each other
+      harness('init W6-A --force');
+      harness('init W7-A --force');
+
+      const w6 = readStatus('W6-A');
+      const w7 = readStatus('W7-A');
+
+      assert.equal(w6.taskId, 'W6-A');
+      assert.equal(w7.taskId, 'W7-A');
+      assert.ok(w6.subtasks['W6-A-02'], 'W6-A should have W6-A-02 subtask');
+      assert.ok(!w6.subtasks['W7-A-01'], 'W6-A should NOT have W7-A-01 subtask');
+      assert.ok(w7.subtasks['W7-A-01'], 'W7-A should have W7-A-01 subtask');
+      assert.ok(!w7.subtasks['W6-A-02'], 'W7-A should NOT have W6-A-02 subtask');
+    });
+
+    it('cacheKey: W6-A status is unchanged after W7-A init', () => {
+      harness('init W6-A --force');
+      const before = JSON.stringify(readStatus('W6-A'));
+
+      harness('init W7-A --force');
+
+      const after = JSON.stringify(readStatus('W6-A'));
+      assert.equal(after, before, 'W6-A status must not change after W7-A init');
+    });
+
+    it('cacheKey: W7-A after-then-W6-A-then-W7-A cycles correctly', () => {
+      // First W6-A init
+      harness('init W6-A --force');
+      // Then W7-A — should use W7-A config
+      harness('init W7-A --force');
+      let status = readStatus('W7-A');
+      assert.equal(status.subtasks['W7-A-01'].title, '占位入口治理 + 交互 P0');
+
+      // Then W6-A again — should restore W6-A config
+      harness('init W6-A --force');
+      status = readStatus('W6-A');
+      assert.equal(status.subtasks['W6-A-02'].title, '移动磁吸与红色参考线');
+
+      // Then W7-A again — must reload W7-A config (cacheKey miss)
+      harness('init W7-A --force');
+      status = readStatus('W7-A');
+      assert.equal(status.subtasks['W7-A-01'].title, '占位入口治理 + 交互 P0');
+      assert.ok(!status.subtasks['W6-A-02']);
+    });
+
+    it('taskTitle throw: missing taskTitle in config throws clear error', () => {
+      // Create a W7-A config without taskTitle
+      const brokenConfigPath = path.join(HARNESS_DIR, 'workflows', 'weekly-canvas-task-W7-A.json');
+      const originalConfig = fs.readFileSync(brokenConfigPath, 'utf-8');
+      const broken = JSON.parse(originalConfig);
+      delete broken.taskTitle;
+      fs.writeFileSync(brokenConfigPath, JSON.stringify(broken, null, 2), 'utf-8');
+
+      const r = harness('init W7-A --force');
+      assert.equal(r.success, false, 'init should fail when taskTitle is missing');
+      assert.ok(
+        r.stdout.includes('taskTitle') || r.stderr.includes('taskTitle'),
+        'Error must mention taskTitle'
+      );
+
+      // Restore config for subsequent tests
+      fs.writeFileSync(brokenConfigPath, originalConfig, 'utf-8');
+    });
+
+    it('JSON parse error: invalid JSON config throws clear error', () => {
+      const brokenConfigPath = path.join(HARNESS_DIR, 'workflows', 'weekly-canvas-task-W7-A.json');
+      const originalConfig = fs.readFileSync(brokenConfigPath, 'utf-8');
+      fs.writeFileSync(brokenConfigPath, '{ "taskId": "W7-A", "taskTitle": "x", invalid json ', 'utf-8');
+
+      const r = harness('init W7-A --force');
+      assert.equal(r.success, false, 'init should fail on invalid JSON');
+      assert.ok(
+        r.stdout.includes('parse') || r.stderr.includes('parse') ||
+        r.stdout.includes('JSON') || r.stderr.includes('JSON'),
+        'Error must mention JSON parse failure'
+      );
+
+      // Restore
+      fs.writeFileSync(brokenConfigPath, originalConfig, 'utf-8');
+    });
+
+    it('W6-A isolation: runs/W6-A/ status.json not modified by W7-A ops (semantic equality)', () => {
+      // Snapshot W6-A runs dir BEFORE any W7-A ops
+      harness('init W6-A --force');
+      const w6Dir = path.join(HARNESS_DIR, 'runs', 'W6-A');
+      const w6StatusBefore = JSON.parse(JSON.stringify(readStatus('W6-A')));
+      const w6MtimeBefore = fs.statSync(path.join(w6Dir, 'status.json')).mtimeMs;
+
+      // W7-A ops must not touch W6-A status.json
+      harness('init W7-A --force');
+      harness('next W7-A');
+
+      const w6MtimeAfter = fs.statSync(path.join(w6Dir, 'status.json')).mtimeMs;
+      assert.equal(w6MtimeAfter, w6MtimeBefore,
+        'runs/W6-A/status.json mtime must be unchanged after W7-A ops');
+
+      // Compare semantically (deep equal) — JSON formatting differs from write
+      const w6StatusAfter = JSON.parse(fs.readFileSync(path.join(w6Dir, 'status.json'), 'utf-8'));
+      assert.deepEqual(w6StatusAfter, w6StatusBefore,
+        'runs/W6-A/status.json content must be semantically unchanged after W7-A ops');
+    });
+
+    it('W7-A full chain: init → check → step → plan-review', () => {
+      // Init W7-A
+      harness('init W7-A --force');
+
+      // Create a valid implementation-plan report with Fabric section
+      const status = readStatus('W7-A');
+      const stage = status.subtasks['W7-A-01'].stages['implementation-plan'];
+      fs.mkdirSync(path.dirname(stage.primaryReportPath), { recursive: true });
+      fs.writeFileSync(stage.primaryReportPath,
+        '# Plan\n\n## Fabric 官方能力核查\n- Fabric API 覆盖\n- 自定义逻辑仅做业务桥接\n\n## 需求理解\nContent.\n',
+        'utf-8');
+
+      // Run step (check → advance → next)
+      const r = harnessEnv({ HARNESS_COPY_COMMAND: 'true' }, 'step W7-A');
+      assert.equal(r.success, true, `step should succeed: ${r.stderr}`);
+      assert.ok(r.stdout.includes('CHECK PASSED') || r.stdout.includes('CHECK'));
+
+      const after = readStatus('W7-A');
+      assert.equal(after.currentStage, 'plan-review', 'step should advance to plan-review');
+      assert.ok(
+        after.subtasks['W7-A-01'].stages['implementation-plan'].stageStatus === 'completed',
+        'implementation-plan stage should be completed'
+      );
+    });
+
+    it('W7-A current --copy includes copiedToClipboard info', () => {
+      harness('init W7-A --force');
+      const r = harness('current W7-A');
+      assert.equal(r.success, true);
+      assert.ok(r.stdout.includes('currentSubtask'));
+      assert.ok(r.stdout.includes('W7-A'));
+    });
+
+    // ----- HW7A-CR-P1-001: 未知 taskId fallback 防御 -----
+    it('HW7A-CR-P1-001: init W8-A (no taskId-specific config) throws clear error', () => {
+      // W8-A 没有 weekly-canvas-task-W8-A.json，必须 throw 而非静默使用 W6-A config
+      const r = harness('init W8-A --force');
+      assert.equal(r.success, false, 'init W8-A must fail when no taskId-specific config exists');
+      const msg = (r.stdout + r.stderr).toLowerCase();
+      assert.ok(
+        msg.includes('weekly-canvas-task-w8-a.json') ||
+        msg.includes('create workflows/weekly-canvas-task-w8-a.json') ||
+        msg.includes('no task-specific config'),
+        'Error must mention W8-A config filename or "No task-specific config"'
+      );
+    });
+
+    // ----- HW7A-CR-P2-004: 空 subtasks 防御 -----
+    it('HW7A-CR-P2-004: empty subtasks config throws clear error', () => {
+      // 临时破坏 W7-A config 的 subtasks 字段为空数组
+      const w7ConfigPath = path.join(HARNESS_DIR, 'workflows', 'weekly-canvas-task-W7-A.json');
+      const originalConfig = fs.readFileSync(w7ConfigPath, 'utf-8');
+      const broken = JSON.parse(originalConfig);
+      broken.subtasks = [];
+      fs.writeFileSync(w7ConfigPath, JSON.stringify(broken, null, 2), 'utf-8');
+
+      const r = harness('init W7-A --force');
+      assert.equal(r.success, false, 'init must fail when subtasks is empty');
+      const msg = r.stdout + r.stderr;
+      assert.ok(
+        msg.includes('No subtasks defined'),
+        'Error must say "No subtasks defined" instead of raw TypeError'
+      );
+
+      // 恢复 config
+      fs.writeFileSync(w7ConfigPath, originalConfig, 'utf-8');
+    });
+  });
+
+  // ----- HW7A-CR-P2-002 Option B: 验证生产 W7-A config 结构 -----
+  describe('W7-A production config structure validation', () => {
+    it('production workflows/weekly-canvas-task-W7-A.json has required fields', () => {
+      const productionConfigPath = path.join(srcHarness, 'workflows', 'weekly-canvas-task-W7-A.json');
+      assert.ok(fs.existsSync(productionConfigPath), 'production W7-A config must exist');
+      const cfg = JSON.parse(fs.readFileSync(productionConfigPath, 'utf-8'));
+      assert.equal(cfg.taskId, 'W7-A', 'taskId must be W7-A');
+      assert.ok(cfg.taskTitle && cfg.taskTitle.trim().length > 0,
+        'taskTitle must be present and non-empty (HW7A-P1-003 throw precondition)');
+      assert.ok(Array.isArray(cfg.subtasks) && cfg.subtasks.length > 0,
+        'subtasks must be non-empty array');
+      assert.ok(Array.isArray(cfg.stages) && cfg.stages.length === 10,
+        'stages must have 10 entries');
+      assert.ok(cfg.reportRoot.endsWith('/W7'),
+        `reportRoot must end with /W7, got ${cfg.reportRoot}`);
     });
   });
 });
