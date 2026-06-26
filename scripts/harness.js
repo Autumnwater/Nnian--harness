@@ -1737,8 +1737,16 @@ function cmdCheck(taskId) {
   // Fabric-first gate — required before code-implementation
   const fabricGateStages = ['implementation-plan', 'plan-fix-review'];
   if (fabricGateStages.includes(currentStage)) {
-    if (primaryPath && fs.existsSync(primaryPath)) {
-      const content = fs.readFileSync(primaryPath, 'utf-8');
+    const fabricGatePath = currentStage === 'plan-fix-review'
+      ? (
+          status.subtasks[currentSubtask]?.stages?.['implementation-plan']?.latestAcceptedOutputPath ||
+          status.subtasks[currentSubtask]?.stages?.['implementation-plan']?.primaryReportPath ||
+          primaryPath
+        )
+      : primaryPath;
+
+    if (fabricGatePath && fs.existsSync(fabricGatePath)) {
+      const content = fs.readFileSync(fabricGatePath, 'utf-8');
       if (!content.includes('Fabric 官方能力核查') && !content.includes('Fabric Official')) {
         issues.push('Fabric-first: 实施方案必须包含 "Fabric 官方能力核查" 章节。缺少该章节不允许进入代码实现。');
       }

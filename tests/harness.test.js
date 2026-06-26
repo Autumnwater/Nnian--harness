@@ -958,6 +958,16 @@ describe('HEXAI Review Harness V1', () => {
       const s = readStatus('W6-A');
       assert.equal(s.currentStage, 'plan-review');
     });
+
+    it('should check the accepted implementation plan, not the fix-review report, before code implementation', () => {
+      setupPlanFixReviewStage();
+      const status = readStatus('W6-A');
+      createReport(status, 'plan-fix-review',
+        '# Fix Review\n\nDecision: pass\n\n### Finding W6-A-02-P1-001\nPriority: P1\nStatus: verified\nOwner: someone\nModule: M\nIssue: X\nExpected: Y\n');
+
+      const r = harness('check W6-A');
+      assert.equal(r.success, true, r.stdout);
+    });
   });
 
   describe('harness brief', () => {
