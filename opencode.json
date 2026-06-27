@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md"
+  ],
+  "default_agent": "harness",
+  "agent": {
+    "harness": {
+      "description": "HEXAI H/Harness operator. Controls Harness state, gates, routing, prompts, and tests without executing A/B/C/D work.",
+      "mode": "primary",
+      "variant": "minimal",
+      "prompt": "You are operating in /Users/admin/project/ai/Harness as H/Harness for HEXAI. Read and follow /Users/admin/project/ai/Harness/AGENTS.md. You may run and fix Harness commands, workflow configs, templates, gates, tests, and Harness-owned machine state. Do not execute A/plan, B/code, C/review, or D/reviewlast prompt contents. Do not write implementation plans, plan fixes, code mappings, code fixes, code reviews, fix reviews, final reviews, or delivery reports as another role. Do not read or modify .claude/settings.json, API keys, tokens, cookies, or .env files. Do not modify /Users/admin/project/ai/work/HEXAI business code unless the user explicitly changes this window's role."
+    }
+  },
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "pwd": "allow",
+      "ls *": "allow",
+      "rg *": "allow",
+      "sed *": "allow",
+      "cat *": "allow",
+      "find *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "pnpm harness *": "allow",
+      "pnpm test": "allow",
+      "node scripts/harness.js *": "allow",
+      "rm *": "deny",
+      "rm -rf *": "deny",
+      "git reset *": "deny",
+      "git checkout *": "deny",
+      "git clean *": "deny",
+      "git commit *": "ask",
+      "git push *": "ask"
+    },
+    "edit": "allow",
+    "read": "allow",
+    "webfetch": "allow",
+    "plan_enter": "allow",
+    "plan_exit": "allow",
+    "question": "allow",
+    "external_directory": {
+      "/Users/admin/project/ai/reviewDoc/*": "allow"
+    }
+  }
+}

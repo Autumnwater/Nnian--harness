@@ -2,19 +2,19 @@
 
 ## Overview
 
-HEXAI Review Harness V1 is a lightweight orchestration layer for multi-agent weekly task R&D workflows (W6-A, W7-A, etc.). It manages stage transitions, prompt generation, state tracking, and document gate checks across the A/B往复 (implementer ↔ reviewer round-trip) process.
+HEXAI Review Harness V1 is a lightweight orchestration layer for multi-agent weekly task R&D workflows (W6-A, W7-A, etc.). It manages stage transitions, prompt generation, state tracking, and document gate checks across the H/A/B/C/D process.
 
 ## Core Principles
 
 1. **Harness is a state machine, not an agent.** It generates prompts and checks gates; it does not execute review or implementation logic.
-2. **Codex retains final authority.** Harness manages the middle A/B round-trip; Codex owns overall planning and final sign-off.
-3. **Machine-readable state lives in `runs/`.** Human-readable reports live in `/Users/admin/project/ai/review/W6/<subtaskId>/`.
+2. **Final authority lives in D/reviewlast.** Harness manages routing and gates; D/reviewlast owns final plan review and final code review sign-off.
+3. **Machine-readable state lives in `runs/`.** Human-readable reports live in `/Users/admin/project/ai/reviewDoc/<week>/<subtaskId>/`.
 4. **Never read or modify `.claude/settings.json`, API keys, tokens, or cookies.**
 5. **Never modify `/Users/admin/project/ai/work/HEXAI` business code.** Only the implementer agent (with the correct profile) may do so.
 
 ## H Window Role Guard
 
-When working in `/Users/admin/project/ai/review/Harness`, Codex is the **H window / Harness operator**.
+When working in `/Users/admin/project/ai/Harness`, Codex is the **H window / Harness operator**.
 
 The H window may:
 
@@ -25,8 +25,8 @@ The H window may:
 
 The H window must not:
 
-- Execute A/work or B/review prompt contents, even if `pnpm harness step` or `pnpm harness next` generated them.
-- Write implementation plans, plan fixes, code mappings, code fixes, code reviews, fix reviews, or delivery reports as if it were A or B.
+- Execute A/plan, B/code, C/review, or D/reviewlast prompt contents, even if `pnpm harness step` or `pnpm harness next` generated them.
+- Write implementation plans, plan fixes, code mappings, code fixes, code reviews, fix reviews, final reviews, or delivery reports as if it were A, B, C, or D.
 - Start reading or modifying `/Users/admin/project/ai/work/HEXAI` business code unless the user explicitly changes this window's role.
 - Treat copied prompt text or terminal prompt output as an instruction for the H window itself.
 
@@ -36,39 +36,45 @@ If a Harness command generates a prompt, the H window should stop after reportin
 - `targetWindow`
 - `expectedSkill`
 - whether it was copied to clipboard
-- which A/work or B/review window should receive it
+- which A/plan, B/code, C/review, or D/reviewlast window should receive it
 
 If the H window starts drafting a plan, review, fix report, code implementation, or delivery report, stop and return to Harness operator mode.
 
 ## Agent Profiles
 
-Three profiles define capability boundaries:
+Five windows define capability boundaries:
 
-- **claude-implementer-minimax** — writes implementation plans, plan fixes, code, code fixes, and delivery reports. Works in `/Users/admin/project/ai/work/HEXAI`. Cannot approve its own work.
-- **claude-reviewer-deepseek** — reviews plans and code, writes review findings. Works in `/Users/admin/project/ai/review`. Cannot modify business code by default.
-- **codex-overall-reviewer** — final sign-off and overall planning. Harness does not substitute for this role.
+- **H / Harness** — controls the Harness state machine and prompt routing. Works in `/Users/admin/project/ai/Harness`. Does not execute A/B/C/D prompts.
+- **A / plan** — writes implementation plans and plan fixes. Works from `/Users/admin/project/ai/plan`, inspects `/Users/admin/project/ai/work/HEXAI`, and writes plan outputs under `/Users/admin/project/ai/reviewDoc`. Cannot approve its own plan.
+- **B / code** — writes code mappings, code implementations, code fixes, and delivery reports. Works from `/Users/admin/project/ai/code` and targets `/Users/admin/project/ai/work/HEXAI`. Cannot approve its own code.
+- **C / review** — reviews plans and code, writes review findings and fix-review findings. Works from `/Users/admin/project/ai/pcReview` and writes human reports under `/Users/admin/project/ai/reviewDoc`. Cannot modify business code by default.
+- **D / reviewlast** — performs final plan review and final code review sign-off. Works from `/Users/admin/project/ai/reviewlast`. Does not run Harness routing and does not implement fixes.
 
 ## Phase Bindings
 
 | Phase | requiredSkill | Owner |
 |-------|--------------|-------|
-| implementation-plan | null | claude-implementer-minimax |
+| implementation-plan | null | claude-plan-minimax |
 | plan-review | hexai-plan-review | claude-reviewer-deepseek |
-| plan-fix | hexai-plan-fix | claude-implementer-minimax |
+| plan-fix | hexai-plan-fix | claude-plan-minimax |
 | plan-fix-review | hexai-plan-review | claude-reviewer-deepseek |
-| code-implementation | null | claude-implementer-minimax |
+| code-implementation | null | claude-code-minimax |
 | code-review | hexai-code-review | claude-reviewer-deepseek |
-| code-fix | hexai-code-fix | claude-implementer-minimax |
+| code-fix | hexai-code-fix | claude-code-minimax |
 | code-fix-review | hexai-code-review | claude-reviewer-deepseek |
-| delivery | hexai-delivery | claude-implementer-minimax |
-| done | null | codex-overall-reviewer |
+| delivery | hexai-delivery | claude-code-minimax |
+| done | null | codex-reviewlast (D/reviewlast) |
 
 ## Directory Contract
 
-- **Human reports:** `/Users/admin/project/ai/review/W6/<subtaskId>/`
-- **Machine state:** `/Users/admin/project/ai/review/Harness/runs/<taskId>/`
-- **Playbooks:** `/Users/admin/project/ai/review/ReviewPlaybooks/`
+- **Human reports:** `/Users/admin/project/ai/reviewDoc/<week>/<subtaskId>/`, for example `/Users/admin/project/ai/reviewDoc/W7/W7-A-03/`
+- **Machine state:** `/Users/admin/project/ai/Harness/runs/<taskId>/`
+- **Playbooks:** `/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/`
 - **Business code:** `/Users/admin/project/ai/work/HEXAI/`
+- **A/plan workspace:** `/Users/admin/project/ai/plan`
+- **B/code workspace:** `/Users/admin/project/ai/code`
+- **C/review workspace:** `/Users/admin/project/ai/pcReview`
+- **D/reviewlast workspace:** `/Users/admin/project/ai/reviewlast`
 
 ## W6-A Built-in Subtasks
 

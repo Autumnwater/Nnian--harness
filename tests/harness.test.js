@@ -1017,7 +1017,8 @@ describe('HEXAI Review Harness V1', () => {
     it('should include ownerProfile and requiredSkill', () => {
       assert.ok(
         result.stdout.includes('ownerProfile') ||
-        result.stdout.includes('claude-implementer'),
+        result.stdout.includes('claude-plan-minimax') ||
+        result.stdout.includes('claude-code-minimax'),
         'Should include ownerProfile'
       );
     });
@@ -1066,7 +1067,7 @@ describe('HEXAI Review Harness V1', () => {
 ### Finding W6-A-02-P1-001
 Priority: P1
 Status: open
-Owner: claude-implementer-minimax
+Owner: claude-plan-minimax
 Module: TestModule
 Issue: Something needs fixing
 Expected: Should work properly
@@ -1074,7 +1075,7 @@ Expected: Should work properly
 ### Finding W6-A-02-P2-001
 Priority: P2
 Status: open
-Owner: claude-implementer-minimax
+Owner: claude-plan-minimax
 Module: TestModule
 Issue: Minor issue
 Expected: Should be better
@@ -1142,7 +1143,7 @@ Expected: Should be better
 ### Finding W6-A-02-P1-002
 Priority: P1
 Status: open
-Owner: claude-implementer-minimax
+Owner: claude-code-minimax
 Module: TestModule
 Issue: Code issue
 Expected: Should be fixed
@@ -1709,8 +1710,8 @@ Expected: Should be fixed
     it('should include structured metadata in output', () => {
       assert.ok(result.stdout.includes('currentSubtask'), 'Should include currentSubtask');
       assert.ok(result.stdout.includes('targetWindow'), 'Should include targetWindow');
-      assert.ok(result.stdout.includes('nextAction: 请粘贴到 A/work 窗口'),
-        'Should explicitly identify the A/work target window');
+      assert.ok(result.stdout.includes('nextAction: 请粘贴到 A/plan 窗口'),
+        'Should explicitly identify the A/plan target window');
       assert.ok(result.stdout.includes('expectedSkill'), 'Should include expectedSkill');
       assert.ok(result.stdout.includes('promptPath'), 'Should include promptPath');
     });
@@ -1778,8 +1779,8 @@ Expected: Should be fixed
       // Should have generated next prompt
       assert.ok(r.stdout.includes('NEXT PROMPT GENERATED') || r.stdout.includes('NEXT'),
         'Should include NEXT output');
-      assert.ok(r.stdout.includes('nextAction: 请粘贴到 B/review 窗口'),
-        'Should explicitly identify the B/review target window');
+      assert.ok(r.stdout.includes('nextAction: 请粘贴到 C/review 窗口'),
+        'Should explicitly identify the C/review target window');
       assert.ok(r.stdout.includes('copiedToClipboard: true') || r.stdout.includes('Copied to clipboard: true'),
         'step should copy the generated prompt by default');
     });
@@ -1882,16 +1883,38 @@ Expected: Should be fixed
     it('should output targetWindow', () => {
       assert.ok(result.stdout.includes('targetWindow'), 'Should include targetWindow');
       assert.ok(
-        result.stdout.includes('work') || result.stdout.includes('review'),
+        result.stdout.includes('| targetWindow | plan |') ||
+        result.stdout.includes('| targetWindow | code |') ||
+        result.stdout.includes('| targetWindow | review |') ||
+        result.stdout.includes('| targetWindow | reviewlast |'),
         'Should show window value'
       );
     });
 
-    it('should route delivery to the work window', () => {
+    it('should route windows from workflow stage groups', () => {
+      const workflowPath = path.join(HARNESS_DIR, 'workflows', 'weekly-canvas-task.json');
+      const original = fs.readFileSync(workflowPath, 'utf-8');
+      try {
+        const workflow = JSON.parse(original);
+        workflow.planStages = workflow.planStages.filter(s => s !== 'implementation-plan');
+        workflow.codeStages = ['implementation-plan', ...workflow.codeStages];
+        fs.writeFileSync(workflowPath, JSON.stringify(workflow, null, 2) + '\n', 'utf-8');
+
+        harness('init W6-A --force');
+        const routed = harness('current W6-A');
+        assert.equal(routed.success, true, routed.stdout);
+        assert.ok(routed.stdout.includes('| targetWindow | code |'), routed.stdout);
+      } finally {
+        fs.writeFileSync(workflowPath, original, 'utf-8');
+        harness('init W6-A --force');
+      }
+    });
+
+    it('should route delivery to the B/code window', () => {
       harness('set-current W6-A W6-A-02 delivery');
       const deliveryResult = harness('current W6-A');
       assert.equal(deliveryResult.success, true, deliveryResult.stdout);
-      assert.ok(deliveryResult.stdout.includes('| targetWindow | work |'), deliveryResult.stdout);
+      assert.ok(deliveryResult.stdout.includes('| targetWindow | code |'), deliveryResult.stdout);
       assert.ok(deliveryResult.stdout.includes('| expectedSkill | hexai-delivery |'), deliveryResult.stdout);
     });
 

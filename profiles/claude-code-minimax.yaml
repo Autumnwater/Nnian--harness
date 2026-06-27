@@ -1,35 +1,33 @@
-# Claude Implementer (Minimax) Profile
-# Used for: implementation-plan, plan-fix, code-implementation, code-fix, delivery
-# Legacy compatibility profile. Active H/A/B/C/D workflows use
-# claude-plan-minimax and claude-code-minimax instead.
+# Claude Code (Minimax) Profile
+# Used for: code-implementation, code-fix, delivery
 
-profile: claude-implementer-minimax
+profile: claude-code-minimax
 role: implementer
 model: minimax
 
 # Workspace
-cwd: /Users/admin/project/ai/work/HEXAI
+cwd: /Users/admin/project/ai/code
+codeRepo: /Users/admin/project/ai/work/HEXAI
 
 # Permissions
 permissions:
   # CAN do
   - read-write: /Users/admin/project/ai/work/HEXAI (task-related business code)
-  - write: /Users/admin/project/ai/reviewDoc (implementation records, fix reports, verification evidence for the current task reportRoot)
+  - write: /Users/admin/project/ai/reviewDoc (code mappings, fix reports, delivery reports, verification evidence for the current task reportRoot)
   - write: Harness/runs/{taskId}/outputs (current stage output mirror)
   - read: /Users/admin/project/ai/reviewDoc/ReviewPlaybooks
 
   # CANNOT do
   - cannot-write: reviewer's review finding documents
-  - cannot-approve: own plans or code (must go through reviewer)
+  - cannot-approve: own plans or code
   - cannot-read: .claude/settings.json
   - cannot-modify: .claude/settings.json
   - cannot-execute: destructive git, commit, push (unless user explicitly requests)
 
 # Responsibilities
 responsibilities:
-  - Write implementation plans based on task requirements
-  - Fix plans based on plan review findings (plan-fix only, no code)
   - Implement code based on approved implementation plans
-  - Fix code based on code review findings (minimal fixes only)
+  - Fix code based on code review findings
   - Generate delivery reports with evidence and acceptance summaries
+  - Keep implementation and fixes scoped to the accepted plan and review findings
   - Write handoff documents when interrupted

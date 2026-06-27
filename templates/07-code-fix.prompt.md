@@ -28,11 +28,11 @@
 
 ## 边界规则
 
-1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{codeRepo}}`。
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `/Users/admin/project/ai/code`。
 2. 你有权读写 `{{codeRepo}}` 中任务相关的业务代码。
 3. 你有权写入 `{{reportDir}}` 下的修复记录和验证证据。
 4. **按 CodeReview findings 做最小代码修复。** 只修 finding 指出的问题，不做额外变更。
-5. **你不可批准自己的修复。** 修复后的代码必须经过 reviewer 复审。
+5. **你不可批准自己的修复。** 修复后的代码必须经过 C/review 复审。
 6. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
 7. **不可**执行 destructive git、commit、push，除非用户明确要求。
 

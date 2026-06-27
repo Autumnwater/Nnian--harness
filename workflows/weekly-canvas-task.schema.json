@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hexai.dev/harness/weekly-canvas-task.schema.json",
+  "title": "HEXAI Review Harness Workflow",
+  "type": "object",
+  "required": ["taskId", "taskTitle", "reportRoot", "codeRepo", "reviewRoot", "stages", "subtasks", "fileNaming"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "taskId": { "type": "string", "pattern": "^W\\d+-[A-Z]$" },
+    "taskTitle": { "type": "string", "minLength": 1 },
+    "reportRoot": { "type": "string", "minLength": 1 },
+    "reportDirPattern": { "type": "string" },
+    "codeRepo": { "type": "string", "minLength": 1 },
+    "reviewRoot": { "type": "string", "minLength": 1 },
+    "firstRunDefaults": {
+      "type": "object",
+      "properties": {
+        "importedCompleted": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "ownerProfile"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "label": { "type": "string", "minLength": 1 },
+          "requiredSkill": { "type": ["string", "null"] },
+          "ownerProfile": { "type": "string", "minLength": 1 },
+          "nextStage": { "type": ["string", "null"] },
+          "roundGroup": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      }
+    },
+    "reviewStages": { "$ref": "#/$defs/stageIdList" },
+    "fixStages": { "$ref": "#/$defs/stageIdList" },
+    "fixReviewStages": { "$ref": "#/$defs/stageIdList" },
+    "planStages": { "$ref": "#/$defs/stageIdList" },
+    "codeStages": { "$ref": "#/$defs/stageIdList" },
+    "reviewLastStages": { "$ref": "#/$defs/stageIdList" },
+    "implementerStages": { "$ref": "#/$defs/stageIdList" },
+    "subtasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "shortTitle", "taskTheme"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "minLength": 1 },
+          "shortTitle": { "type": "string", "minLength": 1 },
+          "taskTheme": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": true
+      }
+    },
+    "fileNaming": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["pattern"],
+        "properties": {
+          "pattern": { "type": "string", "minLength": 1 },
+          "altPattern": { "type": "string" },
+          "roundSuffix": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "requiredPlaybooks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "stageIdList": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    }
+  }
+}

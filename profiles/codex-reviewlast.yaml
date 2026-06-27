@@ -1,8 +1,7 @@
 # Codex ReviewLast Profile
 # Used for: done (final plan review and final code review sign-off)
-# Legacy compatibility profile. Active H/A/B/C/D workflows use codex-reviewlast.
 
-profile: codex-overall-reviewer
+profile: codex-reviewlast
 role: final-approver
 model: codex
 
@@ -15,6 +14,7 @@ permissions:
   - read: /Users/admin/project/ai/work/HEXAI (business code)
   - approve: final sign-off and merge readiness
   - plan: overall task planning and task decomposition
+  - cannot-write: /Users/admin/project/ai/work/HEXAI (business code, unless user changes role)
   - cannot-read: .claude/settings.json
   - cannot-modify: .claude/settings.json
 
@@ -24,3 +24,4 @@ responsibilities:
   - Final code review sign-off
   - Go/no-go decision for merge
   - Harness does not substitute for this role
+

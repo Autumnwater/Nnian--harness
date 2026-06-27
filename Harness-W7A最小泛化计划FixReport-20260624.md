@@ -123,7 +123,7 @@ pnpm harness step W7-A         # 推到 plan-review + 生成 B 窗口 prompt
 pnpm harness init W7-A
 cp /Users/admin/project/ai/review/W7/W7-A/W7-A画布可演示交互闭环实施计划-20260624.md \
    $(jq -r '.subtasks["W7-A"].stages["implementation-plan"].primaryReportPath' \
-       /Users/admin/project/ai/review/Harness/runs/W7-A/status.json)
+       /Users/admin/project/ai/Harness/runs/W7-A/status.json)
 pnpm harness check W7-A
 pnpm harness step W7-A
 ```

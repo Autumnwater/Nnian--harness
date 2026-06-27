@@ -6,20 +6,20 @@ role: reviewer
 model: deepseek
 
 # Workspace
-cwd: /Users/admin/project/ai/review
+cwd: /Users/admin/project/ai/pcReview
 codeRepo: /Users/admin/project/ai/work/HEXAI
 
 # Permissions
 permissions:
   # CAN do
   - read: /Users/admin/project/ai/work/HEXAI (code review)
-  - write: /Users/admin/project/ai/review/W6 (review outputs for corresponding subtask)
-  - read: /Users/admin/project/ai/review/ReviewPlaybooks
+  - write: /Users/admin/project/ai/reviewDoc (review outputs for the corresponding current task reportRoot)
+  - read: /Users/admin/project/ai/reviewDoc/ReviewPlaybooks
   - update: finding status and re-review conclusions
 
   # CANNOT do (default)
   - cannot-write: /Users/admin/project/ai/work/HEXAI (business code)
-  - cannot-do: final sign-off (reserved for Codex)
+  - cannot-do: final sign-off (reserved for D/reviewlast)
   - cannot-read: .claude/settings.json
   - cannot-modify: .claude/settings.json
 

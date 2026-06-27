@@ -27,7 +27,7 @@
 
 ## 边界规则
 
-1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{reviewRoot}}`。
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `/Users/admin/project/ai/pcReview`。
 2. 你可以读取 `{{codeRepo}}` 中的业务代码。
 3. 你可以写入 `{{reportDir}}` 中对应 review 输出。
 4. **默认不能写** `{{codeRepo}}` 业务代码。
@@ -39,8 +39,8 @@
 
 在开始 review 之前，**必须**完整读取以下 Playbook：
 
-1. `/Users/admin/project/ai/review/ReviewPlaybooks/code-review-playbook.md`
-2. `/Users/admin/project/ai/review/ReviewPlaybooks/canvas-stage-review-playbook.md`
+1. `/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/code-review-playbook.md`
+2. `/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/canvas-stage-review-playbook.md`
 
 ## Review 输入
 
@@ -59,7 +59,7 @@
 
 Priority: P0/P1/P2
 Status: open
-Owner: claude-implementer-minimax
+Owner: claude-code-minimax
 Module: {模块名}
 Files:
 - {文件路径}

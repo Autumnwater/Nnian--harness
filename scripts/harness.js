@@ -15,7 +15,7 @@ const HARNESS_ROOT = process.env.HARNESS_ROOT || path.resolve(__dirname, '..');
 // ---------------------------------------------------------------------------
 // Paths — can be overridden via env vars for testing
 // ---------------------------------------------------------------------------
-const REVIEW_ROOT = process.env.REVIEW_ROOT || '/Users/admin/project/ai/review';
+const REVIEW_ROOT = process.env.REVIEW_ROOT || '/Users/admin/project/ai/reviewDoc';
 const CODE_REPO = process.env.CODE_REPO || '/Users/admin/project/ai/work/HEXAI';
 const REVIEW_PLAYBOOKS = path.join(REVIEW_ROOT, 'ReviewPlaybooks');
 
@@ -129,6 +129,18 @@ function getReviewStages() {
   return getWorkflowConfig().reviewStages || [];
 }
 
+function getPlanStages() {
+  return getWorkflowConfig().planStages || ['implementation-plan', 'plan-fix'];
+}
+
+function getCodeStages() {
+  return getWorkflowConfig().codeStages || ['code-implementation', 'code-fix', 'delivery'];
+}
+
+function getReviewLastStages() {
+  return getWorkflowConfig().reviewLastStages || ['done'];
+}
+
 function getFixStages() {
   return getWorkflowConfig().fixStages || [];
 }
@@ -168,23 +180,25 @@ function copyToClipboard(text) {
 // V2: Stage-to-window mapping
 // ---------------------------------------------------------------------------
 function getTargetWindow(stage) {
-  const workStages = ['implementation-plan', 'code-implementation', 'plan-fix', 'code-fix', 'delivery'];
-  const reviewStages = ['plan-review', 'plan-fix-review', 'code-review', 'code-fix-review'];
-  const harnessStages = ['done'];
-  if (workStages.includes(stage)) return 'work';
+  const planStages = getPlanStages();
+  const codeStages = getCodeStages();
+  const reviewStages = getReviewStages();
+  const reviewLastStages = getReviewLastStages();
+  if (planStages.includes(stage)) return 'plan';
+  if (codeStages.includes(stage)) return 'code';
   if (reviewStages.includes(stage)) return 'review';
-  if (harnessStages.includes(stage)) return 'harness';
-  // Default: implementer stages → work, review stages → review
+  if (reviewLastStages.includes(stage)) return 'reviewlast';
+  // Legacy fallback for older workflow configs that only define implementerStages.
   const implementerStages = getImplementerStages();
-  if (implementerStages.includes(stage)) return 'work';
-  const reviewStagesAll = getReviewStages();
-  if (reviewStagesAll.includes(stage)) return 'review';
+  if (implementerStages.includes(stage)) return 'code';
   return 'review';
 }
 
 function getTargetWindowInstruction(targetWindow) {
-  if (targetWindow === 'work') return '请粘贴到 A/work 窗口';
-  if (targetWindow === 'review') return '请粘贴到 B/review 窗口';
+  if (targetWindow === 'plan') return '请粘贴到 A/plan 窗口';
+  if (targetWindow === 'code') return '请粘贴到 B/code 窗口';
+  if (targetWindow === 'review') return '请粘贴到 C/review 窗口';
+  if (targetWindow === 'reviewlast') return '请粘贴到 D/reviewlast 窗口';
   return '请返回 Harness 窗口继续操作';
 }
 
@@ -533,7 +547,7 @@ function chineseToNumber(cn) {
  *   ### W6-A-02-P1-001
  *   Priority: P1
  *   Status: open
- *   Owner: claude-implementer-minimax
+ *   Owner: claude-plan-minimax
  *   Module: InfiniteCanvas
  *   Files:
  *   - src/file1.ts

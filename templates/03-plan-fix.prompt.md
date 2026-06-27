@@ -28,11 +28,11 @@
 
 ## 边界规则
 
-1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{codeRepo}}`。
-2. 你有权读写 `{{codeRepo}}` 中任务相关的业务代码。
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `/Users/admin/project/ai/plan`。
+2. 你可以读取 `{{codeRepo}}` 用于方案修订，但本阶段不得修改业务代码。
 3. 你有权写入 `{{reportDir}}` 下的修订记录和验证证据。
 4. **只修方案，不写代码。** 本阶段修订的是实施方案文档，不是业务代码。
-5. **你不可批准自己的方案。** 修订后的方案仍须经过 reviewer 评审。
+5. **你不可批准自己的方案。** 修订后的方案仍须经过 C/review 评审。
 6. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
 7. **不可**执行 destructive git、commit、push，除非用户明确要求。
 

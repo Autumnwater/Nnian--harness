@@ -5,16 +5,16 @@
   "taskId": "W7-A",
   "taskTitle": "W7-A 画布可演示交互闭环",
 
-  "reportRoot": "/Users/admin/project/ai/review/W7",
+  "reportRoot": "/Users/admin/project/ai/reviewDoc/W7",
   "codeRepo": "/Users/admin/project/ai/work/HEXAI",
-  "reviewRoot": "/Users/admin/project/ai/review",
+  "reviewRoot": "/Users/admin/project/ai/reviewDoc",
 
   "stages": [
     {
       "id": "implementation-plan",
       "label": "实施方案",
       "requiredSkill": null,
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-plan-minimax",
       "nextStage": "plan-review",
       "roundGroup": null
     },
@@ -22,7 +22,7 @@
       "id": "plan-review",
       "label": "方案 Review",
       "requiredSkill": "hexai-plan-review",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-reviewer-deepseek",
       "nextStage": "plan-fix",
       "roundGroup": "plan"
     },
@@ -30,7 +30,7 @@
       "id": "plan-fix",
       "label": "方案修订",
       "requiredSkill": "hexai-plan-fix",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-plan-minimax",
       "nextStage": "plan-fix-review",
       "roundGroup": "plan"
     },
@@ -46,7 +46,7 @@
       "id": "code-implementation",
       "label": "代码实施",
       "requiredSkill": null,
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-code-minimax",
       "nextStage": "code-review",
       "roundGroup": null
     },
@@ -62,7 +62,7 @@
       "id": "code-fix",
       "label": "代码修复",
       "requiredSkill": "hexai-code-fix",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-code-minimax",
       "nextStage": "code-fix-review",
       "roundGroup": "code"
     },
@@ -78,7 +78,7 @@
       "id": "delivery",
       "label": "交付物整理",
       "requiredSkill": "hexai-delivery",
-      "ownerProfile": "claude-implementer-minimax",
+      "ownerProfile": "claude-code-minimax",
       "nextStage": "done",
       "roundGroup": "delivery"
     },
@@ -86,7 +86,7 @@
       "id": "done",
       "label": "完成",
       "requiredSkill": null,
-      "ownerProfile": "codex-overall-reviewer",
+      "ownerProfile": "codex-reviewlast",
       "nextStage": null,
       "roundGroup": null
     }
@@ -97,6 +97,12 @@
   "fixStages": ["plan-fix", "code-fix"],
 
   "fixReviewStages": ["plan-fix-review", "code-fix-review"],
+
+  "planStages": ["implementation-plan", "plan-fix"],
+
+  "codeStages": ["code-implementation", "code-fix", "delivery"],
+
+  "reviewLastStages": ["done"],
 
   "implementerStages": ["implementation-plan", "plan-fix", "code-implementation", "code-fix", "delivery"],
 
@@ -148,20 +154,20 @@
 
   "requiredPlaybooks": {
     "plan-review": [
-      "/Users/admin/project/ai/review/ReviewPlaybooks/plan-review-playbook.md",
-      "/Users/admin/project/ai/review/ReviewPlaybooks/canvas-stage-review-playbook.md"
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/plan-review-playbook.md",
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/canvas-stage-review-playbook.md"
     ],
     "plan-fix-review": [
-      "/Users/admin/project/ai/review/ReviewPlaybooks/plan-review-playbook.md",
-      "/Users/admin/project/ai/review/ReviewPlaybooks/canvas-stage-review-playbook.md"
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/plan-review-playbook.md",
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/canvas-stage-review-playbook.md"
     ],
     "code-review": [
-      "/Users/admin/project/ai/review/ReviewPlaybooks/code-review-playbook.md",
-      "/Users/admin/project/ai/review/ReviewPlaybooks/canvas-stage-review-playbook.md"
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/code-review-playbook.md",
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/canvas-stage-review-playbook.md"
     ],
     "code-fix-review": [
-      "/Users/admin/project/ai/review/ReviewPlaybooks/code-review-playbook.md",
-      "/Users/admin/project/ai/review/ReviewPlaybooks/canvas-stage-review-playbook.md"
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/code-review-playbook.md",
+      "/Users/admin/project/ai/reviewDoc/ReviewPlaybooks/canvas-stage-review-playbook.md"
     ]
   }
 }

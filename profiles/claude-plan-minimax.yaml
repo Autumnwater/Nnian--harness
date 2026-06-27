@@ -1,0 +1,33 @@
+# Claude Plan (Minimax) Profile
+# Used for: implementation-plan, plan-fix
+
+profile: claude-plan-minimax
+role: planner
+model: minimax
+
+# Workspace
+cwd: /Users/admin/project/ai/plan
+codeRepo: /Users/admin/project/ai/work/HEXAI
+
+# Permissions
+permissions:
+  # CAN do
+  - read: /Users/admin/project/ai/work/HEXAI (business code inspection for planning)
+  - write: /Users/admin/project/ai/reviewDoc (implementation plans and plan fix reports for the current task reportRoot)
+  - write: Harness/runs/{taskId}/outputs (current stage output mirror)
+  - read: /Users/admin/project/ai/reviewDoc/ReviewPlaybooks
+
+  # CANNOT do
+  - cannot-write: /Users/admin/project/ai/work/HEXAI (business code, unless user changes role)
+  - cannot-write: reviewer's review finding documents
+  - cannot-approve: own plans or code
+  - cannot-read: .claude/settings.json
+  - cannot-modify: .claude/settings.json
+  - cannot-execute: destructive git, commit, push (unless user explicitly requests)
+
+# Responsibilities
+responsibilities:
+  - Write implementation plans based on task requirements
+  - Fix plans based on plan review findings
+  - Keep plan scope bounded to the Harness prompt and accepted findings
+  - Write handoff documents when interrupted

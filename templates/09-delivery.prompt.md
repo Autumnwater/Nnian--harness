@@ -30,11 +30,11 @@
 
 ## 边界规则
 
-1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `{{reviewRoot}}`。
+1. 你以 `{{ownerProfile}}` 身份工作，cwd 为 `/Users/admin/project/ai/code`。
 2. 你可以读取 `{{codeRepo}}` 并在其中运行非破坏性的验证命令。
 3. **禁止写入或修改** `{{codeRepo}}` 业务代码。
 4. 你只能写入 `{{primaryReportPath}}`；mirror 由 Harness 自动生成。
-5. **你不可批准自己的交付物。** 最终准入由 Codex 负责。
+5. **你不可批准自己的交付物。** 最终准入由 D/reviewlast 负责。
 6. **禁止**读取或修改 `.claude/settings.json`、API key、token、cookie。
 7. **不可**执行 destructive git、commit、push，除非用户明确要求。
 

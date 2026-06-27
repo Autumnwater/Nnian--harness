@@ -5,7 +5,7 @@
 ## 快速开始
 
 ```bash
-cd /Users/admin/project/ai/review/Harness
+cd /Users/admin/project/ai/Harness
 
 # 初始化 W6-A（默认从 W6-A-02 implementation-plan 开始）
 pnpm harness init W6-A
