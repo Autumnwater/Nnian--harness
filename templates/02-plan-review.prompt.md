@@ -64,8 +64,10 @@
 
 报告必须包含独占一行的 `Decision: pass` 或 `Decision: changes-required`。
 
+Finding 标题行必须只包含纯 ID，说明文字放到标题下一行正文。禁止在标题行追加括号、冒号、破折号或中文说明，例如禁止 `### Finding {{subtaskId}}-P2-01（说明）`、`### Finding {{subtaskId}}-P2-01: 说明`。
+
 ```markdown
-### Finding {{subtaskId}}-P{n}-{序号}
+### Finding {{subtaskId}}-P2-01
 
 Priority: P0/P1/P2
 Status: open

@@ -76,6 +76,14 @@ Five windows define capability boundaries:
 - **C/review workspace:** `/Users/admin/project/ai/pcReview`
 - **D/reviewlast workspace:** `/Users/admin/project/ai/reviewlast`
 
+## OpenCode / Claude Operation Guardrails
+
+- H/Harness should not receive `/Users/admin/project/ai/work/HEXAI/*` write or broad shell permissions. H may inspect Harness state and `/Users/admin/project/ai/reviewDoc`, then route prompts to A/B/C/D.
+- A/B/C/D must not use `git stash`, `git stash pop`, `git reset`, `git checkout`, or `git clean` to manufacture a clean baseline. If the business worktree is dirty, bind verification to the actual worktree and disclose the risk.
+- C/review and D/reviewlast are allowed to run read-only verification such as `git status`, `git diff`, `git log`, `git show`, `tsc --noEmit`, ESLint, Vitest, and Prettier checks, but they must not modify `/Users/admin/project/ai/work/HEXAI`.
+- Prettier validation should use `pnpm exec prettier --check ...` or `pnpm exec prettier --list-different ...`. Do not use formatter-to-stdout plus `/tmp` plus manual `diff` previews in C/D review windows, and do not run `prettier --write` unless the workspace is explicitly acting as B/code on an approved formatting fix.
+- Generated human reports may be written under `/Users/admin/project/ai/reviewDoc` and mirrored into `/Users/admin/project/ai/Harness/runs/<taskId>/outputs/...` when the Harness prompt requires it.
+
 ## W6-A Built-in Subtasks
 
 W6-A-01 缩放锚点

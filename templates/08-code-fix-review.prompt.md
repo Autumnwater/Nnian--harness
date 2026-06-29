@@ -64,10 +64,12 @@
 4. 如发现新问题，产出新的 findings
 5. 判断代码是否可以进入交付阶段
 
-报告必须包含 `Decision: pass` 或 `Decision: changes-required`。所有既有和新增 finding 都必须使用以下机器可读格式；禁止使用 `### P1#1`、`### NEW P1#1` 等旧格式：
+报告必须包含 `Decision: pass` 或 `Decision: changes-required`。所有既有和新增 finding 都必须使用以下机器可读格式；禁止使用 `### P1#1`、`### NEW P1#1` 等旧格式。
+
+Finding 标题行必须只包含纯 ID，说明文字放到标题下一行正文。禁止在标题行追加括号、冒号、破折号或中文说明，例如禁止 `### Finding {{subtaskId}}-P2-01（说明）`、`### Finding {{subtaskId}}-P2-01: 说明`。
 
 ```markdown
-### Finding {{subtaskId}}-P{n}-{序号}
+### Finding {{subtaskId}}-P2-01
 
 Priority: P0/P1/P2
 Status: verified/accepted/deferred/false-positive/open/reopened

@@ -1458,6 +1458,25 @@ Expected: Should be fixed
     });
   });
 
+  describe('review prompt finding heading contract', () => {
+    it('should require pure Finding IDs in all review templates', () => {
+      const templatePaths = [
+        'templates/02-plan-review.prompt.md',
+        'templates/04-plan-fix-review.prompt.md',
+        'templates/06-code-review.prompt.md',
+        'templates/08-code-fix-review.prompt.md',
+      ];
+
+      for (const templatePath of templatePaths) {
+        const content = fs.readFileSync(path.join(HARNESS_DIR, templatePath), 'utf-8');
+        assert.ok(content.includes('Finding 标题行必须只包含纯 ID'), templatePath);
+        assert.ok(content.includes('禁止在标题行追加括号、冒号、破折号或中文说明'), templatePath);
+        assert.ok(content.includes('### Finding {{subtaskId}}-P2-01'), templatePath);
+        assert.ok(!content.includes('### Finding {{subtaskId}}-P{n}-{序号}'), templatePath);
+      }
+    });
+  });
+
   // V2: Delivery now requires --confirm-committed before advancing to next subtask
   describe('P0-1: delivery blocks open findings (test 14, 15)', () => {
     before(() => {
@@ -1781,6 +1800,12 @@ Expected: Should be fixed
         'Should include NEXT output');
       assert.ok(r.stdout.includes('nextAction: 请粘贴到 C/review 窗口'),
         'Should explicitly identify the C/review target window');
+      assert.ok(r.stdout.includes('➡ NEXT ROUTE PREVIEW'),
+        'Should include a route preview before generating the next prompt');
+      assert.ok(r.stdout.includes('Paste to: 请粘贴到 C/review 窗口'),
+        'Route preview should show the target window instruction');
+      assert.ok(r.stdout.indexOf('Paste to: 请粘贴到 C/review 窗口') < r.stdout.indexOf('▶ NEXT'),
+        'Route preview should appear before NEXT so collapsed output still shows where to paste');
       assert.ok(r.stdout.includes('copiedToClipboard: true') || r.stdout.includes('Copied to clipboard: true'),
         'step should copy the generated prompt by default');
     });
@@ -2122,6 +2147,36 @@ Expected: Should be fixed
         r.stdout.includes('checkpoint'),
         'Should mention commit requirements'
       );
+    });
+  });
+
+  describe('V2: completed task blocks redundant step/check cleanly', () => {
+    before(() => {
+      harness('init W6-A --from W6-A-06 --stage delivery --force');
+      const status = readStatus('W6-A');
+      createReport(status, 'delivery',
+        '# Delivery Report\n\n## 交付摘要\nDone.\n\n## 验证\nAll tests pass.\n\n## Residual Risk\nNone.\n');
+      assert.equal(harness('accept W6-A --note "用户人工验收通过"').success, true);
+      assert.equal(harness('advance W6-A').success, true);
+      assert.equal(harness('advance W6-A --confirm-committed').success, true);
+
+      const completed = readStatus('W6-A');
+      assert.equal(completed.taskStatus, 'completed');
+      assert.equal(completed.currentStage, 'done');
+    });
+
+    it('step should not re-enter report gates after task completion', () => {
+      const r = harness('step W6-A');
+      assert.equal(r.success, true, r.stdout + r.stderr);
+      assert.ok(r.stdout.includes('already completed'), r.stdout);
+      assert.ok(!r.stdout.includes('primaryReportPath is not set'), r.stdout);
+    });
+
+    it('check should not require a primaryReportPath for done stage', () => {
+      const r = harness('check W6-A');
+      assert.equal(r.success, true, r.stdout + r.stderr);
+      assert.ok(r.stdout.includes('already completed'), r.stdout);
+      assert.ok(!r.stdout.includes('primaryReportPath is not set'), r.stdout);
     });
   });
 

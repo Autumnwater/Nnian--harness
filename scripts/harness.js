@@ -213,6 +213,24 @@ function getNextRecommendedCommand(taskId, status, stageData = {}) {
   return `pnpm harness next ${taskId} --copy`;
 }
 
+function printRoutePreview(taskId, status) {
+  const currentSubtask = status.currentSubtask;
+  const currentStage = status.currentStage;
+  const config = getStageConfig(currentStage) || {};
+  const targetWindow = getTargetWindow(currentStage);
+  const nextAction = getTargetWindowInstruction(targetWindow);
+  const promptPath = promptFilePath(taskId, currentSubtask, currentStage);
+
+  console.log('➡ NEXT ROUTE PREVIEW');
+  console.log(`   Paste to: ${nextAction}`);
+  console.log(`   targetWindow: ${targetWindow}`);
+  console.log(`   currentSubtask: ${currentSubtask}`);
+  console.log(`   currentStage: ${currentStage}`);
+  console.log(`   expectedSkill: ${config.requiredSkill || '(none)'}`);
+  console.log(`   promptPath: ${promptPath}`);
+  console.log();
+}
+
 // ---------------------------------------------------------------------------
 // V2: Prompt file path
 // ---------------------------------------------------------------------------
@@ -1263,6 +1281,18 @@ function cmdNext(taskId, opts = {}) {
 function cmdStep(taskId, opts = {}) {
   // P1-1: If already at commit checkpoint, skip check/advance entirely
   const preCheck = loadStatus(taskId);
+  if (preCheck.taskStatus === 'completed' || preCheck.currentStage === 'done') {
+    console.log('═══════════════════════════════════════════════');
+    console.log(`✅ Task ${taskId} is already completed.`);
+    console.log('   No further Harness step is required.');
+    console.log('═══════════════════════════════════════════════');
+    return {
+      success: true,
+      stoppedAt: 'completed',
+      taskStatus: preCheck.taskStatus,
+      currentStage: preCheck.currentStage,
+    };
+  }
   if (preCheck.awaitingCommit) {
     console.log('═══════════════════════════════════════════════');
     console.log('⏸️  Already at commit checkpoint — awaiting manual commit.');
@@ -1313,6 +1343,7 @@ function cmdStep(taskId, opts = {}) {
   }
 
   console.log(`✅ ADVANCED: ${advanceResult.subtask || ''} / ${advanceResult.stage || ''}\n`);
+  printRoutePreview(taskId, loadStatus(taskId));
 
   // Step 3: Next
   console.log('▶ NEXT');
@@ -1511,6 +1542,17 @@ function generateContinuationPrompt(taskId, status, subtaskId, stage, subtask) {
 function cmdCheck(taskId) {
   const status = loadStatus(taskId);
   const { currentSubtask, currentStage } = status;
+
+  if (status.taskStatus === 'completed' || currentStage === 'done') {
+    console.log(`✅ CHECK PASSED: Task ${taskId} is already completed.`);
+    return {
+      pass: true,
+      completed: true,
+      taskStatus: status.taskStatus,
+      currentStage,
+    };
+  }
+
   const stageData = status.subtasks[currentSubtask]?.stages?.[currentStage];
 
   if (!stageData) {
